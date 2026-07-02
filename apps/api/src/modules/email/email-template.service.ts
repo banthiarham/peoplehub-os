@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../common/database/prisma.service';
-import { EmailTemplateStatus } from '@prisma/client';
+import { EmailTemplateStatus, Prisma } from '@prisma/client';
 
 @Injectable()
 export class EmailTemplateService {
@@ -100,7 +100,7 @@ export class EmailTemplateService {
         subject: current.subject,
         bodyHtml: current.bodyHtml,
         bodyText: current.bodyText,
-        variables: current.variables,
+        variables: (current.variables ?? []) as unknown as Prisma.InputJsonValue,
       },
     });
 
