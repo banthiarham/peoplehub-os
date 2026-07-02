@@ -330,6 +330,132 @@ async function main() {
     },
   });
 
+
+  // ── AY 2026-27 Tax Engine Seed ─────────────────────────────────────────────
+  console.log('🧮 Seeding AY 2026-27 tax rules...');
+
+  const taxYear = await prisma.taxYear.upsert({
+    where: { tenantId_financialYear_country: { tenantId: tenant.id, financialYear: '2025-26', country: 'IN' } },
+    update: {},
+    create: {
+      tenantId: tenant.id,
+      financialYear: '2025-26',
+      assessmentYear: '2026-27',
+      country: 'IN',
+      effectiveFrom: new Date('2025-04-01'),
+      effectiveTo: new Date('2026-03-31'),
+      isActive: true,
+      isDefault: true,
+    },
+  });
+
+  await prisma.taxRegimeConfig.upsert({
+    where: { tenantId_taxYearId_regime: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW' } },
+    update: {},
+    create: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', name: 'New Tax Regime (115BAC)', isDefault: true, employeeCanSelect: true },
+  });
+  await prisma.taxRegimeConfig.upsert({
+    where: { tenantId_taxYearId_regime: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD' } },
+    update: {},
+    create: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', name: 'Old Tax Regime', isDefault: false, employeeCanSelect: true },
+  });
+
+  const oldSlabsBelow60 = [
+    { minIncome: 0, maxIncome: 250000, taxRate: 0, fixedTax: 0, sortOrder: 1 },
+    { minIncome: 250000, maxIncome: 500000, taxRate: 0.05, fixedTax: 0, sortOrder: 2 },
+    { minIncome: 500000, maxIncome: 1000000, taxRate: 0.2, fixedTax: 12500, sortOrder: 3 },
+    { minIncome: 1000000, maxIncome: null, taxRate: 0.3, fixedTax: 112500, sortOrder: 4 },
+  ];
+  const oldSlabsSenior = [
+    { minIncome: 0, maxIncome: 300000, taxRate: 0, fixedTax: 0, sortOrder: 1 },
+    { minIncome: 300000, maxIncome: 500000, taxRate: 0.05, fixedTax: 0, sortOrder: 2 },
+    { minIncome: 500000, maxIncome: 1000000, taxRate: 0.2, fixedTax: 10000, sortOrder: 3 },
+    { minIncome: 1000000, maxIncome: null, taxRate: 0.3, fixedTax: 110000, sortOrder: 4 },
+  ];
+  const oldSlabsSuperSenior = [
+    { minIncome: 0, maxIncome: 500000, taxRate: 0, fixedTax: 0, sortOrder: 1 },
+    { minIncome: 500000, maxIncome: 1000000, taxRate: 0.2, fixedTax: 0, sortOrder: 2 },
+    { minIncome: 1000000, maxIncome: null, taxRate: 0.3, fixedTax: 100000, sortOrder: 3 },
+  ];
+  const newSlabs = [
+    { minIncome: 0, maxIncome: 400000, taxRate: 0, fixedTax: 0, sortOrder: 1 },
+    { minIncome: 400000, maxIncome: 800000, taxRate: 0.05, fixedTax: 0, sortOrder: 2 },
+    { minIncome: 800000, maxIncome: 1200000, taxRate: 0.1, fixedTax: 20000, sortOrder: 3 },
+    { minIncome: 1200000, maxIncome: 1600000, taxRate: 0.15, fixedTax: 60000, sortOrder: 4 },
+    { minIncome: 1600000, maxIncome: 2000000, taxRate: 0.2, fixedTax: 120000, sortOrder: 5 },
+    { minIncome: 2000000, maxIncome: 2400000, taxRate: 0.25, fixedTax: 200000, sortOrder: 6 },
+    { minIncome: 2400000, maxIncome: null, taxRate: 0.3, fixedTax: 300000, sortOrder: 7 },
+  ];
+
+  const slabsToCreate = [
+    ...oldSlabsBelow60.map((s) => ({ ...s, regime: 'OLD' as const, ageCategory: 'BELOW_60' as const })),
+    ...oldSlabsSenior.map((s) => ({ ...s, regime: 'OLD' as const, ageCategory: 'SENIOR_60_80' as const })),
+    ...oldSlabsSuperSenior.map((s) => ({ ...s, regime: 'OLD' as const, ageCategory: 'SUPER_SENIOR_80_PLUS' as const })),
+    ...newSlabs.map((s) => ({ ...s, regime: 'NEW' as const, ageCategory: 'BELOW_60' as const })),
+    ...newSlabs.map((s) => ({ ...s, regime: 'NEW' as const, ageCategory: 'SENIOR_60_80' as const })),
+    ...newSlabs.map((s) => ({ ...s, regime: 'NEW' as const, ageCategory: 'SUPER_SENIOR_80_PLUS' as const })),
+  ];
+
+  await prisma.taxSlab.deleteMany({ where: { tenantId: tenant.id, taxYearId: taxYear.id } });
+  await prisma.taxSlab.createMany({
+    data: slabsToCreate.map((s) => ({ tenantId: tenant.id, taxYearId: taxYear.id, status: 'PUBLISHED', version: 1, ...s })),
+  });
+
+  await prisma.taxRebateRule.upsert({
+    where: { tenantId_taxYearId_regime_section: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', section: '87A' } },
+    update: {},
+    create: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', section: '87A', maxRebate: 60000, incomeLimit: 1200000, status: 'PUBLISHED' },
+  });
+  await prisma.taxRebateRule.upsert({
+    where: { tenantId_taxYearId_regime_section: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: '87A' } },
+    update: {},
+    create: { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: '87A', maxRebate: 12500, incomeLimit: 500000, status: 'PUBLISHED' },
+  });
+
+  await prisma.taxCessRule.deleteMany({ where: { tenantId: tenant.id, taxYearId: taxYear.id } });
+  await prisma.taxCessRule.create({
+    data: { tenantId: tenant.id, taxYearId: taxYear.id, country: 'IN', cessName: 'Health and Education Cess', cessRate: 0.04, applicableOnTax: true, applicableOnSurcharge: true, status: 'PUBLISHED' },
+  });
+
+  await prisma.taxSurchargeRule.deleteMany({ where: { tenantId: tenant.id, taxYearId: taxYear.id } });
+  await prisma.taxSurchargeRule.createMany({
+    data: [
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', minIncome: 0, maxIncome: 5000000, surchargeRate: 0, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', minIncome: 5000000, maxIncome: 10000000, surchargeRate: 0.1, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', minIncome: 10000000, maxIncome: 20000000, surchargeRate: 0.15, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', minIncome: 20000000, maxIncome: 50000000, surchargeRate: 0.25, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', minIncome: 50000000, maxIncome: null, surchargeRate: 0.25, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', minIncome: 0, maxIncome: 5000000, surchargeRate: 0, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', minIncome: 5000000, maxIncome: 10000000, surchargeRate: 0.1, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', minIncome: 10000000, maxIncome: 20000000, surchargeRate: 0.15, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', minIncome: 20000000, maxIncome: 50000000, surchargeRate: 0.25, marginalReliefEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', minIncome: 50000000, maxIncome: null, surchargeRate: 0.37, marginalReliefEnabled: true, status: 'PUBLISHED' },
+    ],
+  });
+
+  await prisma.taxDeductionRule.deleteMany({ where: { tenantId: tenant.id, taxYearId: taxYear.id } });
+  await prisma.taxDeductionRule.createMany({
+    data: [
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: 'STANDARD_DEDUCTION', name: 'Standard Deduction', maxLimit: 50000, requiresProof: false, isEnabled: true, sortOrder: 1, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: '80C', name: 'Section 80C (PF, PPF, ELSS, LIC)', maxLimit: 150000, requiresProof: true, isEnabled: true, sortOrder: 2, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: '80D', name: 'Section 80D (Health Insurance)', maxLimit: 25000, requiresProof: true, isEnabled: true, sortOrder: 3, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: '80CCD_1B', name: 'Section 80CCD(1B) NPS Employee', maxLimit: 50000, requiresProof: true, isEnabled: true, sortOrder: 4, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: '80CCD_2', name: 'Section 80CCD(2) NPS Employer', maxLimit: null, requiresProof: false, isEnabled: true, sortOrder: 5, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: 'HOME_LOAN_INTEREST', name: 'Home Loan Interest (Section 24b)', maxLimit: 200000, requiresProof: true, isEnabled: true, sortOrder: 6, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', section: 'PROFESSIONAL_TAX', name: 'Professional Tax', maxLimit: 2500, requiresProof: false, isEnabled: true, sortOrder: 7, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', section: 'STANDARD_DEDUCTION', name: 'Standard Deduction', maxLimit: 75000, requiresProof: false, isEnabled: true, sortOrder: 1, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'NEW', section: '80CCD_2', name: 'Section 80CCD(2) NPS Employer', maxLimit: null, requiresProof: false, isEnabled: true, sortOrder: 2, status: 'PUBLISHED' },
+    ],
+  });
+
+  await prisma.taxExemptionRule.deleteMany({ where: { tenantId: tenant.id, taxYearId: taxYear.id } });
+  await prisma.taxExemptionRule.createMany({
+    data: [
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', name: 'HRA', description: 'House Rent Allowance', maxLimit: null, requiresProof: true, isEnabled: true, status: 'PUBLISHED' },
+      { tenantId: tenant.id, taxYearId: taxYear.id, regime: 'OLD', name: 'LTA', description: 'Leave Travel Allowance', maxLimit: null, requiresProof: true, isEnabled: true, status: 'PUBLISHED' },
+    ],
+  });
+
   console.log('✅ Seed complete!');
   console.log('\n📋 Demo Credentials:');
   console.log('   Super Admin: admin@democorp.com');

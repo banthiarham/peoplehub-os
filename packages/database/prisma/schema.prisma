@@ -1752,3 +1752,423 @@ model FileObject {
   @@index([tenantId])
   @@map("file_objects")
 }
+
+// ─── Tax Engine (Module 6A) ───────────────────────────────────────────────────
+
+enum AgeCategory {
+  BELOW_60
+  SENIOR_60_80
+  SUPER_SENIOR_80_PLUS
+  CUSTOM
+}
+
+enum ResidentialStatus {
+  RESIDENT
+  NON_RESIDENT
+  RNOR
+}
+
+enum TaxRuleStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum TaxDeclarationStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  LOCKED
+}
+
+enum TaxProofStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model TaxYear {
+  id             String        @id @default(cuid())
+  tenantId       String
+  financialYear  String
+  assessmentYear String
+  country        String        @default("IN")
+  effectiveFrom  DateTime
+  effectiveTo    DateTime?
+  isActive       Boolean       @default(true)
+  isDefault      Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  slabs              TaxSlab[]
+  surchargeRules     TaxSurchargeRule[]
+  rebateRules        TaxRebateRule[]
+  cessRules          TaxCessRule[]
+  deductionRules     TaxDeductionRule[]
+  exemptionRules     TaxExemptionRule[]
+  ruleVersions       TaxRuleVersion[]
+  regimeConfigs      TaxRegimeConfig[]
+
+  @@unique([tenantId, financialYear, country])
+  @@index([tenantId])
+  @@map("tax_years")
+}
+
+// TaxRegimeConfig stores per-year regime settings (note: TaxRegime enum already exists for OLD/NEW)
+model TaxRegimeConfig {
+  id                    String     @id @default(cuid())
+  tenantId              String
+  taxYearId             String
+  regime                TaxRegime
+  name                  String
+  description           String?
+  isDefault             Boolean    @default(false)
+  employeeCanSelect     Boolean    @default(true)
+  selectionLockDate     DateTime?
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+
+  taxYear               TaxYear    @relation(fields: [taxYearId], references: [id])
+
+  @@unique([tenantId, taxYearId, regime])
+  @@index([tenantId, taxYearId])
+  @@map("tax_regime_configs")
+}
+
+model TaxSlab {
+  id            String        @id @default(cuid())
+  tenantId      String
+  taxYearId     String
+  regime        TaxRegime
+  ageCategory   AgeCategory
+  minIncome     Decimal       @db.Decimal(15, 2)
+  maxIncome     Decimal?      @db.Decimal(15, 2)
+  taxRate       Decimal       @db.Decimal(5, 4)
+  fixedTax      Decimal       @default(0) @db.Decimal(15, 2)
+  sortOrder     Int
+  status        TaxRuleStatus @default(PUBLISHED)
+  version       Int           @default(1)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  taxYear       TaxYear       @relation(fields: [taxYearId], references: [id])
+
+  @@index([tenantId, taxYearId, regime, ageCategory])
+  @@map("tax_slabs")
+}
+
+model TaxSurchargeRule {
+  id                    String        @id @default(cuid())
+  tenantId              String
+  taxYearId             String
+  regime                TaxRegime
+  minIncome             Decimal       @db.Decimal(15, 2)
+  maxIncome             Decimal?      @db.Decimal(15, 2)
+  surchargeRate         Decimal       @db.Decimal(5, 4)
+  marginalReliefEnabled Boolean       @default(true)
+  status                TaxRuleStatus @default(PUBLISHED)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  taxYear               TaxYear       @relation(fields: [taxYearId], references: [id])
+
+  @@index([tenantId, taxYearId, regime])
+  @@map("tax_surcharge_rules")
+}
+
+model TaxRebateRule {
+  id           String        @id @default(cuid())
+  tenantId     String
+  taxYearId    String
+  regime       TaxRegime
+  section      String        @default("87A")
+  maxRebate    Decimal       @db.Decimal(15, 2)
+  incomeLimit  Decimal       @db.Decimal(15, 2)
+  status       TaxRuleStatus @default(PUBLISHED)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  taxYear      TaxYear       @relation(fields: [taxYearId], references: [id])
+
+  @@unique([tenantId, taxYearId, regime, section])
+  @@index([tenantId, taxYearId])
+  @@map("tax_rebate_rules")
+}
+
+model TaxCessRule {
+  id                    String        @id @default(cuid())
+  tenantId              String
+  taxYearId             String
+  regime                TaxRegime?
+  country               String        @default("IN")
+  cessName              String        @default("Health and Education Cess")
+  cessRate              Decimal       @db.Decimal(5, 4)
+  applicableOnTax       Boolean       @default(true)
+  applicableOnSurcharge Boolean       @default(true)
+  status                TaxRuleStatus @default(PUBLISHED)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  taxYear               TaxYear       @relation(fields: [taxYearId], references: [id])
+
+  @@index([tenantId, taxYearId])
+  @@map("tax_cess_rules")
+}
+
+model TaxDeductionRule {
+  id             String        @id @default(cuid())
+  tenantId       String
+  taxYearId      String
+  regime         TaxRegime
+  section        String
+  name           String
+  description    String?
+  maxLimit       Decimal?      @db.Decimal(15, 2)
+  isEnabled      Boolean       @default(true)
+  requiresProof  Boolean       @default(false)
+  sortOrder      Int           @default(0)
+  status         TaxRuleStatus @default(PUBLISHED)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  taxYear        TaxYear       @relation(fields: [taxYearId], references: [id])
+
+  @@unique([tenantId, taxYearId, regime, section])
+  @@index([tenantId, taxYearId, regime])
+  @@map("tax_deduction_rules")
+}
+
+model TaxExemptionRule {
+  id                   String        @id @default(cuid())
+  tenantId             String
+  taxYearId            String
+  regime               TaxRegime
+  name                 String
+  description          String?
+  maxLimit             Decimal?      @db.Decimal(15, 2)
+  calculationFormula   String?
+  isEnabled            Boolean       @default(true)
+  requiresProof        Boolean       @default(false)
+  status               TaxRuleStatus @default(PUBLISHED)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  taxYear              TaxYear       @relation(fields: [taxYearId], references: [id])
+
+  @@unique([tenantId, taxYearId, regime, name])
+  @@index([tenantId, taxYearId, regime])
+  @@map("tax_exemption_rules")
+}
+
+model EmployeeTaxProfile {
+  id                   String            @id @default(cuid())
+  tenantId             String
+  employeeId           String            @unique
+  taxYearId            String
+  regime               TaxRegime         @default(NEW)
+  ageCategory          AgeCategory       @default(BELOW_60)
+  residentialStatus    ResidentialStatus @default(RESIDENT)
+  panNumber            String?
+  dateOfBirth          DateTime?
+  regimeLockedAt       DateTime?
+  regimeLockedById     String?
+  declarationWindowOpen Boolean          @default(true)
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  declarations         EmployeeTaxDeclaration[]
+  previousIncome       EmployeePreviousEmployerIncome[]
+  monthlyTds           EmployeeMonthlyTds[]
+
+  @@index([tenantId, taxYearId])
+  @@map("employee_tax_profiles")
+}
+
+model EmployeeTaxDeclaration {
+  id             String               @id @default(cuid())
+  tenantId       String
+  employeeId     String
+  taxProfileId   String
+  taxYearId      String
+  section        String
+  declaredAmount Decimal              @db.Decimal(15, 2)
+  approvedAmount Decimal?             @db.Decimal(15, 2)
+  status         TaxDeclarationStatus @default(DRAFT)
+  metadata       Json?
+  submittedAt    DateTime?
+  reviewedAt     DateTime?
+  reviewedById   String?
+  reviewNote     String?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  taxProfile     EmployeeTaxProfile   @relation(fields: [taxProfileId], references: [id])
+  proofs         EmployeeTaxProof[]
+
+  @@index([tenantId, employeeId, taxYearId])
+  @@map("employee_tax_declarations")
+}
+
+model EmployeeTaxProof {
+  id            String                 @id @default(cuid())
+  tenantId      String
+  declarationId String
+  employeeId    String
+  fileObjectId  String?
+  documentType  String
+  description   String?
+  status        TaxProofStatus         @default(PENDING)
+  reviewedById  String?
+  reviewedAt    DateTime?
+  reviewNote    String?
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+
+  declaration   EmployeeTaxDeclaration @relation(fields: [declarationId], references: [id])
+
+  @@index([tenantId, employeeId])
+  @@map("employee_tax_proofs")
+}
+
+model EmployeePreviousEmployerIncome {
+  id               String             @id @default(cuid())
+  tenantId         String
+  employeeId       String
+  taxProfileId     String
+  taxYearId        String
+  employerName     String
+  employerPan      String?
+  grossSalary      Decimal            @db.Decimal(15, 2)
+  taxableAmount    Decimal            @db.Decimal(15, 2)
+  tdsDeducted      Decimal            @default(0) @db.Decimal(15, 2)
+  pfContribution   Decimal            @default(0) @db.Decimal(15, 2)
+  professionalTax  Decimal            @default(0) @db.Decimal(15, 2)
+  from12B          Boolean            @default(false)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  taxProfile       EmployeeTaxProfile @relation(fields: [taxProfileId], references: [id])
+
+  @@index([tenantId, employeeId, taxYearId])
+  @@map("employee_previous_employer_income")
+}
+
+model EmployeeMonthlyTds {
+  id                    String             @id @default(cuid())
+  tenantId              String
+  employeeId            String
+  taxProfileId          String
+  taxYearId             String
+  payrollRunId          String?
+  month                 Int
+  year                  Int
+  grossIncomeTillDate   Decimal            @db.Decimal(15, 2)
+  projectedAnnualIncome Decimal            @db.Decimal(15, 2)
+  totalExemptions       Decimal            @default(0) @db.Decimal(15, 2)
+  totalDeductions       Decimal            @default(0) @db.Decimal(15, 2)
+  netTaxableIncome      Decimal            @db.Decimal(15, 2)
+  taxBeforeRebate       Decimal            @db.Decimal(15, 2)
+  rebate                Decimal            @default(0) @db.Decimal(15, 2)
+  surcharge             Decimal            @default(0) @db.Decimal(15, 2)
+  cess                  Decimal            @default(0) @db.Decimal(15, 2)
+  totalTax              Decimal            @db.Decimal(15, 2)
+  tdsDeductedTillDate   Decimal            @default(0) @db.Decimal(15, 2)
+  remainingTax          Decimal            @db.Decimal(15, 2)
+  remainingMonths       Int
+  monthlyTds            Decimal            @db.Decimal(15, 2)
+  effectiveTaxRate      Decimal            @db.Decimal(6, 4)
+  createdAt             DateTime           @default(now())
+
+  taxProfile            EmployeeTaxProfile @relation(fields: [taxProfileId], references: [id])
+
+  @@unique([tenantId, employeeId, taxYearId, month, year])
+  @@index([tenantId, employeeId, taxYearId])
+  @@map("employee_monthly_tds")
+}
+
+model TaxComputationSnapshot {
+  id                 String    @id @default(cuid())
+  tenantId           String
+  employeeId         String
+  payrollRunId       String
+  taxYearId          String
+  regime             TaxRegime
+  ageCategory        AgeCategory
+  annualFixedSalary  Decimal   @db.Decimal(15, 2)
+  grossTaxableIncome Decimal   @db.Decimal(15, 2)
+  exemptIncome       Decimal   @default(0) @db.Decimal(15, 2)
+  deductibleAmount   Decimal   @default(0) @db.Decimal(15, 2)
+  netTaxableIncome   Decimal   @db.Decimal(15, 2)
+  taxBeforeRebate    Decimal   @db.Decimal(15, 2)
+  rebate             Decimal   @default(0) @db.Decimal(15, 2)
+  surcharge          Decimal   @default(0) @db.Decimal(15, 2)
+  cess               Decimal   @default(0) @db.Decimal(15, 2)
+  totalAnnualTax     Decimal   @db.Decimal(15, 2)
+  tdsAlreadyDeducted Decimal   @default(0) @db.Decimal(15, 2)
+  remainingTax       Decimal   @db.Decimal(15, 2)
+  monthlyTdsDeducted Decimal   @db.Decimal(15, 2)
+  effectiveTaxRate   Decimal   @db.Decimal(6, 4)
+  breakdownJson      Json
+  slabsUsed          Json
+  createdAt          DateTime  @default(now())
+
+  @@index([tenantId, employeeId, payrollRunId])
+  @@index([tenantId, payrollRunId])
+  @@map("tax_computation_snapshots")
+}
+
+model TaxRuleVersion {
+  id           String    @id @default(cuid())
+  tenantId     String
+  taxYearId    String
+  entityType   String
+  entityId     String
+  version      Int
+  changeType   String
+  changedById  String
+  previousData Json?
+  newData      Json
+  createdAt    DateTime  @default(now())
+
+  taxYear      TaxYear   @relation(fields: [taxYearId], references: [id])
+
+  @@index([tenantId, taxYearId, entityType, entityId])
+  @@map("tax_rule_versions")
+}
+
+model TaxOverride {
+  id             String   @id @default(cuid())
+  tenantId       String
+  employeeId     String
+  taxYearId      String
+  overrideType   String
+  originalValue  Decimal  @db.Decimal(15, 2)
+  overrideValue  Decimal  @db.Decimal(15, 2)
+  reason         String
+  overriddenById String
+  overriddenAt   DateTime @default(now())
+  expiresAt      DateTime?
+  isActive       Boolean  @default(true)
+
+  @@index([tenantId, employeeId, taxYearId])
+  @@map("tax_overrides")
+}
+
+model TaxAuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  actorId    String
+  action     String
+  entityType String
+  entityId   String
+  oldValue   Json?
+  newValue   Json?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, actorId])
+  @@map("tax_audit_logs")
+}

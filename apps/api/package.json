@@ -43,7 +43,8 @@
     "helmet": "^7.1.0",
     "compression": "^1.7.4",
     "@peoplehub/database": "*",
-    "@peoplehub/types": "*"
+    "@peoplehub/types": "*",
+    "@prisma/client": "^5.14.0"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.2",
