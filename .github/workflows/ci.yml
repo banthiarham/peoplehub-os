@@ -92,7 +92,7 @@ jobs:
         run: cd packages/database && npx prisma migrate deploy
 
       - name: Run tests
-        run: npm test -- --passWithNoTests
+        run: npm test
 
   build:
     name: Build
