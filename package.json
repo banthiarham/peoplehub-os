@@ -2,7 +2,7 @@
   "name": "peoplehub-os",
   "version": "0.1.0",
   "private": true,
-  "description": "AI-first People Operating System — HRMS, Payroll, Attendance, Hiring, Performance, and Developer API Platform",
+  "description": "AI-first People Operating System \u2014 HRMS, Payroll, Attendance, Hiring, Performance, and Developer API Platform",
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -24,7 +24,9 @@
     "typescript": "^5.4.5",
     "@types/node": "^20.12.12",
     "eslint": "^8.57.0",
-    "prettier": "^3.2.5"
+    "prettier": "^3.2.5",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0"
   },
   "engines": {
     "node": ">=20.0.0",
