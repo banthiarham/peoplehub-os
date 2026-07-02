@@ -456,6 +456,70 @@ async function main() {
     ],
   });
 
+
+  // ── Default Email Templates (Module 22) ─────────────────────────────────────
+  console.log('📧 Seeding default email templates...');
+
+  const emailTemplates = [
+    { templateKey: 'account_invitation', name: 'Account Invitation', module: 'auth', isMandatory: true, subject: 'Welcome to {{company_name}} — Set up your account', bodyHtml: '<p>Hi {{employee_name}},</p><p>You have been invited to join {{company_name}} on PeopleHub OS.</p><p><a href="{{login_link}}">Set up your account</a></p><p>This link expires in 48 hours.</p>' },
+    { templateKey: 'password_reset', name: 'Password Reset', module: 'auth', isMandatory: true, subject: 'Reset your password — {{company_name}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>We received a request to reset your password.</p><p><a href="{{login_link}}">Reset Password</a></p><p>This link expires in 1 hour. If you did not request this, ignore this email.</p>' },
+    { templateKey: 'welcome', name: 'Welcome Email', module: 'auth', isMandatory: true, subject: 'Welcome to {{company_name}}!', bodyHtml: '<p>Hi {{employee_name}},</p><p>Welcome aboard! Your account is now active. <a href="{{login_link}}">Login here</a>.</p>' },
+    { templateKey: 'offer_letter', name: 'Offer Letter', module: 'recruitment', isMandatory: true, subject: 'Your Offer Letter from {{company_name}}', bodyHtml: '<p>Dear {{candidate_name}},</p><p>We are pleased to offer you the position at {{company_name}}.</p><p><a href="{{offer_link}}">View and Accept Offer</a></p>' },
+    { templateKey: 'interview_invite', name: 'Interview Invite', module: 'recruitment', isMandatory: true, subject: 'Interview Scheduled — {{company_name}}', bodyHtml: '<p>Dear {{candidate_name}},</p><p>Your interview has been scheduled for {{interview_date}}.</p><p>Please confirm your attendance.</p>' },
+    { templateKey: 'leave_request', name: 'Leave Request Notification', module: 'leave', isMandatory: false, subject: '{{employee_name}} has applied for {{leave_type}}', bodyHtml: '<p>{{employee_name}} has submitted a leave request for {{leave_type}} from {{leave_start_date}} to {{leave_end_date}}.</p><p><a href="{{approval_link}}">Review Request</a></p>' },
+    { templateKey: 'leave_approved', name: 'Leave Approved', module: 'leave', isMandatory: false, subject: 'Your {{leave_type}} leave has been approved', bodyHtml: '<p>Hi {{employee_name}},</p><p>Your {{leave_type}} leave from {{leave_start_date}} to {{leave_end_date}} has been approved.</p>' },
+    { templateKey: 'leave_rejected', name: 'Leave Rejected', module: 'leave', isMandatory: false, subject: 'Your {{leave_type}} leave request was not approved', bodyHtml: '<p>Hi {{employee_name}},</p><p>Your {{leave_type}} leave from {{leave_start_date}} to {{leave_end_date}} could not be approved. Please contact your manager for details.</p>' },
+    { templateKey: 'attendance_regularization', name: 'Attendance Regularization', module: 'attendance', isMandatory: false, subject: 'Attendance regularization request from {{employee_name}}', bodyHtml: '<p>{{employee_name}} has submitted an attendance regularization request.</p><p><a href="{{approval_link}}">Review Request</a></p>' },
+    { templateKey: 'expense_approval', name: 'Expense Claim Status', module: 'expenses', isMandatory: false, subject: 'Your expense claim has been {{status}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>Your expense claim has been {{status}} by {{manager_name}}.</p>' },
+    { templateKey: 'payroll_published', name: 'Payroll Published', module: 'payroll', isMandatory: true, subject: '{{company_name}} payroll for {{payroll_month}} has been processed', bodyHtml: '<p>Hi {{employee_name}},</p><p>Your payslip for {{payroll_month}} is now available.</p><p><a href="{{payslip_link}}">View Payslip</a></p>' },
+    { templateKey: 'payslip_available', name: 'Payslip Available', module: 'payroll', isMandatory: true, subject: 'Your payslip for {{payroll_month}} is ready', bodyHtml: '<p>Hi {{employee_name}},</p><p>Your payslip for {{payroll_month}} is available. <a href="{{payslip_link}}">Download Payslip</a></p>' },
+    { templateKey: 'tax_declaration_reminder', name: 'Tax Declaration Reminder', module: 'tax', isMandatory: true, subject: 'Action Required: Submit your tax declarations — {{company_name}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>The tax declaration window is now open. Please submit your investment declarations and upload proofs before the deadline.</p><p><a href="{{login_link}}">Submit Declarations</a></p>' },
+    { templateKey: 'hr_ticket_update', name: 'HR Ticket Update', module: 'helpdesk', isMandatory: false, subject: 'Update on your HR ticket #{{ticket_id}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>There is an update on your HR ticket #{{ticket_id}}. <a href="{{login_link}}">View ticket</a></p>' },
+    { templateKey: 'review_reminder', name: 'Performance Review Reminder', module: 'performance', isMandatory: false, subject: 'Action Required: Complete your performance review — {{review_cycle_name}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>Please complete your performance review for {{review_cycle_name}} before the deadline.</p><p><a href="{{login_link}}">Start Review</a></p>' },
+    { templateKey: 'survey_invite', name: 'Survey Invite', module: 'engagement', isMandatory: false, subject: '{{company_name}} — You are invited to participate in a survey', bodyHtml: '<p>Hi {{employee_name}},</p><p>{{company_name}} has launched a new survey. Your feedback is valuable.</p><p><a href="{{login_link}}">Take Survey</a></p>' },
+    { templateKey: 'policy_acknowledgement', name: 'Policy Acknowledgement', module: 'compliance', isMandatory: true, subject: 'Action Required: Acknowledge {{policy_name}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>Please review and acknowledge the policy: {{policy_name}}.</p><p><a href="{{login_link}}">Acknowledge Policy</a></p>' },
+    { templateKey: 'exit_process', name: 'Exit Process Update', module: 'offboarding', isMandatory: true, subject: 'Exit process update — {{company_name}}', bodyHtml: '<p>Hi {{employee_name}},</p><p>Your exit process has been initiated. Please complete the required tasks through the self-service portal.</p><p><a href="{{login_link}}">View Exit Tasks</a></p>' },
+    { templateKey: 'workflow_approval', name: 'Workflow Approval Request', module: 'workflows', isMandatory: false, subject: 'Approval required: {{workflow_name}}', bodyHtml: '<p>Hi {{manager_name}},</p><p>An approval request is pending your action.</p><p><a href="{{approval_link}}">Review and Approve</a></p>' },
+    { templateKey: 'integration_failure', name: 'Integration Failure Alert', module: 'developer', isMandatory: true, subject: 'Alert: Integration failure detected — {{company_name}}', bodyHtml: '<p>An integration failure has been detected for your {{company_name}} account. Please check the integration settings and take necessary action.</p><p><a href="{{login_link}}">View Details</a></p>' },
+  ];
+
+  for (const tpl of emailTemplates) {
+    await prisma.emailTemplate.upsert({
+      where: { tenantId_templateKey_language: { tenantId: null as unknown as string, templateKey: tpl.templateKey, language: 'en' } },
+      update: {},
+      create: {
+        tenantId: null,
+        templateKey: tpl.templateKey,
+        name: tpl.name,
+        subject: tpl.subject,
+        bodyHtml: tpl.bodyHtml,
+        bodyText: null,
+        variables: [],
+        language: 'en',
+        module: tpl.module,
+        isMandatory: tpl.isMandatory,
+        status: 'ACTIVE',
+        version: 1,
+      } as any,
+    });
+  }
+
+  // Seed mock SMTP config for demo tenant
+  const mockProvider = await prisma.emailProviderConfig.upsert({
+    where: { id: 'demo-email-provider' },
+    update: {},
+    create: {
+      id: 'demo-email-provider',
+      tenantId: tenant.id,
+      providerType: 'MOCK',
+      name: 'Demo Mock Provider',
+      isActive: true,
+      isDefault: true,
+      dailySendingLimit: 1000,
+      createdById: 'system',
+    },
+  });
+
   console.log('✅ Seed complete!');
   console.log('\n📋 Demo Credentials:');
   console.log('   Super Admin: admin@democorp.com');

@@ -5,6 +5,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { DatabaseModule } from './common/database/database.module';
 import { TaxModule } from './modules/tax/tax.module';
+import { EmailModule } from './modules/email/email.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { TaxModule } from './modules/tax/tax.module';
     ScheduleModule.forRoot(),
     DatabaseModule,
     TaxModule,
+    EmailModule,
   ],
 })
 export class AppModule {}

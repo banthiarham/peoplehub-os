@@ -2172,3 +2172,278 @@ model TaxAuditLog {
   @@index([tenantId, actorId])
   @@map("tax_audit_logs")
 }
+
+// ─── Email Infrastructure (Module 22) ────────────────────────────────────────
+
+enum EmailProviderType {
+  SMTP
+  SES
+  SENDGRID
+  MAILGUN
+  POSTMARK
+  MOCK
+}
+
+enum SmtpEncryption {
+  SSL
+  TLS
+  STARTTLS
+  NONE
+}
+
+enum EmailStatus {
+  DRAFT
+  QUEUED
+  SENDING
+  SENT
+  FAILED
+  BOUNCED
+  CANCELLED
+  SUPPRESSED
+}
+
+enum EmailTemplateStatus {
+  ACTIVE
+  INACTIVE
+  DRAFT
+}
+
+enum EmailSuppressionReason {
+  HARD_BOUNCE
+  INVALID_ADDRESS
+  MANUAL
+  SPAM_COMPLAINT
+}
+
+model EmailProviderConfig {
+  id                String            @id @default(cuid())
+  tenantId          String
+  providerType      EmailProviderType @default(SMTP)
+  name              String
+  isActive          Boolean           @default(false)
+  isDefault         Boolean           @default(false)
+  dailySendingLimit Int?
+  createdById       String
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  smtpConfig        SmtpConfig?
+  testLogs          EmailTestLog[]
+
+  @@index([tenantId])
+  @@map("email_provider_configs")
+}
+
+model SmtpConfig {
+  id               String              @id @default(cuid())
+  tenantId         String
+  providerId       String              @unique
+  host             String
+  port             Int
+  encryption       SmtpEncryption      @default(STARTTLS)
+  username         String
+  passwordEncrypted String
+  fromEmail        String
+  fromName         String
+  replyTo          String?
+  bounceEmail      String?
+  testRecipient    String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  provider         EmailProviderConfig @relation(fields: [providerId], references: [id])
+
+  @@index([tenantId])
+  @@map("smtp_configs")
+}
+
+model EmailTemplate {
+  id           String              @id @default(cuid())
+  tenantId     String?
+  templateKey  String
+  name         String
+  subject      String
+  bodyHtml     String              @db.Text
+  bodyText     String?             @db.Text
+  variables    Json                @default("[]")
+  language     String              @default("en")
+  module       String
+  isMandatory  Boolean             @default(false)
+  status       EmailTemplateStatus @default(ACTIVE)
+  version      Int                 @default(1)
+  createdById  String?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  versions     EmailTemplateVersion[]
+
+  @@unique([tenantId, templateKey, language])
+  @@index([tenantId, module])
+  @@map("email_templates")
+}
+
+model EmailTemplateVersion {
+  id          String   @id @default(cuid())
+  templateId  String
+  version     Int
+  subject     String
+  bodyHtml    String   @db.Text
+  bodyText    String?  @db.Text
+  variables   Json
+  changedById String?
+  createdAt   DateTime @default(now())
+
+  template    EmailTemplate @relation(fields: [templateId], references: [id])
+
+  @@index([templateId])
+  @@map("email_template_versions")
+}
+
+model EmailQueue {
+  id              String      @id @default(cuid())
+  tenantId        String
+  idempotencyKey  String?     @unique
+  to              String[]
+  cc              String[]    @default([])
+  bcc             String[]    @default([])
+  subject         String
+  bodyHtml        String      @db.Text
+  bodyText        String?     @db.Text
+  templateKey     String?
+  templateVars    Json?
+  module          String?
+  relatedType     String?
+  relatedId       String?
+  providerId      String?
+  isMandatory     Boolean     @default(false)
+  priority        Int         @default(5)
+  status          EmailStatus @default(QUEUED)
+  scheduledAt     DateTime?
+  processAfter    DateTime?
+  retryCount      Int         @default(0)
+  maxRetries      Int         @default(3)
+  lastError       String?     @db.Text
+  createdById     String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  deliveryLog     EmailDeliveryLog?
+  attachments     EmailAttachment[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, module])
+  @@index([processAfter])
+  @@map("email_queue")
+}
+
+model EmailDeliveryLog {
+  id             String      @id @default(cuid())
+  tenantId       String
+  queueId        String      @unique
+  to             String[]
+  cc             String[]    @default([])
+  subject        String
+  templateKey    String?
+  module         String?
+  relatedType    String?
+  relatedId      String?
+  providerType   String?
+  providerId     String?
+  status         EmailStatus
+  errorMessage   String?     @db.Text
+  retryCount     Int         @default(0)
+  messageId      String?
+  sentAt         DateTime?
+  openedAt       DateTime?
+  clickedAt      DateTime?
+  bouncedAt      DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  queue          EmailQueue  @relation(fields: [queueId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([tenantId, module])
+  @@index([tenantId, templateKey])
+  @@map("email_delivery_logs")
+}
+
+model EmailPreference {
+  id                    String   @id @default(cuid())
+  tenantId              String
+  employeeId            String
+  announcements         Boolean  @default(true)
+  recognition           Boolean  @default(true)
+  surveys               Boolean  @default(true)
+  reminders             Boolean  @default(true)
+  digestEmails          Boolean  @default(true)
+  digestFrequency       String   @default("DAILY")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([tenantId, employeeId])
+  @@map("email_preferences")
+}
+
+model EmailSuppression {
+  id               String                  @id @default(cuid())
+  tenantId         String?
+  email            String
+  reason           EmailSuppressionReason
+  note             String?
+  suppressedById   String?
+  createdAt        DateTime                @default(now())
+
+  @@unique([email])
+  @@index([tenantId])
+  @@map("email_suppressions")
+}
+
+model EmailAttachment {
+  id           String     @id @default(cuid())
+  queueId      String
+  fileObjectId String?
+  filename     String
+  contentType  String
+  sizeBytes    Int?
+  isSecureLink Boolean    @default(false)
+  secureUrl    String?
+  expiresAt    DateTime?
+  createdAt    DateTime   @default(now())
+
+  queue        EmailQueue @relation(fields: [queueId], references: [id])
+
+  @@index([queueId])
+  @@map("email_attachments")
+}
+
+model EmailEvent {
+  id         String   @id @default(cuid())
+  tenantId   String
+  queueId    String?
+  messageId  String?
+  eventType  String
+  email      String
+  metadata   Json?
+  occurredAt DateTime @default(now())
+
+  @@index([tenantId, eventType])
+  @@index([messageId])
+  @@map("email_events")
+}
+
+model EmailTestLog {
+  id         String              @id @default(cuid())
+  tenantId   String
+  providerId String
+  recipient  String
+  success    Boolean
+  error      String?
+  testedById String
+  testedAt   DateTime            @default(now())
+
+  provider   EmailProviderConfig @relation(fields: [providerId], references: [id])
+
+  @@index([tenantId, providerId])
+  @@map("email_test_logs")
+}
