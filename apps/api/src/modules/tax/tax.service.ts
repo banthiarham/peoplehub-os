@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../common/database/prisma.service';
-import { TaxRegime, AgeCategory, TaxRuleStatus } from '@prisma/client';
+import { TaxRegime, AgeCategory, TaxRuleStatus, Prisma } from '@prisma/client';
 
 @Injectable()
 export class TaxService {
@@ -77,7 +77,7 @@ export class TaxService {
       this.prisma.taxExemptionRule.findMany({ where: { tenantId, taxYearId: sourceTaxYearId } }),
     ]);
 
-    return this.prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const newYear = await tx.taxYear.create({
         data: {
           tenantId,

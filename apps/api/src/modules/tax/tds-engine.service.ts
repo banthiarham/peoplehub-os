@@ -1,6 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../common/database/prisma.service';
-import { TaxRegime, AgeCategory, Prisma } from '@prisma/client';
+import { TaxRegime, AgeCategory } from '@prisma/client';
+
+// Prisma Decimal fields are decimal.js objects at runtime — this interface covers what we need
+interface DecimalLike { toString(): string }
 
 export interface TdsCalculationInput {
   tenantId: string;
@@ -197,7 +200,7 @@ export class TdsEngineService {
 
   private applySlabs(
     taxableIncome: number,
-    slabs: { minIncome: Prisma.Decimal; maxIncome: Prisma.Decimal | null; taxRate: Prisma.Decimal; fixedTax: Prisma.Decimal }[],
+    slabs: { minIncome: DecimalLike; maxIncome: DecimalLike | null; taxRate: DecimalLike; fixedTax: DecimalLike }[],
   ): { tax: number; slabsApplied: SlabApplication[] } {
     let tax = 0;
     const slabsApplied: SlabApplication[] = [];
@@ -222,7 +225,7 @@ export class TdsEngineService {
   private applySurcharge(
     netTaxableIncome: number,
     taxAfterRebate: number,
-    surchargeRules: { minIncome: Prisma.Decimal; maxIncome: Prisma.Decimal | null; surchargeRate: Prisma.Decimal; marginalReliefEnabled: boolean }[],
+    surchargeRules: { minIncome: DecimalLike; maxIncome: DecimalLike | null; surchargeRate: DecimalLike; marginalReliefEnabled: boolean }[],
   ): number {
     const applicableRule = [...surchargeRules]
       .reverse()
