@@ -13,19 +13,23 @@ interface StatCardProps {
 
 export function StatCard({ label, value, delta, icon: Icon, children, className }: StatCardProps) {
   return (
-    <Card className={cn('p-5', className)}>
+    <Card className={cn('overflow-hidden p-5', className)}>
       <div className="flex items-start justify-between">
-        <div className="flex items-center gap-2 text-sm text-ink-muted">
-          {Icon && <Icon className="h-4 w-4" />}
+        <div className="flex items-center gap-2 text-[13px] font-medium text-ink-muted">
+          {Icon && (
+            <span className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-50 text-primary-700">
+              <Icon className="h-4 w-4" />
+            </span>
+          )}
           {label}
         </div>
       </div>
-      <div className="mt-2 flex items-baseline gap-2">
-        <span className="text-3xl font-semibold tracking-tight">{value}</span>
+      <div className="mt-3 flex flex-wrap items-baseline gap-2">
+        <span className="text-2xl font-semibold tracking-tight text-ink">{value}</span>
         {delta && (
           <span
             className={cn(
-              'inline-flex items-center gap-0.5 text-xs font-medium',
+              'inline-flex items-center gap-0.5 rounded-full px-2 py-0.5 text-xs font-medium',
               delta.positive ? 'text-success' : 'text-danger',
             )}
           >

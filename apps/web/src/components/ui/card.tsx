@@ -3,18 +3,18 @@ import { cn } from '@/lib/utils';
 export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn('rounded-2xl border border-line bg-card shadow-card', className)}
+      className={cn('rounded-lg border border-line bg-card shadow-card', className)}
       {...props}
     />
   );
 }
 
 export function CardHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('flex flex-col gap-1 p-5 pb-2', className)} {...props} />;
+  return <div className={cn('flex flex-col gap-1 border-b border-line/70 px-5 py-4', className)} {...props} />;
 }
 
 export function CardTitle({ className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
-  return <h3 className={cn('text-sm font-semibold', className)} {...props} />;
+  return <h3 className={cn('text-[13px] font-semibold uppercase tracking-[0.08em] text-ink-muted', className)} {...props} />;
 }
 
 export function CardDescription({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
@@ -22,5 +22,5 @@ export function CardDescription({ className, ...props }: React.HTMLAttributes<HT
 }
 
 export function CardContent({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('p-5 pt-3', className)} {...props} />;
+  return <div className={cn('p-5', className)} {...props} />;
 }
