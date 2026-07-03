@@ -1,0 +1,102 @@
+'use client';
+
+import { signIn } from 'next-auth/react';
+import { useRouter } from 'next/navigation';
+import { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [email, setEmail] = useState('admin@democorp.com');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    const res = await signIn('credentials', { email, password, redirect: false });
+    setLoading(false);
+    if (res?.error) {
+      setError('Invalid email or password');
+    } else {
+      router.push('/dashboard');
+      router.refresh();
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen">
+      <div className="relative hidden w-1/2 flex-col justify-between overflow-hidden bg-primary-950 p-12 lg:flex">
+        <div
+          className="pointer-events-none absolute inset-0 opacity-[0.07]"
+          style={{
+            backgroundImage:
+              'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)',
+            backgroundSize: '48px 48px',
+          }}
+        />
+        <div className="flex items-center gap-2.5">
+          <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-white text-base font-bold text-primary-800">
+            P
+          </span>
+          <span className="text-lg font-semibold text-white">
+            PeopleHub <span className="font-normal text-primary-300">OS</span>
+          </span>
+        </div>
+        <div>
+          <h1 className="max-w-md text-4xl font-semibold leading-tight text-white">
+            The people platform for modern India.
+          </h1>
+          <p className="mt-4 max-w-md text-primary-200">
+            Payroll, attendance, hiring, performance and an AI copilot — one system your whole
+            company runs on.
+          </p>
+        </div>
+        <p className="text-sm text-primary-400">© 2026 PeopleHub OS</p>
+      </div>
+      <div className="flex w-full items-center justify-center p-8 lg:w-1/2">
+        <div className="w-full max-w-sm">
+          <h2 className="text-2xl font-semibold tracking-tight">Welcome back</h2>
+          <p className="mt-1 text-sm text-ink-muted">Sign in to your workspace</p>
+          <form onSubmit={onSubmit} className="mt-8 space-y-4">
+            <div>
+              <label className="mb-1.5 block text-sm font-medium">Work email</label>
+              <Input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+                autoComplete="email"
+              />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-sm font-medium">Password</label>
+              <Input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+                placeholder="••••••••"
+              />
+            </div>
+            {error && <p className="text-sm text-danger">{error}</p>}
+            <Button type="submit" className="w-full" disabled={loading}>
+              {loading ? 'Signing in…' : 'Sign in'}
+            </Button>
+          </form>
+          <div className="mt-6 rounded-xl border border-line bg-canvas p-4 text-xs text-ink-muted">
+            <p className="font-medium text-ink">Demo credentials</p>
+            <p className="mt-1">admin@democorp.com · hr@democorp.com · payroll@democorp.com</p>
+            <p>
+              Password: <code className="rounded bg-white px-1 py-0.5">Demo@123</code>
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

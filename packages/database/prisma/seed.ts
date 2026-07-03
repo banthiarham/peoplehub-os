@@ -484,10 +484,12 @@ async function main() {
   ];
 
   for (const tpl of emailTemplates) {
-    await prisma.emailTemplate.upsert({
-      where: { tenantId_templateKey_language: { tenantId: null as unknown as string, templateKey: tpl.templateKey, language: 'en' } },
-      update: {},
-      create: {
+    const existingTpl = await prisma.emailTemplate.findFirst({
+      where: { tenantId: null, templateKey: tpl.templateKey, language: 'en' },
+    });
+    if (existingTpl) continue;
+    await prisma.emailTemplate.create({
+      data: {
         tenantId: null,
         templateKey: tpl.templateKey,
         name: tpl.name,

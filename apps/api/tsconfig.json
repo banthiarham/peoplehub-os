@@ -8,8 +8,18 @@
     "rootDir": "src",
     "emitDecoratorMetadata": true,
     "experimentalDecorators": true,
-    "strictPropertyInitialization": false
+    "strictPropertyInitialization": false,
+    "noEmit": false,
+    "isolatedModules": false,
+    "declaration": false,
+    "declarationMap": false
   },
-  "include": ["src", "test"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src",
+    "test"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }
