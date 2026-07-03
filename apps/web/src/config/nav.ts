@@ -7,6 +7,8 @@ import {
   Laptop,
   LayoutDashboard,
   LifeBuoy,
+  Mail,
+  ReceiptText,
   Settings,
   Sparkles,
   Target,
@@ -47,7 +49,10 @@ export const NAV_SECTIONS: NavSection[] = [
   },
   {
     title: 'Pay',
-    items: [{ label: 'Payroll', href: '/payroll', icon: Wallet }],
+    items: [
+      { label: 'Payroll', href: '/payroll', icon: Wallet },
+      { label: 'Tax Engine', href: '/tax', icon: ReceiptText },
+    ],
   },
   {
     title: 'Talent',
@@ -68,6 +73,7 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: 'Admin',
     items: [
+      { label: 'Communications', href: '/communications', icon: Mail },
       { label: 'Developer', href: '/developer', icon: Code2 },
       { label: 'Settings', href: '/settings', icon: Settings },
     ],

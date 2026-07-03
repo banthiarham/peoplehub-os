@@ -3,11 +3,23 @@
 @tailwind utilities;
 
 @layer base {
-  body {
-    @apply bg-canvas text-ink antialiased;
+  html {
+    @apply bg-canvas;
   }
+
+  body {
+    @apply min-h-screen bg-canvas text-ink antialiased;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(246, 247, 249, 0) 320px),
+      #f6f7f9;
+  }
+
   ::selection {
     @apply bg-primary-200;
+  }
+
+  * {
+    @apply border-line;
   }
 }
 
