@@ -520,6 +520,552 @@ async function main() {
     },
   });
 
+  // ── Demo data enrichment ───────────────────────────────────────────────────
+  console.log('👥 Seeding demo employees & transactional data...');
+
+  const DEMO_HASH = '$2a$10$Pgk3TwRa5jYs2ZYavDVdauPN6HDNCt.xCvhwjGfV25paQ10UKMCMe'; // Demo@123
+  await prisma.user.updateMany({
+    where: { tenantId: tenant.id, email: { in: ['admin@democorp.com', 'hr@democorp.com', 'payroll@democorp.com'] } },
+    data: { passwordHash: DEMO_HASH },
+  });
+
+  const allRoles = await prisma.role.findMany({ where: { tenantId: tenant.id } });
+  const roleId = (name: string) => allRoles.find((r) => r.name === name)!.id;
+  await prisma.userRole.createMany({
+    data: [
+      { userId: adminUser.id, roleId: roleId('Super Admin') },
+      { userId: hrUser.id, roleId: roleId('HR Admin') },
+      { userId: hrUser.id, roleId: roleId('Manager') },
+      { userId: payrollUser.id, roleId: roleId('Payroll Admin') },
+    ],
+    skipDuplicates: true,
+  });
+
+  await prisma.jobRequisition.updateMany({
+    where: { tenantId: tenant.id, status: 'ACTIVE' },
+    data: { status: 'OPEN' },
+  });
+
+  const shift = (await prisma.shift.findFirst({ where: { tenantId: tenant.id } }))!;
+
+  // Deterministic pseudo-random
+  let rndState = 42;
+  const rnd = () => {
+    rndState = (rndState * 1103515245 + 12345) % 2147483648;
+    return rndState / 2147483648;
+  };
+
+  const FIRST = ['Aarav','Priya','Rohan','Ananya','Vikram','Sneha','Arjun','Kavya','Rahul','Meera','Karan','Divya','Aditya','Pooja','Nikhil','Riya','Siddharth','Neha','Manish','Isha','Varun','Tanvi','Rajat','Shreya','Amit','Nandini','Harsh','Aisha','Deepak','Lakshmi','Sameer','Ritika','Gaurav','Anjali','Yash'];
+  const LAST = ['Sharma','Patel','Reddy','Iyer','Singh','Nair','Gupta','Menon','Verma','Krishnan','Malhotra','Desai','Joshi','Kulkarni','Chopra','Banerjee','Rao','Mehta','Agarwal','Pillai','Kapoor','Saxena','Bhat','Chauhan','Mishra','Hegde','Trivedi','Khan','Yadav','Subramanian','Sinha','Dutta','Bose','Naidu','Shetty'];
+
+  const today0 = new Date();
+  const dayMs = 24 * 3600 * 1000;
+  const employees: Array<Awaited<ReturnType<typeof prisma.employee.create>>> = [];
+
+  for (let i = 0; i < 35; i++) {
+    const deptIdx = i % 8;
+    const isHead = i < 8;
+    const joinDaysAgo = i < 3 ? 20 + i * 15 : Math.floor(rnd() * 1400) + 90;
+    const joiningDate = new Date(today0.getTime() - joinDaysAgo * dayMs);
+    const emp = await prisma.employee.create({
+      data: {
+        tenantId: tenant.id,
+        employeeCode: `EMP-${String(i + 1).padStart(4, '0')}`,
+        firstName: FIRST[i]!,
+        lastName: LAST[i]!,
+        workEmail: `${FIRST[i]!.toLowerCase()}.${LAST[i]!.toLowerCase()}@democorp.com`,
+        phone: `+91 98${String(10000000 + i * 13579).slice(0, 8)}`,
+        gender: i % 2 === 0 ? 'MALE' : 'FEMALE',
+        dateOfBirth: new Date(1980 + (i % 20), i % 12, (i % 27) + 1),
+        joiningDate,
+        status: joinDaysAgo < 180 ? 'ON_PROBATION' : 'CONFIRMED',
+        employmentType: i >= 33 ? 'INTERN' : i >= 31 ? 'CONTRACTOR' : 'FULL_TIME',
+        workMode: i % 5 === 0 ? 'REMOTE' : i % 3 === 0 ? 'HYBRID' : 'OFFICE',
+        departmentId: departments[deptIdx]!.id,
+        designationId: designations[isHead ? 7 : i % 7]!.id,
+        locationId: locations[i % 4]!.id,
+        legalEntityId: entity1.id,
+        managerId: isHead ? (i === 0 ? null : employees[0]!.id) : employees[deptIdx]!.id,
+        pan: `ABCDE${String(1000 + i)}F`,
+        uan: `1000${String(10000000 + i * 7)}`,
+        taxRegime: i % 4 === 0 ? 'OLD' : 'NEW',
+      },
+    });
+    employees.push(emp);
+  }
+
+  // Link login users to employees
+  await prisma.employee.update({ where: { id: employees[0]!.id }, data: { userId: adminUser.id } });
+  await prisma.employee.update({ where: { id: employees[4]!.id }, data: { userId: hrUser.id } });
+  await prisma.employee.update({ where: { id: employees[5]!.id }, data: { userId: payrollUser.id } });
+
+  // Salaries
+  const ctcFor = (i: number) => (i < 8 ? 3200000 + i * 150000 : 450000 + Math.floor(rnd() * 1800000));
+  const buildComponents = (ctc: number) => {
+    const monthlyCtc = ctc / 12;
+    let gross = monthlyCtc;
+    for (let k = 0; k < 3; k++) {
+      gross = monthlyCtc - 0.12 * Math.min(gross * 0.4, 15000);
+    }
+    const basic = Math.round(gross * 0.4);
+    const hra = Math.round(basic * 0.5);
+    const sa = Math.round(gross - basic - hra);
+    return {
+      gross: Math.round(gross),
+      list: [
+        { code: 'BASIC', name: 'Basic', type: 'EARNING', monthly: basic, annual: basic * 12 },
+        { code: 'HRA', name: 'HRA', type: 'EARNING', monthly: hra, annual: hra * 12 },
+        { code: 'SA', name: 'Special Allowance', type: 'EARNING', monthly: sa, annual: sa * 12 },
+      ],
+      basic,
+    };
+  };
+  for (let i = 0; i < employees.length; i++) {
+    const ctc = ctcFor(i);
+    const breakup = buildComponents(ctc);
+    await prisma.employeeSalary.create({
+      data: {
+        employeeId: employees[i]!.id,
+        salaryStructureId: salaryStructure.id,
+        ctc,
+        effectiveFrom: employees[i]!.joiningDate ?? new Date(),
+        components: breakup.list,
+      },
+    });
+  }
+
+  // Attendance: last 45 days, skipping weekends
+  const holidays = await prisma.holiday.findMany({ where: { holidayCalendar: { tenantId: tenant.id } } });
+  const holidaySet = new Set(holidays.map((h) => h.date.toISOString().slice(0, 10)));
+  const attendanceRows: Array<Record<string, unknown>> = [];
+  for (let d = 45; d >= 0; d--) {
+    const day = new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), today0.getDate() - d));
+    const dow = day.getUTCDay();
+    if (dow === 0 || dow === 6) continue;
+    if (holidaySet.has(day.toISOString().slice(0, 10))) continue;
+    for (let i = 0; i < employees.length; i++) {
+      const emp = employees[i]!;
+      if (emp.joiningDate && emp.joiningDate > day) continue;
+      const roll = rnd();
+      let status = 'PRESENT';
+      if (roll > 0.96) status = 'ABSENT';
+      else if (roll > 0.9) status = 'ON_LEAVE';
+      else if (roll > 0.82) status = 'LATE';
+      const inMin = status === 'LATE' ? 40 + Math.floor(rnd() * 60) : Math.floor(rnd() * 30) - 15;
+      const punchIn = new Date(day.getTime() + (9 * 60 + inMin) * 60000);
+      const workMins = 8 * 60 + Math.floor(rnd() * 90);
+      attendanceRows.push({
+        tenantId: tenant.id,
+        employeeId: emp.id,
+        date: day,
+        status,
+        punchIn: status === 'ABSENT' || status === 'ON_LEAVE' ? null : punchIn,
+        punchOut:
+          status === 'ABSENT' || status === 'ON_LEAVE'
+            ? null
+            : new Date(punchIn.getTime() + workMins * 60000),
+        workingMinutes: status === 'ABSENT' || status === 'ON_LEAVE' ? null : workMins,
+        punchSource: 'WEB',
+      });
+    }
+  }
+  await prisma.attendanceRecord.createMany({ data: attendanceRows as never, skipDuplicates: true });
+
+  // Leave balances + requests
+  const year = today0.getFullYear();
+  const allocation: Record<string, number> = { CL: 12, SL: 12, EL: 15, ML: 26, LWP: 0 };
+  for (const emp of employees) {
+    for (const lt of leaveTypes) {
+      if (lt.code === 'ML' && emp.gender !== 'FEMALE') continue;
+      const alloc = allocation[lt.code] ?? 0;
+      const used = alloc > 0 ? Math.floor(rnd() * Math.min(alloc, 6)) : 0;
+      await prisma.leaveBalance.create({
+        data: {
+          employeeId: emp.id,
+          leaveTypeId: lt.id,
+          year,
+          openingBalance: alloc,
+          accrued: alloc,
+          used,
+          balance: alloc - used,
+        },
+      });
+    }
+  }
+  const leaveStatuses = ['APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','APPROVED','PENDING','PENDING','PENDING','PENDING','PENDING','PENDING','REJECTED','REJECTED'] as const;
+  for (let i = 0; i < leaveStatuses.length; i++) {
+    const emp = employees[(i * 3) % employees.length]!;
+    const lt = leaveTypes[i % 3]!; // CL, SL, EL only
+    const status = leaveStatuses[i]!;
+    const offset = status === 'PENDING' ? 3 + i : -(5 + i * 2);
+    const from = new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), today0.getDate() + offset));
+    const days = 1 + (i % 3);
+    const to = new Date(from.getTime() + (days - 1) * dayMs);
+    await prisma.leaveRequest.create({
+      data: {
+        tenantId: tenant.id,
+        employeeId: emp.id,
+        leaveTypeId: lt.id,
+        fromDate: from,
+        toDate: to,
+        days,
+        reason: ['Family function','Not feeling well','Personal errand','Travel plans','Medical appointment'][i % 5],
+        status,
+      },
+    });
+  }
+
+  // Payroll: previous 5 months published runs + current run entries
+  const calcMonth = (ctc: number, emi = 0) => {
+    const b = buildComponents(ctc);
+    const gross = b.gross;
+    const pf = Math.round(0.12 * Math.min(b.basic, 15000));
+    const esi = gross <= 21000 ? Math.round(gross * 0.0075) : 0;
+    const pt = gross >= 15000 ? 200 : gross >= 10000 ? 150 : 0;
+    const annualTaxable = Math.max(0, gross * 12 - 75000);
+    let tds = 0;
+    if (annualTaxable > 1200000) {
+      const slabs: Array<[number, number, number]> = [[0,400000,0],[400000,800000,0.05],[800000,1200000,0.1],[1200000,1600000,0.15],[1600000,2000000,0.2],[2000000,2400000,0.25],[2400000,Infinity,0.3]];
+      let tax = 0;
+      for (const [lo, hi, rate] of slabs) if (annualTaxable > lo) tax += (Math.min(annualTaxable, hi) - lo) * rate;
+      tds = Math.round((tax * 1.04) / 12);
+    }
+    const deductions = pf + esi + pt + tds + emi;
+    const comps = [
+      ...b.list,
+      { code: 'PF_EMP', name: 'Provident Fund (Employee)', type: 'DEDUCTION', monthly: pf, annual: pf * 12 },
+      ...(esi ? [{ code: 'ESI_EMP', name: 'ESI (Employee)', type: 'DEDUCTION', monthly: esi, annual: esi * 12 }] : []),
+      ...(pt ? [{ code: 'PT', name: 'Professional Tax', type: 'DEDUCTION', monthly: pt, annual: pt * 12 }] : []),
+      ...(tds ? [{ code: 'TDS', name: 'TDS', type: 'DEDUCTION', monthly: tds, annual: tds * 12 }] : []),
+    ];
+    return { gross, deductions, net: gross - deductions, comps };
+  };
+
+  for (let m = 5; m >= 1; m--) {
+    const runDate = new Date(today0.getFullYear(), today0.getMonth() - m, 1);
+    const run = await prisma.payrollRun.create({
+      data: {
+        tenantId: tenant.id,
+        month: runDate.getMonth() + 1,
+        year: runDate.getFullYear(),
+        status: 'PUBLISHED',
+        publishedAt: new Date(runDate.getFullYear(), runDate.getMonth() + 1, 1),
+      },
+    });
+    for (let i = 0; i < employees.length; i++) {
+      const emp = employees[i]!;
+      if (emp.joiningDate && emp.joiningDate > runDate) continue;
+      const r = calcMonth(ctcFor(i));
+      await prisma.payrollRunEmployee.create({
+        data: {
+          payrollRunId: run.id,
+          employeeId: emp.id,
+          grossPay: r.gross,
+          totalDeductions: r.deductions,
+          netPay: r.net,
+          payableDays: 30,
+          components: r.comps,
+        },
+      });
+      await prisma.payslip.create({
+        data: {
+          tenantId: tenant.id,
+          employeeId: emp.id,
+          payrollRunId: run.id,
+          month: run.month,
+          year: run.year,
+          grossPay: r.gross,
+          totalDeductions: r.deductions,
+          netPay: r.net,
+          components: r.comps,
+          publishedAt: run.publishedAt,
+        },
+      });
+    }
+  }
+  // Current-month run entries (kept in DRAFT for the demo flow)
+  for (let i = 0; i < employees.length; i++) {
+    const r = calcMonth(ctcFor(i));
+    await prisma.payrollRunEmployee.create({
+      data: {
+        payrollRunId: payrollRun.id,
+        employeeId: employees[i]!.id,
+        grossPay: r.gross,
+        totalDeductions: r.deductions,
+        netPay: r.net,
+        payableDays: 30,
+        components: r.comps,
+      },
+    });
+  }
+
+  // Recruitment: candidates, interviews, offers
+  const jobs = await prisma.jobRequisition.findMany({ where: { tenantId: tenant.id } });
+  const CAND_STAGES = ['APPLIED','APPLIED','SCREENING','SCREENING','RECRUITER_CALL','TECHNICAL_ROUND','TECHNICAL_ROUND','MANAGER_ROUND','HR_ROUND','OFFER_SENT','OFFER_ACCEPTED','REJECTED','APPLIED','SCREENING'] as const;
+  const CAND_SOURCES = ['LinkedIn','Naukri','Referral','Website','LinkedIn','Referral','Naukri'];
+  const CAND_FIRST = ['Ishaan','Zara','Kabir','Myra','Vivaan','Anika','Reyansh','Sara','Ayaan','Diya','Advait','Kiara','Dhruv','Navya'];
+  const CAND_LAST = ['Bajaj','Fernandes','Oberoi','Mathur','Chandra','Rana','Tandon','Bhalla','Sethi','Grover','Anand','Kohli','Vohra','Sood'];
+  const candidates: Array<Awaited<ReturnType<typeof prisma.candidate.create>>> = [];
+  for (let i = 0; i < 14; i++) {
+    const cand = await prisma.candidate.create({
+      data: {
+        tenantId: tenant.id,
+        jobRequisitionId: jobs[i % jobs.length]!.id,
+        firstName: CAND_FIRST[i]!,
+        lastName: CAND_LAST[i]!,
+        email: `${CAND_FIRST[i]!.toLowerCase()}.${CAND_LAST[i]!.toLowerCase()}@example.com`,
+        phone: `+91 97${String(10000000 + i * 24681).slice(0, 8)}`,
+        currentStage: CAND_STAGES[i]!,
+        source: CAND_SOURCES[i % CAND_SOURCES.length],
+        currentCTC: 800000 + i * 120000,
+        expectedCTC: 1100000 + i * 150000,
+        noticePeriodDays: [30, 60, 90][i % 3],
+      },
+    });
+    candidates.push(cand);
+  }
+  for (let i = 0; i < 6; i++) {
+    const upcoming = i < 2;
+    await prisma.interview.create({
+      data: {
+        tenantId: tenant.id,
+        candidateId: candidates[i + 4]!.id,
+        jobRequisitionId: candidates[i + 4]!.jobRequisitionId,
+        stage: ['TECHNICAL_ROUND', 'MANAGER_ROUND', 'HR_ROUND'][i % 3]!,
+        scheduledAt: new Date(today0.getTime() + (upcoming ? (i + 1) * dayMs : -(i * 2 + 1) * dayMs)),
+        interviewers: [`${FIRST[i]} ${LAST[i]}`],
+        mode: i % 2 === 0 ? 'VIDEO' : 'IN_PERSON',
+        ...(upcoming ? {} : { rating: 3 + (i % 3), result: i % 3 === 2 ? 'ON_HOLD' : 'PASS', feedback: 'Strong fundamentals, good communication.' }),
+      },
+    });
+  }
+  await prisma.offer.create({
+    data: { tenantId: tenant.id, candidateId: candidates[9]!.id, ctc: 2400000, joiningDate: new Date(today0.getTime() + 30 * dayMs), designation: 'Senior Full Stack Engineer', status: 'SENT' },
+  });
+  await prisma.offer.create({
+    data: { tenantId: tenant.id, candidateId: candidates[10]!.id, ctc: 2100000, joiningDate: new Date(today0.getTime() + 45 * dayMs), designation: 'Product Manager', status: 'ACCEPTED' },
+  });
+
+  // Performance: goals, review responses, feedback
+  const GOAL_TITLES = ['Ship payroll v2 engine','Reduce time-to-hire to 21 days','Improve eNPS by 10 points','Close Q3 enterprise deals','Launch referral program','Migrate CI to Node 24','Automate compliance reports','Redesign onboarding flow','Cut infra cost by 15%','Mentor two junior engineers','Achieve 99.9% uptime','Publish API v1 docs','Run 4 pulse surveys','Roll out OKR process','Complete SOC2 readiness'];
+  for (let i = 0; i < GOAL_TITLES.length; i++) {
+    const progress = [10, 25, 40, 55, 70, 85, 100][i % 7]!;
+    await prisma.goal.create({
+      data: {
+        tenantId: tenant.id,
+        employeeId: employees[(i * 2) % employees.length]!.id,
+        title: GOAL_TITLES[i]!,
+        type: i % 5 === 0 ? 'COMPANY' : i % 3 === 0 ? 'TEAM' : 'INDIVIDUAL',
+        progress,
+        status: progress === 100 ? 'COMPLETED' : progress < 30 && i % 4 === 0 ? 'AT_RISK' : 'ACTIVE',
+        targetDate: new Date(today0.getFullYear(), 11, 31),
+      },
+    });
+  }
+  const cycle = await prisma.reviewCycle.findFirst({ where: { tenantId: tenant.id } });
+  if (cycle) {
+    for (let i = 0; i < 8; i++) {
+      await prisma.reviewResponse.create({
+        data: {
+          reviewCycleId: cycle.id,
+          revieweeId: employees[i + 8]!.id,
+          reviewerId: employees[i % 8]!.id,
+          reviewerType: 'MANAGER',
+          overallRating: 3 + (i % 3),
+          comments: 'Consistent performer; strong ownership this cycle.',
+          responses: { strengths: 'Delivery, collaboration', growth: 'Delegation' },
+          submittedAt: new Date(today0.getTime() - i * dayMs),
+        },
+      });
+    }
+  }
+  const FEEDBACK_MSGS = ['Great job on the client demo!','Thanks for unblocking the release.','Excellent documentation on the new module.','Your onboarding buddy support was fantastic.','Impressive debugging under pressure.','Loved the sprint retro facilitation.','Thanks for covering on-call.','Solid RCA writeup.','Great mentoring this month.','Clean, well-tested PRs — keep it up.'];
+  for (let i = 0; i < FEEDBACK_MSGS.length; i++) {
+    await prisma.feedback.create({
+      data: {
+        tenantId: tenant.id,
+        giverId: employees[i % 8]!.id,
+        recipientId: employees[(i + 10) % employees.length]!.id,
+        type: i % 2 === 0 ? 'PRAISE' : 'FEEDBACK',
+        message: FEEDBACK_MSGS[i]!,
+        isPublic: i % 2 === 0,
+      },
+    });
+  }
+
+  // Engagement: survey responses + recognitions
+  const survey = await prisma.survey.findFirst({ where: { tenantId: tenant.id } });
+  if (survey) {
+    for (let i = 0; i < 12; i++) {
+      await prisma.surveyResponse.create({
+        data: {
+          surveyId: survey.id,
+          responses: { '1': 3 + (i % 3), '2': 3 + ((i + 1) % 3), '3': 6 + (i % 5), '4': i % 4 === 0 ? 'More team offsites please!' : '' },
+        },
+      });
+    }
+  }
+  const BADGES = ['TEAM_PLAYER','INNOVATOR','CUSTOMER_FIRST','OWNERSHIP','MENTOR'];
+  const RECOG_MSGS = ['Went above and beyond for the payroll release','Brilliant fix for the attendance sync bug','Always there to help new joiners','Owned the client escalation end to end','Made our sprint demos delightful'];
+  for (let i = 0; i < 15; i++) {
+    await prisma.recognition.create({
+      data: {
+        tenantId: tenant.id,
+        giverId: employees[i % 10]!.id,
+        recipientId: employees[(i + 7) % employees.length]!.id,
+        badge: BADGES[i % BADGES.length],
+        message: RECOG_MSGS[i % RECOG_MSGS.length]!,
+      },
+    });
+  }
+
+  // Helpdesk tickets
+  const TICKETS = [
+    { category: 'PAYROLL', subject: 'Payslip for May not visible', priority: 'HIGH', status: 'OPEN' },
+    { category: 'IT', subject: 'Laptop running very slow', priority: 'MEDIUM', status: 'IN_PROGRESS' },
+    { category: 'HR', subject: 'Need employment verification letter', priority: 'MEDIUM', status: 'RESOLVED' },
+    { category: 'LEAVE', subject: 'Leave balance looks incorrect', priority: 'HIGH', status: 'OPEN' },
+    { category: 'IT', subject: 'VPN access for remote work', priority: 'URGENT', status: 'IN_PROGRESS' },
+    { category: 'FACILITIES', subject: 'AC not working on 3rd floor', priority: 'LOW', status: 'RESOLVED' },
+    { category: 'PAYROLL', subject: 'PF contribution query', priority: 'MEDIUM', status: 'WAITING' },
+    { category: 'HR', subject: 'Update emergency contact', priority: 'LOW', status: 'CLOSED' },
+    { category: 'IT', subject: 'Request second monitor', priority: 'LOW', status: 'OPEN' },
+    { category: 'HR', subject: 'Insurance card not received', priority: 'HIGH', status: 'IN_PROGRESS' },
+  ] as const;
+  for (let i = 0; i < TICKETS.length; i++) {
+    const t = TICKETS[i]!;
+    const ticket = await prisma.ticket.create({
+      data: {
+        tenantId: tenant.id,
+        employeeId: employees[(i * 4) % employees.length]!.id,
+        category: t.category,
+        subject: t.subject,
+        description: `${t.subject} — raised via employee portal.`,
+        priority: t.priority,
+        status: t.status,
+        ...(t.status === 'RESOLVED' || t.status === 'CLOSED'
+          ? { resolvedAt: new Date(today0.getTime() - i * dayMs) }
+          : {}),
+      },
+    });
+    if (i % 3 === 0) {
+      await prisma.ticketComment.create({
+        data: { ticketId: ticket.id, authorId: hrUser.id, message: 'We are looking into this — expect an update within 24 hours.' },
+      });
+    }
+  }
+
+  // Assets
+  const ASSET_DEFS = [
+    ...Array.from({ length: 8 }, (_, i) => ({ name: `MacBook Pro 14 #${i + 1}`, category: 'LAPTOP' })),
+    ...Array.from({ length: 4 }, (_, i) => ({ name: `Dell U2723QE Monitor #${i + 1}`, category: 'MONITOR' })),
+    ...Array.from({ length: 3 }, (_, i) => ({ name: `iPhone 15 #${i + 1}`, category: 'PHONE' })),
+  ];
+  for (let i = 0; i < ASSET_DEFS.length; i++) {
+    const assigned = i < 10;
+    const asset = await prisma.asset.create({
+      data: {
+        tenantId: tenant.id,
+        name: ASSET_DEFS[i]!.name,
+        category: ASSET_DEFS[i]!.category,
+        serialNumber: `SN-${2024000 + i * 17}`,
+        purchaseCost: ASSET_DEFS[i]!.category === 'LAPTOP' ? 210000 : ASSET_DEFS[i]!.category === 'MONITOR' ? 45000 : 80000,
+        condition: 'GOOD',
+        status: assigned ? 'ASSIGNED' : 'AVAILABLE',
+      },
+    });
+    if (assigned) {
+      await prisma.assetAssignment.create({
+        data: { assetId: asset.id, employeeId: employees[i]!.id, assignedAt: new Date(today0.getTime() - (i + 10) * dayMs) },
+      });
+    }
+  }
+
+  // Projects + timesheets
+  const projects = await Promise.all([
+    prisma.project.create({ data: { tenantId: tenant.id, name: 'PeopleHub Platform', code: 'PHUB', status: 'ACTIVE' } }),
+    prisma.project.create({ data: { tenantId: tenant.id, name: 'Client Implementation — Acme', code: 'ACME', clientName: 'Acme Corp', status: 'ACTIVE' } }),
+    prisma.project.create({ data: { tenantId: tenant.id, name: 'Internal Tooling', code: 'INT', status: 'ACTIVE' } }),
+  ]);
+  const monday = new Date(today0);
+  monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7) - 7); // last week's Monday
+  monday.setHours(0, 0, 0, 0);
+  for (let i = 0; i < 5; i++) {
+    const entries = [0, 1, 2, 3, 4].map((d) => ({
+      date: new Date(monday.getTime() + d * dayMs).toISOString().slice(0, 10),
+      hours: 7 + (d % 2),
+      task: 'Feature development',
+      billable: true,
+    }));
+    await prisma.timesheet.create({
+      data: {
+        tenantId: tenant.id,
+        employeeId: employees[i + 8]!.id,
+        projectId: projects[i % 3]!.id,
+        weekStart: monday,
+        entries,
+        totalHours: entries.reduce((s, e) => s + e.hours, 0),
+        billableHours: entries.reduce((s, e) => s + e.hours, 0),
+        status: i < 3 ? 'APPROVED' : 'SUBMITTED',
+        submittedAt: new Date(monday.getTime() + 5 * dayMs),
+      },
+    });
+  }
+
+  // Expenses, loan, approvals, notifications
+  await prisma.expenseClaim.createMany({
+    data: [
+      { tenantId: tenant.id, employeeId: employees[10]!.id, category: 'TRAVEL', amount: 4850, description: 'Client visit — Mumbai', status: 'SUBMITTED' },
+      { tenantId: tenant.id, employeeId: employees[12]!.id, category: 'MEALS', amount: 1200, description: 'Team lunch', status: 'APPROVED' },
+      { tenantId: tenant.id, employeeId: employees[15]!.id, category: 'INTERNET', amount: 999, description: 'Home broadband — June', status: 'PAID' },
+    ],
+  });
+  await prisma.loan.create({
+    data: {
+      tenantId: tenant.id,
+      employeeId: employees[14]!.id,
+      type: 'LOAN',
+      amount: 120000,
+      outstanding: 90000,
+      emiAmount: 10000,
+      emiStartMonth: today0.getMonth(),
+      emiStartYear: today0.getFullYear(),
+      totalInstallments: 12,
+      paidInstallments: 3,
+    },
+  });
+  for (let i = 0; i < 5; i++) {
+    await prisma.approvalRequest.create({
+      data: {
+        tenantId: tenant.id,
+        requesterId: employees[(i * 5 + 9) % employees.length]!.id,
+        approverId: employees[i % 8]!.id,
+        module: i % 2 === 0 ? 'leave' : 'expenses',
+        objectType: i % 2 === 0 ? 'LeaveRequest' : 'ExpenseClaim',
+        objectId: `demo-${i}`,
+        requestData: { note: 'Awaiting your approval' },
+      },
+    });
+  }
+  const NOTIFS = [
+    { type: 'LEAVE', title: 'Leave request pending', body: '6 leave requests need your approval' },
+    { type: 'PAYROLL', title: 'Payroll run ready', body: 'June payroll run is ready for review' },
+    { type: 'HIRING', title: 'Interview today', body: 'Technical round with Vivaan Chandra at 3:00 PM' },
+    { type: 'SYSTEM', title: 'Welcome to PeopleHub OS', body: 'Explore the dashboard to get started' },
+    { type: 'ENGAGEMENT', title: 'Pulse survey live', body: 'Q3 pulse survey closes this Friday' },
+    { type: 'HELPDESK', title: 'Ticket escalated', body: 'VPN access ticket marked URGENT' },
+  ];
+  for (let i = 0; i < 12; i++) {
+    const n = NOTIFS[i % NOTIFS.length]!;
+    await prisma.notification.create({
+      data: { tenantId: tenant.id, userId: adminUser.id, type: n.type, title: n.title, body: n.body, isRead: i > 5 },
+    });
+  }
+
+  console.log(`   35 employees, ${attendanceRows.length} attendance records, 25 leave requests`);
+  console.log('   6 payroll runs (5 published + current), payslips, 14 candidates, tickets, assets');
+  console.log('   Password for all demo users: Demo@123');
+
   console.log('✅ Seed complete!');
   console.log('\n📋 Demo Credentials:');
   console.log('   Super Admin: admin@democorp.com');
