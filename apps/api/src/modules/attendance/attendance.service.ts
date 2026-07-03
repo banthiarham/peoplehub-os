@@ -24,6 +24,18 @@ function parseMonth(month?: string): { start: Date; end: Date } {
   };
 }
 
+
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000;
+  const rad = (d: number) => (d * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1);
+  const dLng = rad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
 @Injectable()
 export class AttendanceService {
   constructor(private readonly prisma: PrismaService) {}
@@ -50,9 +62,11 @@ export class AttendanceService {
     return this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
   }
 
-  async checkIn(user: AuthUser) {
+  async checkIn(user: AuthUser, geo?: { geoLat?: number; geoLng?: number }) {
     const employeeId = this.requireEmployee(user);
     const today = dateOnly(new Date());
+
+    await this.validateGeofence(user.tenantId, employeeId, geo);
     const existing = await this.prisma.attendanceRecord.findUnique({
       where: { employeeId_date: { employeeId, date: today } },
     });
@@ -75,10 +89,51 @@ export class AttendanceService {
         date: today,
         status,
         punchIn: now,
-        punchSource: 'WEB',
+        punchSource: geo?.geoLat != null ? 'GPS' : 'WEB',
+        geoLat: geo?.geoLat,
+        geoLng: geo?.geoLng,
       },
-      update: { punchIn: now, status },
+      update: {
+        punchIn: now,
+        status,
+        punchSource: geo?.geoLat != null ? 'GPS' : 'WEB',
+        geoLat: geo?.geoLat,
+        geoLng: geo?.geoLng,
+      },
     });
+  }
+
+
+  /**
+   * Enforces the office geofence when everything needed is known:
+   * device coords provided, employee works from OFFICE, and their location
+   * has coordinates plus an attendanceRadius configured.
+   */
+  private async validateGeofence(
+    tenantId: string,
+    employeeId: string,
+    geo?: { geoLat?: number; geoLng?: number },
+  ): Promise<void> {
+    if (geo?.geoLat == null || geo?.geoLng == null) return;
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: employeeId, tenantId },
+      select: { workMode: true, location: true },
+    });
+    const loc = employee?.location;
+    if (
+      employee?.workMode !== 'OFFICE' ||
+      !loc?.geoLat ||
+      !loc?.geoLng ||
+      !loc?.attendanceRadius
+    ) {
+      return;
+    }
+    const distance = haversineMeters(geo.geoLat, geo.geoLng, loc.geoLat, loc.geoLng);
+    if (distance > loc.attendanceRadius) {
+      throw new BadRequestException(
+        `You are ${Math.round(distance)}m away from ${loc.name} — check-in is allowed within ${loc.attendanceRadius}m`,
+      );
+    }
   }
 
   async checkOut(user: AuthUser) {
@@ -127,6 +182,7 @@ export class AttendanceService {
         punchIn: rec?.punchIn ?? null,
         punchOut: rec?.punchOut ?? null,
         workingMinutes: rec?.workingMinutes ?? null,
+        punchSource: rec?.punchSource ?? null,
       };
     });
     return {

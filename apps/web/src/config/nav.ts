@@ -1,4 +1,5 @@
 import {
+  BarChart3,
   Briefcase,
   CalendarDays,
   Clock,
@@ -8,6 +9,7 @@ import {
   LayoutDashboard,
   LifeBuoy,
   Mail,
+  Network,
   ReceiptText,
   Settings,
   Sparkles,
@@ -36,6 +38,7 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { label: 'Copilot', href: '/copilot', icon: Sparkles },
+      { label: 'Reports', href: '/reports', icon: BarChart3 },
     ],
   },
   {
@@ -45,6 +48,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { label: 'Attendance', href: '/attendance', icon: Clock },
       { label: 'Leave', href: '/leave', icon: CalendarDays },
       { label: 'Onboarding', href: '/onboarding', icon: UserPlus },
+      { label: 'Org Chart', href: '/org', icon: Network },
     ],
   },
   {

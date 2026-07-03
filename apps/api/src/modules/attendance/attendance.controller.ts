@@ -6,6 +6,7 @@ import { AuthUser } from '../../common/types/auth-user';
 import { AttendanceService } from './attendance.service';
 import {
   AssignShiftDto,
+  CheckInDto,
   CreateShiftDto,
   ListAttendanceDto,
   MonthQueryDto,
@@ -20,8 +21,8 @@ export class AttendanceController {
 
   @Post('check-in')
   @ApiOperation({ summary: 'Punch in for today' })
-  checkIn(@CurrentUser() user: AuthUser) {
-    return this.attendance.checkIn(user);
+  checkIn(@CurrentUser() user: AuthUser, @Body() dto: CheckInDto) {
+    return this.attendance.checkIn(user, dto);
   }
 
   @Post('check-out')

@@ -6,6 +6,7 @@ import {
   IsEnum,
   IsInt,
   IsNotEmpty,
+  IsNumber,
   IsOptional,
   IsString,
   Matches,
@@ -13,6 +14,21 @@ import {
   Min,
 } from 'class-validator';
 import { AttendanceStatus, ShiftType } from '@prisma/client';
+
+
+export class CheckInDto {
+  @ApiPropertyOptional({ description: 'Device latitude at punch time' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  geoLat?: number;
+
+  @ApiPropertyOptional({ description: 'Device longitude at punch time' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  geoLng?: number;
+}
 
 export class ListAttendanceDto {
   @ApiPropertyOptional({ default: 1 })

@@ -9,6 +9,7 @@ import { useState } from 'react';
 import { api } from '@/lib/api';
 import { Avatar } from '@/components/ui/avatar';
 import { NAV_SECTIONS } from '@/config/nav';
+import { useCommandPalette } from '@/components/command-palette';
 import { cn } from '@/lib/utils';
 
 export function Topbar() {
@@ -22,6 +23,7 @@ export function Topbar() {
     refetchInterval: 60_000,
   });
 
+  const openPalette = useCommandPalette();
   const name = session?.user?.name ?? 'User';
   const role = session?.user?.roles?.[0] ?? 'Member';
 
@@ -44,16 +46,20 @@ export function Topbar() {
             <p className="truncate text-sm font-medium text-ink">People operations command center</p>
           </div>
 
-          <div className="relative hidden w-[min(38vw,420px)] md:block">
+          <button
+            type="button"
+            onClick={openPalette}
+            className="relative hidden w-[min(38vw,420px)] md:block"
+            aria-label="Open universal search"
+          >
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-faint" />
-            <input
-              placeholder="Search employees, tax rules, templates, workflows"
-              className="h-10 w-full rounded-lg border border-line bg-canvas pl-9 pr-12 text-sm placeholder:text-ink-faint focus:outline-none focus:ring-2 focus:ring-primary-300"
-            />
+            <span className="flex h-10 w-full items-center rounded-lg border border-line bg-canvas pl-9 pr-12 text-sm text-ink-faint hover:border-primary-300">
+              Search employees, candidates, tickets, jobs…
+            </span>
             <kbd className="absolute right-3 top-1/2 -translate-y-1/2 rounded-md border border-line bg-white px-1.5 text-[10px] text-ink-faint">
               ⌘K
             </kbd>
-          </div>
+          </button>
         </div>
 
         <div className="flex items-center gap-3">

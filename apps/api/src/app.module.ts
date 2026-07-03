@@ -21,6 +21,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
 import { WorkflowsModule } from './modules/workflows/workflows.module';
 import { DeveloperModule } from './modules/developer/developer.module';
 import { AiModule } from './modules/ai/ai.module';
+import { SearchModule } from './modules/search/search.module';
 import { TaxModule } from './modules/tax/tax.module';
 import { EmailModule } from './modules/email/email.module';
 
@@ -48,6 +49,7 @@ import { EmailModule } from './modules/email/email.module';
     WorkflowsModule,
     DeveloperModule,
     AiModule,
+    SearchModule,
     TaxModule,
     EmailModule,
   ],
