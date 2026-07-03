@@ -45,3 +45,4 @@ packages/database/prisma/migrations/*.sql.bak
 # Misc
 *.tgz
 *.pem
+*.tsbuildinfo
