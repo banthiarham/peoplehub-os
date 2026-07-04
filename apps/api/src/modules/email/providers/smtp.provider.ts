@@ -20,7 +20,9 @@ export class SmtpProvider implements IEmailProvider {
       host: config.host,
       port: config.port,
       secure: config.encryption === 'SSL',
-      auth: { user: config.username, pass: config.password },
+      // Servers like MailHog/relays accept mail without AUTH — only
+      // authenticate when credentials are actually configured.
+      auth: config.username ? { user: config.username, pass: config.password } : undefined,
       tls: config.encryption === 'NONE' ? { rejectUnauthorized: false } : undefined,
     });
   }

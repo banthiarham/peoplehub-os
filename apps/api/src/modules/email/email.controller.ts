@@ -1,8 +1,11 @@
 import { Controller, Get, Post, Patch, Param, Body, Query } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { AuthUser } from '../../common/types/auth-user';
 import { EmailService } from './email.service';
 import { SmtpConfigService } from './smtp-config.service';
 import { EmailTemplateService } from './email-template.service';
+import { SendToEmployeeDto } from './dto/send-to-employee.dto';
 import { SmtpEncryption } from '@prisma/client';
 
 @ApiTags('Email')
@@ -27,7 +30,22 @@ export class EmailController {
   @ApiOperation({ summary: 'Create SMTP configuration' })
   createSmtp(
     @Query('tenantId') tenantId: string,
-    @Body() body: { name: string; host: string; port: number; encryption: SmtpEncryption; username: string; password: string; fromEmail: string; fromName: string; replyTo?: string; bounceEmail?: string; testRecipient?: string; dailySendingLimit?: number; createdById: string },
+    @Body()
+    body: {
+      name: string;
+      host: string;
+      port: number;
+      encryption: SmtpEncryption;
+      username: string;
+      password: string;
+      fromEmail: string;
+      fromName: string;
+      replyTo?: string;
+      bounceEmail?: string;
+      testRecipient?: string;
+      dailySendingLimit?: number;
+      createdById: string;
+    },
   ) {
     return this.smtpConfigService.create(tenantId, body.createdById, body);
   }
@@ -37,7 +55,19 @@ export class EmailController {
   updateSmtp(
     @Param('id') id: string,
     @Query('tenantId') tenantId: string,
-    @Body() body: { name?: string; host?: string; port?: number; encryption?: SmtpEncryption; username?: string; password?: string; fromEmail?: string; fromName?: string; replyTo?: string; dailySendingLimit?: number },
+    @Body()
+    body: {
+      name?: string;
+      host?: string;
+      port?: number;
+      encryption?: SmtpEncryption;
+      username?: string;
+      password?: string;
+      fromEmail?: string;
+      fromName?: string;
+      replyTo?: string;
+      dailySendingLimit?: number;
+    },
   ) {
     return this.smtpConfigService.update(tenantId, id, body);
   }
@@ -127,18 +157,68 @@ export class EmailController {
     return this.emailService.queue(body);
   }
 
+  @Post('employee/:employeeId')
+  @ApiOperation({ summary: "Send a one-off email to an employee's work address (tenant-scoped)" })
+  sendToEmployee(
+    @CurrentUser() user: AuthUser,
+    @Param('employeeId') employeeId: string,
+    @Body() dto: SendToEmployeeDto,
+  ) {
+    return this.emailService.sendToEmployee(user.tenantId, employeeId, dto);
+  }
+
+  @Get('employee/:employeeId/history')
+  @ApiOperation({ summary: 'Emails sent to this employee (delivery log)' })
+  employeeHistory(@CurrentUser() user: AuthUser, @Param('employeeId') employeeId: string) {
+    return this.emailService.employeeEmailHistory(user.tenantId, employeeId);
+  }
+
   @Post('send-template')
   @ApiOperation({ summary: 'Queue a template-based transactional email' })
-  sendTemplate(@Body() body: { tenantId: string; templateKey: string; to: string | string[]; vars: Record<string, string>; module?: string; relatedType?: string; relatedId?: string; idempotencyKey?: string }) {
-    return this.emailService.sendTransactional(body.tenantId, body.templateKey, body.to, body.vars, { module: body.module, relatedType: body.relatedType, relatedId: body.relatedId, idempotencyKey: body.idempotencyKey });
+  sendTemplate(
+    @Body()
+    body: {
+      tenantId: string;
+      templateKey: string;
+      to: string | string[];
+      vars: Record<string, string>;
+      module?: string;
+      relatedType?: string;
+      relatedId?: string;
+      idempotencyKey?: string;
+    },
+  ) {
+    return this.emailService.sendTransactional(
+      body.tenantId,
+      body.templateKey,
+      body.to,
+      body.vars,
+      {
+        module: body.module,
+        relatedType: body.relatedType,
+        relatedId: body.relatedId,
+        idempotencyKey: body.idempotencyKey,
+      },
+    );
   }
 
   @Post('send-bulk')
   @ApiOperation({ summary: 'Queue bulk emails (one queue entry per recipient)' })
-  async sendBulk(@Body() body: { tenantId: string; recipients: string[]; templateKey: string; vars: Record<string, string>; module?: string }) {
+  async sendBulk(
+    @Body()
+    body: {
+      tenantId: string;
+      recipients: string[];
+      templateKey: string;
+      vars: Record<string, string>;
+      module?: string;
+    },
+  ) {
     const ids = await Promise.all(
       body.recipients.map((to) =>
-        this.emailService.sendTransactional(body.tenantId, body.templateKey, to, body.vars, { module: body.module }),
+        this.emailService.sendTransactional(body.tenantId, body.templateKey, to, body.vars, {
+          module: body.module,
+        }),
       ),
     );
     return { queued: ids.length, ids };
@@ -169,7 +249,14 @@ export class EmailController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    return this.emailService.getLogs(tenantId, { status, module, templateKey, search, page: page ? +page : 1, limit: limit ? +limit : 20 });
+    return this.emailService.getLogs(tenantId, {
+      status,
+      module,
+      templateKey,
+      search,
+      page: page ? +page : 1,
+      limit: limit ? +limit : 20,
+    });
   }
 
   @Get('logs/:id')
@@ -199,7 +286,15 @@ export class EmailController {
   updatePreferences(
     @Query('tenantId') tenantId: string,
     @Query('employeeId') employeeId: string,
-    @Body() body: { announcements?: boolean; recognition?: boolean; surveys?: boolean; reminders?: boolean; digestEmails?: boolean; digestFrequency?: string },
+    @Body()
+    body: {
+      announcements?: boolean;
+      recognition?: boolean;
+      surveys?: boolean;
+      reminders?: boolean;
+      digestEmails?: boolean;
+      digestFrequency?: string;
+    },
   ) {
     return this.emailService.updatePreferences(tenantId, employeeId, body);
   }

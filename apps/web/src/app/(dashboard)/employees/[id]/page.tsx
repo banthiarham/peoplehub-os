@@ -2,9 +2,10 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
-import { Building2, FileText, Mail, MapPin, Phone, Smartphone, Users } from 'lucide-react';
+import { Building2, FileText, Mail, MapPin, Phone, Send, Smartphone, Users } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { EmployeeSendEmailDialog } from '@/components/forms/employee-send-email-dialog';
 import { PeopleAddDocumentDialog } from '@/components/forms/people-add-document-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
@@ -18,6 +19,15 @@ interface DocumentRow {
   type: string;
   name: string;
   isVerified: boolean;
+  createdAt: string;
+}
+
+interface EmailLogRow {
+  id: string;
+  subject: string;
+  to: string[];
+  status: string;
+  sentAt: string | null;
   createdAt: string;
 }
 
@@ -44,6 +54,11 @@ export default function EmployeeProfilePage() {
   const { data: device } = useQuery<DeviceRow | null>({
     queryKey: ['employees', id, 'device'],
     queryFn: () => api.get(`/attendance/device/${id}`).then((r) => r.data ?? null),
+    enabled: !!id,
+  });
+  const { data: emailHistory } = useQuery<EmailLogRow[]>({
+    queryKey: ['employees', id, 'email-history'],
+    queryFn: () => api.get(`/email/employee/${id}/history`).then((r) => r.data),
     enabled: !!id,
   });
   const resetDevice = useMutation({
@@ -97,6 +112,7 @@ export default function EmployeeProfilePage() {
               </span>
             </div>
           </div>
+          <EmployeeSendEmailDialog employeeId={id} employeeName={name} workEmail={e.workEmail} />
         </div>
       </Card>
 
@@ -250,6 +266,31 @@ export default function EmployeeProfilePage() {
                 <p className="text-sm text-ink-muted">
                   No punch device registered yet — their first check-in binds one.
                 </p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Send className="h-4 w-4 text-primary-600" /> Emails ({emailHistory?.length ?? 0})
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {emailHistory?.length ? (
+                emailHistory.map((m) => (
+                  <div key={m.id} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{m.subject || '(no subject)'}</p>
+                      <p className="text-xs text-ink-muted">
+                        {formatDate(m.sentAt ?? m.createdAt)}
+                      </p>
+                    </div>
+                    <Badge variant={statusVariant(m.status)}>{m.status}</Badge>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-ink-muted">No emails sent yet.</p>
               )}
             </CardContent>
           </Card>

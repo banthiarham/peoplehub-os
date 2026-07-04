@@ -5,9 +5,7 @@ export class MockEmailProvider implements IEmailProvider {
   private readonly logger = new Logger('MockEmailProvider');
 
   async sendEmail(input: SendEmailInput): Promise<SendEmailResult> {
-    this.logger.log(
-      `[MOCK EMAIL] To: ${input.to.join(', ')} | Subject: ${input.subject}`,
-    );
+    this.logger.log(`[MOCK EMAIL] To: ${input.to.join(', ')} | Subject: ${input.subject}`);
     return { success: true, messageId: `mock-${Date.now()}` };
   }
 
