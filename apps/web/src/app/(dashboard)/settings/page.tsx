@@ -2,6 +2,7 @@
 
 import { useSession } from 'next-auth/react';
 import { Building2, Landmark, ShieldCheck, UserCog } from 'lucide-react';
+import { LocationsGeofencing } from '@/components/settings/locations-geofencing';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { PageHeader } from '@/components/ui/page-header';
@@ -75,6 +76,8 @@ export default function SettingsPage() {
             <Row label="Audit log" value={<Badge variant="success">Enabled</Badge>} />
           </CardContent>
         </Card>
+
+        <LocationsGeofencing />
       </div>
     </div>
   );

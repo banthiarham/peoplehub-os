@@ -24,6 +24,7 @@ import { AiModule } from './modules/ai/ai.module';
 import { SearchModule } from './modules/search/search.module';
 import { TaxModule } from './modules/tax/tax.module';
 import { EmailModule } from './modules/email/email.module';
+import { LocationsModule } from './modules/locations/locations.module';
 
 @Module({
   imports: [
@@ -52,6 +53,7 @@ import { EmailModule } from './modules/email/email.module';
     SearchModule,
     TaxModule,
     EmailModule,
+    LocationsModule,
   ],
 })
 export class AppModule {}
