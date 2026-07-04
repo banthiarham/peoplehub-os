@@ -2,14 +2,13 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Bell, LogOut, Menu, Search, X } from 'lucide-react';
+import { LogOut, Menu, Search, X } from 'lucide-react';
 import { signOut, useSession } from 'next-auth/react';
-import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { api } from '@/lib/api';
 import { Avatar } from '@/components/ui/avatar';
 import { NAV_SECTIONS } from '@/config/nav';
 import { useCommandPalette } from '@/components/command-palette';
+import { NotificationsMenu } from '@/components/layout/notifications-menu';
 import { cn } from '@/lib/utils';
 
 export function Topbar() {
@@ -17,12 +16,6 @@ export function Topbar() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const pathname = usePathname();
-  const { data: unread } = useQuery({
-    queryKey: ['notifications', 'unread-count'],
-    queryFn: () => api.get('/notifications/unread-count').then((r) => r.data),
-    refetchInterval: 60_000,
-  });
-
   const openPalette = useCommandPalette();
   const name = session?.user?.name ?? 'User';
   const role = session?.user?.roles?.[0] ?? 'Member';
@@ -43,7 +36,9 @@ export function Topbar() {
             <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-ink-faint">
               {session?.user?.tenant?.name ?? 'Demo Corp India'}
             </p>
-            <p className="truncate text-sm font-medium text-ink">People operations command center</p>
+            <p className="truncate text-sm font-medium text-ink">
+              People operations command center
+            </p>
           </div>
 
           <button
@@ -63,14 +58,7 @@ export function Topbar() {
         </div>
 
         <div className="flex items-center gap-3">
-          <button className="relative rounded-lg border border-line bg-white p-2 text-ink-muted hover:bg-canvas" aria-label="Notifications">
-            <Bell className="h-5 w-5" />
-            {(unread?.count ?? 0) > 0 && (
-              <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[9px] font-bold text-white">
-                {unread.count}
-              </span>
-            )}
-          </button>
+          <NotificationsMenu />
 
           <div className="relative">
             <button
