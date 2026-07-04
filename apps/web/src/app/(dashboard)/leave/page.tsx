@@ -5,6 +5,7 @@ import { CalendarDays, Check, X } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { PeopleApplyLeaveDialog } from '@/components/forms/people-apply-leave-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -49,7 +50,11 @@ export default function LeavePage() {
 
   return (
     <div>
-      <PageHeader title="Leave" description="Requests, balances and team calendar" />
+      <PageHeader
+        title="Leave"
+        description="Requests, balances and team calendar"
+        actions={<PeopleApplyLeaveDialog />}
+      />
       <div className="mb-4 grid gap-4 sm:grid-cols-3">
         <StatCard label="Pending requests" value={stats?.pendingCount ?? '—'} icon={CalendarDays} />
         <StatCard label="On leave today" value={stats?.onLeaveToday ?? '—'} />

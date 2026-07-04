@@ -21,6 +21,11 @@ export class AnalyticsController {
     return this.analytics.headcountTrend(user.tenantId, months ? Number(months) : 12);
   }
 
+  @Get('attrition')
+  attrition(@CurrentUser() user: AuthUser, @Query('months') months?: string) {
+    return this.analytics.attrition(user.tenantId, months ? Number(months) : 12);
+  }
+
   @Get('demographics')
   demographics(@CurrentUser() user: AuthUser) {
     return this.analytics.demographics(user.tenantId);

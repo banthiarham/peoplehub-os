@@ -2,19 +2,33 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
-import { Building2, Mail, MapPin, Phone, Users } from 'lucide-react';
+import { Building2, FileText, Mail, MapPin, Phone, Users } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { PeopleAddDocumentDialog } from '@/components/forms/people-add-document-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+
+interface DocumentRow {
+  id: string;
+  type: string;
+  name: string;
+  isVerified: boolean;
+  createdAt: string;
+}
 
 export default function EmployeeProfilePage() {
   const { id } = useParams<{ id: string }>();
   const { data: e, isLoading } = useQuery({
     queryKey: ['employees', id],
     queryFn: () => api.get(`/employees/${id}`).then((r) => r.data),
+  });
+  const { data: documents } = useQuery<DocumentRow[]>({
+    queryKey: ['employees', id, 'documents'],
+    queryFn: () => api.get(`/employees/${id}/documents`).then((r) => r.data),
+    enabled: !!id,
   });
 
   if (isLoading || !e) {
@@ -89,7 +103,12 @@ export default function EmployeeProfilePage() {
               {e.lifecycleEvents?.length ? (
                 <ol className="relative space-y-4 border-l border-line pl-5">
                   {e.lifecycleEvents.map(
-                    (ev: { id: string; eventType: string; effectiveDate: string; remarks: string | null }) => (
+                    (ev: {
+                      id: string;
+                      eventType: string;
+                      effectiveDate: string;
+                      remarks: string | null;
+                    }) => (
                       <li key={ev.id} className="relative">
                         <span className="absolute -left-[26px] top-1 h-2.5 w-2.5 rounded-full bg-primary-500" />
                         <p className="text-sm font-medium">{ev.eventType.replace(/_/g, ' ')}</p>
@@ -108,33 +127,69 @@ export default function EmployeeProfilePage() {
           </Card>
         </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Users className="h-4 w-4 text-primary-600" /> Direct reports (
-              {e.directReports?.length ?? 0})
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {e.directReports?.length ? (
-              e.directReports.map(
-                (r: { id: string; firstName: string; lastName: string; designation: { name: string } | null }) => (
-                  <div key={r.id} className="flex items-center gap-3">
-                    <Avatar name={`${r.firstName} ${r.lastName}`} size="sm" />
-                    <div>
-                      <p className="text-sm font-medium">
-                        {r.firstName} {r.lastName}
-                      </p>
-                      <p className="text-xs text-ink-muted">{r.designation?.name ?? '—'}</p>
+        <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Users className="h-4 w-4 text-primary-600" /> Direct reports (
+                {e.directReports?.length ?? 0})
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {e.directReports?.length ? (
+                e.directReports.map(
+                  (r: {
+                    id: string;
+                    firstName: string;
+                    lastName: string;
+                    designation: { name: string } | null;
+                  }) => (
+                    <div key={r.id} className="flex items-center gap-3">
+                      <Avatar name={`${r.firstName} ${r.lastName}`} size="sm" />
+                      <div>
+                        <p className="text-sm font-medium">
+                          {r.firstName} {r.lastName}
+                        </p>
+                        <p className="text-xs text-ink-muted">{r.designation?.name ?? '—'}</p>
+                      </div>
                     </div>
+                  ),
+                )
+              ) : (
+                <p className="text-sm text-ink-muted">No direct reports.</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="flex-row items-center justify-between">
+              <CardTitle className="flex items-center gap-2">
+                <FileText className="h-4 w-4 text-primary-600" /> Documents (
+                {documents?.length ?? 0})
+              </CardTitle>
+              <PeopleAddDocumentDialog employeeId={id} />
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {documents?.length ? (
+                documents.map((d) => (
+                  <div key={d.id} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{d.name}</p>
+                      <p className="text-xs text-ink-muted">
+                        {d.type} · {formatDate(d.createdAt)}
+                      </p>
+                    </div>
+                    <Badge variant={d.isVerified ? 'success' : 'outline'}>
+                      {d.isVerified ? 'Verified' : 'Unverified'}
+                    </Badge>
                   </div>
-                ),
-              )
-            ) : (
-              <p className="text-sm text-ink-muted">No direct reports.</p>
-            )}
-          </CardContent>
-        </Card>
+                ))
+              ) : (
+                <p className="text-sm text-ink-muted">No documents on file.</p>
+              )}
+            </CardContent>
+          </Card>
+        </div>
       </div>
     </div>
   );

@@ -130,8 +130,10 @@ export class AttendanceService {
     }
     const distance = haversineMeters(geo.geoLat, geo.geoLng, loc.geoLat, loc.geoLng);
     if (distance > loc.attendanceRadius) {
+      const away =
+        distance >= 1000 ? `${(distance / 1000).toFixed(1)}km` : `${Math.round(distance)}m`;
       throw new BadRequestException(
-        `You are ${Math.round(distance)}m away from ${loc.name} — check-in is allowed within ${loc.attendanceRadius}m`,
+        `You are ${away} away from ${loc.name} — check-in is allowed within ${loc.attendanceRadius}m`,
       );
     }
   }

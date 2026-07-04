@@ -215,6 +215,54 @@ export class AnalyticsService {
     return out;
   }
 
+  async attrition(tenantId: string, months = 12) {
+    const [employees, departments] = await Promise.all([
+      this.prisma.employee.findMany({
+        where: { tenantId },
+        select: { joiningDate: true, exitDate: true, departmentId: true },
+      }),
+      this.prisma.department.findMany({ where: { tenantId }, select: { id: true, name: true } }),
+    ]);
+
+    const now = new Date();
+    const windowStart = new Date(Date.UTC(now.getFullYear(), now.getMonth() - (months - 1), 1));
+    const windowEnd = new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1, 1));
+
+    const monthly: Array<{ month: string; headcount: number; exits: number; attritionPct: number }> = [];
+    for (let i = months - 1; i >= 0; i--) {
+      const start = new Date(Date.UTC(now.getFullYear(), now.getMonth() - i, 1));
+      const end = new Date(Date.UTC(now.getFullYear(), now.getMonth() - i + 1, 1));
+      const headcount = employees.filter(
+        (e) => e.joiningDate && e.joiningDate < start && (!e.exitDate || e.exitDate >= start),
+      ).length;
+      const exits = employees.filter(
+        (e) => e.exitDate && e.exitDate >= start && e.exitDate < end,
+      ).length;
+      monthly.push({
+        month: monthKey(start),
+        headcount,
+        exits,
+        attritionPct: headcount > 0 ? Math.round((exits / headcount) * 1000) / 10 : 0,
+      });
+    }
+
+    const deptNames = new Map(departments.map((d) => [d.id, d.name]));
+    const exitsByDept = new Map<string, number>();
+    for (const e of employees) {
+      if (e.exitDate && e.exitDate >= windowStart && e.exitDate < windowEnd) {
+        const name = (e.departmentId && deptNames.get(e.departmentId)) ?? 'Unassigned';
+        exitsByDept.set(name, (exitsByDept.get(name) ?? 0) + 1);
+      }
+    }
+
+    return {
+      monthly,
+      byDepartment: [...exitsByDept.entries()]
+        .map(([name, exits]) => ({ name, exits }))
+        .sort((a, b) => b.exits - a.exits),
+    };
+  }
+
   async demographics(tenantId: string) {
     const employees = await this.prisma.employee.findMany({
       where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE'] } },

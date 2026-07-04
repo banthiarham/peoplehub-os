@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { Search, Users } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { PeopleAddEmployeeDialog } from '@/components/forms/people-add-employee-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -53,6 +54,7 @@ export default function EmployeesPage() {
       <PageHeader
         title="Employees"
         description={data ? `${data.meta.total} people in the directory` : 'Directory'}
+        actions={<PeopleAddEmployeeDialog />}
       />
       <Card>
         <div className="flex flex-wrap items-center gap-3 border-b border-line p-4">

@@ -5,6 +5,7 @@ import { LifeBuoy, MessageSquare } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { OpsNewTicketDialog } from '@/components/forms/ops-new-ticket-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
@@ -39,7 +40,11 @@ export default function HelpdeskPage() {
 
   return (
     <div>
-      <PageHeader title="Helpdesk" description="Employee queries and requests" />
+      <PageHeader
+        title="Helpdesk"
+        description="Employee queries and requests"
+        actions={<OpsNewTicketDialog />}
+      />
       <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Open" value={stats?.open ?? '—'} icon={LifeBuoy} />
         <StatCard label="In progress" value={stats?.inProgress ?? '—'} />
