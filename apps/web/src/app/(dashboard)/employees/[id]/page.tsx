@@ -1,15 +1,17 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
-import { Building2, FileText, Mail, MapPin, Phone, Users } from 'lucide-react';
+import { Building2, FileText, Mail, MapPin, Phone, Smartphone, Users } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
 import { PeopleAddDocumentDialog } from '@/components/forms/people-add-document-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+import { useToast } from '@/components/ui/toaster';
 
 interface DocumentRow {
   id: string;
@@ -19,8 +21,17 @@ interface DocumentRow {
   createdAt: string;
 }
 
+interface DeviceRow {
+  deviceName: string | null;
+  platform: string | null;
+  registeredAt: string;
+  lastSeenAt: string;
+}
+
 export default function EmployeeProfilePage() {
   const { id } = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
+  const toast = useToast();
   const { data: e, isLoading } = useQuery({
     queryKey: ['employees', id],
     queryFn: () => api.get(`/employees/${id}`).then((r) => r.data),
@@ -29,6 +40,19 @@ export default function EmployeeProfilePage() {
     queryKey: ['employees', id, 'documents'],
     queryFn: () => api.get(`/employees/${id}/documents`).then((r) => r.data),
     enabled: !!id,
+  });
+  const { data: device } = useQuery<DeviceRow | null>({
+    queryKey: ['employees', id, 'device'],
+    queryFn: () => api.get(`/attendance/device/${id}`).then((r) => r.data ?? null),
+    enabled: !!id,
+  });
+  const resetDevice = useMutation({
+    mutationFn: () => api.delete(`/attendance/device/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['employees', id, 'device'] });
+      toast('Device binding reset — their next punch registers a new device');
+    },
+    onError: () => toast('Could not reset device binding', 'error'),
   });
 
   if (isLoading || !e) {
@@ -186,6 +210,46 @@ export default function EmployeeProfilePage() {
                 ))
               ) : (
                 <p className="text-sm text-ink-muted">No documents on file.</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Smartphone className="h-4 w-4 text-primary-600" /> Punch device
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {device ? (
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-sm font-medium">
+                      {device.deviceName ?? 'Registered device'}
+                    </p>
+                    <p className="text-xs text-ink-muted">
+                      Registered {formatDate(device.registeredAt)} · last punch{' '}
+                      {formatDate(device.lastSeenAt)}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-danger"
+                    disabled={resetDevice.isPending}
+                    onClick={() => resetDevice.mutate()}
+                  >
+                    {resetDevice.isPending ? 'Resetting…' : 'Reset device binding'}
+                  </Button>
+                  <p className="text-[11px] text-ink-faint">
+                    Attendance punches only work from this device. Reset if they changed phones —
+                    their next punch registers the new one.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-sm text-ink-muted">
+                  No punch device registered yet — their first check-in binds one.
+                </p>
               )}
             </CardContent>
           </Card>

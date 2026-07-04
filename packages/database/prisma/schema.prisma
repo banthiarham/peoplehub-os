@@ -572,11 +572,31 @@ model Employee {
   exitTasks         ExitTask[]          @relation("ExitEmployee")
   approvalRequests  ApprovalRequest[]   @relation("ApprovalRequester")
   approvals         ApprovalRequest[]   @relation("ApprovalApprover")
+  device            EmployeeDevice?
 
   @@unique([tenantId, employeeCode])
   @@index([tenantId])
   @@index([managerId])
   @@map("employees")
+}
+
+// One registered punch device per employee. deviceId is also unique per
+// tenant so a single phone can never punch for more than one employee.
+model EmployeeDevice {
+  id           String   @id @default(cuid())
+  tenantId     String
+  employeeId   String   @unique
+  deviceId     String
+  deviceName   String?
+  platform     String?
+  registeredAt DateTime @default(now())
+  lastSeenAt   DateTime @default(now())
+
+  employee     Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, deviceId])
+  @@index([tenantId])
+  @@map("employee_devices")
 }
 
 model EmployeeProfileChange {
@@ -718,6 +738,7 @@ model AttendanceRecord {
   punchSource     String?         // WEB, MOBILE, GPS, BIOMETRIC, MANUAL, API
   geoLat          Float?
   geoLng          Float?
+  geoAccuracy     Float?          // GPS accuracy radius in meters at punch time
   remarks         String?
   isFinalized     Boolean         @default(false)
   createdAt       DateTime        @default(now())

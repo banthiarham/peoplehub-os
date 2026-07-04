@@ -53,13 +53,13 @@ async function main() {
   // Locations
   const locations = await Promise.all([
     prisma.location.create({
-      data: { tenantId: tenant.id, name: 'Delhi HQ', city: 'New Delhi', state: 'Delhi', country: 'IN', timezone: 'Asia/Kolkata', geoLat: 28.6139, geoLng: 77.209 },
+      data: { tenantId: tenant.id, name: 'Delhi HQ', city: 'New Delhi', state: 'Delhi', country: 'IN', timezone: 'Asia/Kolkata', geoLat: 28.6139, geoLng: 77.209, attendanceRadius: 200 },
     }),
     prisma.location.create({
-      data: { tenantId: tenant.id, name: 'Bangalore Office', city: 'Bangalore', state: 'Karnataka', country: 'IN', timezone: 'Asia/Kolkata', geoLat: 12.9716, geoLng: 77.5946 },
+      data: { tenantId: tenant.id, name: 'Bangalore Office', city: 'Bangalore', state: 'Karnataka', country: 'IN', timezone: 'Asia/Kolkata', geoLat: 12.9716, geoLng: 77.5946, attendanceRadius: 200 },
     }),
     prisma.location.create({
-      data: { tenantId: tenant.id, name: 'Mumbai Office', city: 'Mumbai', state: 'Maharashtra', country: 'IN', timezone: 'Asia/Kolkata', geoLat: 19.076, geoLng: 72.8777 },
+      data: { tenantId: tenant.id, name: 'Mumbai Office', city: 'Mumbai', state: 'Maharashtra', country: 'IN', timezone: 'Asia/Kolkata', geoLat: 19.076, geoLng: 72.8777, attendanceRadius: 200 },
     }),
     prisma.location.create({
       data: { tenantId: tenant.id, name: 'Remote', city: 'Remote', country: 'IN', timezone: 'Asia/Kolkata' },
@@ -188,6 +188,15 @@ async function main() {
       tenantId: tenant.id,
       email: 'payroll@democorp.com',
       name: 'Ravi Kumar',
+      isActive: true,
+    },
+  });
+
+  const employeeUser = await prisma.user.create({
+    data: {
+      tenantId: tenant.id,
+      email: 'employee@democorp.com',
+      name: 'Kavya Menon',
       isActive: true,
     },
   });
@@ -527,7 +536,7 @@ async function main() {
 
   const DEMO_HASH = '$2a$10$Pgk3TwRa5jYs2ZYavDVdauPN6HDNCt.xCvhwjGfV25paQ10UKMCMe'; // Demo@123
   await prisma.user.updateMany({
-    where: { tenantId: tenant.id, email: { in: ['admin@democorp.com', 'hr@democorp.com', 'payroll@democorp.com'] } },
+    where: { tenantId: tenant.id, email: { in: ['admin@democorp.com', 'hr@democorp.com', 'payroll@democorp.com', 'employee@democorp.com'] } },
     data: { passwordHash: DEMO_HASH },
   });
 
@@ -539,6 +548,7 @@ async function main() {
       { userId: hrUser.id, roleId: roleId('HR Admin') },
       { userId: hrUser.id, roleId: roleId('Manager') },
       { userId: payrollUser.id, roleId: roleId('Payroll Admin') },
+      { userId: employeeUser.id, roleId: roleId('Employee') },
     ],
     skipDuplicates: true,
   });
@@ -600,6 +610,7 @@ async function main() {
   await prisma.employee.update({ where: { id: employees[0]!.id }, data: { userId: adminUser.id } });
   await prisma.employee.update({ where: { id: employees[4]!.id }, data: { userId: hrUser.id } });
   await prisma.employee.update({ where: { id: employees[5]!.id }, data: { userId: payrollUser.id } });
+  await prisma.employee.update({ where: { id: employees[7]!.id }, data: { userId: employeeUser.id } });
 
   // Salaries
   const ctcFor = (i: number) => (i < 8 ? 3200000 + i * 150000 : 450000 + Math.floor(rnd() * 1800000));
@@ -1073,6 +1084,7 @@ async function main() {
   console.log('   Super Admin: admin@democorp.com');
   console.log('   HR Admin:    hr@democorp.com');
   console.log('   Payroll:     payroll@democorp.com');
+  console.log('   Employee:    employee@democorp.com (self-service portal at /me)');
   console.log('\n🏢 Tenant slug: demo-corp');
 }
 

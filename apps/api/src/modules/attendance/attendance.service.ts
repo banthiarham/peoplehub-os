@@ -1,13 +1,25 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import {
   AssignShiftDto,
+  CheckInDto,
+  CheckOutDto,
   CreateShiftDto,
   ListAttendanceDto,
   RegularizeDto,
 } from './dto/attendance.dto';
+
+/** Reject GPS fixes with a worse accuracy radius than this (meters). */
+const MAX_FIX_ACCURACY_M = 150;
+/** Reject GPS fixes captured longer ago than this (ms). */
+const MAX_FIX_AGE_MS = 30_000;
 
 function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
@@ -15,15 +27,12 @@ function dateOnly(d: Date): Date {
 
 function parseMonth(month?: string): { start: Date; end: Date } {
   const now = new Date();
-  const [y, m] = month
-    ? month.split('-').map(Number)
-    : [now.getFullYear(), now.getMonth() + 1];
+  const [y, m] = month ? month.split('-').map(Number) : [now.getFullYear(), now.getMonth() + 1];
   return {
     start: new Date(Date.UTC(y, m - 1, 1)),
     end: new Date(Date.UTC(y, m, 1)),
   };
 }
-
 
 function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371000;
@@ -31,8 +40,7 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
   const dLat = rad(lat2 - lat1);
   const dLng = rad(lng2 - lng1);
   const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
+    Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
@@ -62,11 +70,12 @@ export class AttendanceService {
     return this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
   }
 
-  async checkIn(user: AuthUser, geo?: { geoLat?: number; geoLng?: number }) {
+  async checkIn(user: AuthUser, dto: CheckInDto) {
     const employeeId = this.requireEmployee(user);
     const today = dateOnly(new Date());
 
-    await this.validateGeofence(user.tenantId, employeeId, geo);
+    await this.validateDevice(user.tenantId, employeeId, dto);
+    await this.validateGeofence(user.tenantId, employeeId, dto);
     const existing = await this.prisma.attendanceRecord.findUnique({
       where: { employeeId_date: { employeeId, date: today } },
     });
@@ -81,54 +90,133 @@ export class AttendanceService {
       shiftStart.setHours(h, m + (shift.gracePeriodMins ?? 15), 0, 0);
       if (now > shiftStart) status = 'LATE';
     }
+    const punch = {
+      punchIn: now,
+      status,
+      punchSource: dto.geoLat != null ? 'GPS' : 'WEB',
+      geoLat: dto.geoLat,
+      geoLng: dto.geoLng,
+      geoAccuracy: dto.geoAccuracy,
+    };
     return this.prisma.attendanceRecord.upsert({
       where: { employeeId_date: { employeeId, date: today } },
-      create: {
-        tenantId: user.tenantId,
+      create: { tenantId: user.tenantId, employeeId, date: today, ...punch },
+      update: punch,
+    });
+  }
+
+  /**
+   * One punch device per employee, one employee per device. The first punch
+   * binds the device; after that, punches from any other device are rejected
+   * until HR resets the binding. A device already bound to a colleague can
+   * never be used, which blocks credential sharing / buddy punching.
+   */
+  private async validateDevice(
+    tenantId: string,
+    employeeId: string,
+    dto: { deviceId: string; deviceName?: string; platform?: string },
+  ): Promise<void> {
+    const bound = await this.prisma.employeeDevice.findUnique({ where: { employeeId } });
+    if (bound) {
+      if (bound.deviceId !== dto.deviceId) {
+        throw new ForbiddenException(
+          'This is not your registered punch device. If you changed phones, ask HR to reset your device binding.',
+        );
+      }
+      await this.prisma.employeeDevice.update({
+        where: { employeeId },
+        data: { lastSeenAt: new Date() },
+      });
+      return;
+    }
+    const takenByOther = await this.prisma.employeeDevice.findUnique({
+      where: { tenantId_deviceId: { tenantId: tenantId, deviceId: dto.deviceId } },
+    });
+    if (takenByOther) {
+      throw new ForbiddenException(
+        'This device is already registered to another employee — punches must come from your own device.',
+      );
+    }
+    await this.prisma.employeeDevice.create({
+      data: {
+        tenantId,
         employeeId,
-        date: today,
-        status,
-        punchIn: now,
-        punchSource: geo?.geoLat != null ? 'GPS' : 'WEB',
-        geoLat: geo?.geoLat,
-        geoLng: geo?.geoLng,
-      },
-      update: {
-        punchIn: now,
-        status,
-        punchSource: geo?.geoLat != null ? 'GPS' : 'WEB',
-        geoLat: geo?.geoLat,
-        geoLng: geo?.geoLng,
+        deviceId: dto.deviceId,
+        deviceName: dto.deviceName,
+        platform: dto.platform,
       },
     });
   }
 
+  async myDevice(user: AuthUser) {
+    const employeeId = this.requireEmployee(user);
+    return this.prisma.employeeDevice.findUnique({
+      where: { employeeId },
+      select: {
+        deviceId: true,
+        deviceName: true,
+        platform: true,
+        registeredAt: true,
+        lastSeenAt: true,
+      },
+    });
+  }
+
+  async deviceOf(tenantId: string, employeeId: string) {
+    return this.prisma.employeeDevice.findFirst({
+      where: { employeeId, tenantId },
+      select: { deviceName: true, platform: true, registeredAt: true, lastSeenAt: true },
+    });
+  }
+
+  async resetDevice(tenantId: string, employeeId: string) {
+    const bound = await this.prisma.employeeDevice.findUnique({ where: { employeeId } });
+    if (!bound || bound.tenantId !== tenantId) {
+      throw new NotFoundException('No device registered for this employee');
+    }
+    await this.prisma.employeeDevice.delete({ where: { employeeId } });
+    return { reset: true };
+  }
 
   /**
-   * Enforces the office geofence when everything needed is known:
-   * device coords provided, employee works from OFFICE, and their location
-   * has coordinates plus an attendanceRadius configured.
+   * Enforces the office geofence for OFFICE-mode employees whose location has
+   * coordinates and an attendanceRadius configured. For them a fresh,
+   * accurate GPS fix is mandatory — no fix, a stale fix, or a low-accuracy
+   * fix all reject the punch so a cached or spoofed-blurry location can
+   * never sneak past the fence.
    */
   private async validateGeofence(
     tenantId: string,
     employeeId: string,
-    geo?: { geoLat?: number; geoLng?: number },
+    dto: CheckInDto,
   ): Promise<void> {
-    if (geo?.geoLat == null || geo?.geoLng == null) return;
     const employee = await this.prisma.employee.findFirst({
       where: { id: employeeId, tenantId },
       select: { workMode: true, location: true },
     });
     const loc = employee?.location;
-    if (
-      employee?.workMode !== 'OFFICE' ||
-      !loc?.geoLat ||
-      !loc?.geoLng ||
-      !loc?.attendanceRadius
-    ) {
+    if (employee?.workMode !== 'OFFICE' || !loc?.geoLat || !loc?.geoLng || !loc?.attendanceRadius) {
       return;
     }
-    const distance = haversineMeters(geo.geoLat, geo.geoLng, loc.geoLat, loc.geoLng);
+    if (dto.geoLat == null || dto.geoLng == null) {
+      throw new BadRequestException(
+        `Location is required to check in at ${loc.name} — allow location access and try again`,
+      );
+    }
+    if (dto.fixAt != null) {
+      const ageMs = Date.now() - dto.fixAt;
+      if (ageMs > MAX_FIX_AGE_MS) {
+        throw new BadRequestException(
+          `Your location fix is ${Math.round(ageMs / 1000)}s old — waiting for a fresh GPS fix, try again`,
+        );
+      }
+    }
+    if (dto.geoAccuracy != null && dto.geoAccuracy > MAX_FIX_ACCURACY_M) {
+      throw new BadRequestException(
+        `GPS accuracy is ±${Math.round(dto.geoAccuracy)}m — needs to be within ±${MAX_FIX_ACCURACY_M}m. Step outside or near a window and try again.`,
+      );
+    }
+    const distance = haversineMeters(dto.geoLat, dto.geoLng, loc.geoLat, loc.geoLng);
     if (distance > loc.attendanceRadius) {
       const away =
         distance >= 1000 ? `${(distance / 1000).toFixed(1)}km` : `${Math.round(distance)}m`;
@@ -138,8 +226,9 @@ export class AttendanceService {
     }
   }
 
-  async checkOut(user: AuthUser) {
+  async checkOut(user: AuthUser, dto: CheckOutDto) {
     const employeeId = this.requireEmployee(user);
+    await this.validateDevice(user.tenantId, employeeId, dto);
     const today = dateOnly(new Date());
     const record = await this.prisma.attendanceRecord.findUnique({
       where: { employeeId_date: { employeeId, date: today } },
@@ -328,7 +417,11 @@ export class AttendanceService {
     if (!shift) throw new NotFoundException('Shift not found');
     const effectiveFrom = dto.effectiveFrom ? new Date(dto.effectiveFrom) : new Date();
     await this.prisma.shiftAssignment.createMany({
-      data: dto.employeeIds.map((employeeId) => ({ employeeId, shiftId: dto.shiftId, effectiveFrom })),
+      data: dto.employeeIds.map((employeeId) => ({
+        employeeId,
+        shiftId: dto.shiftId,
+        effectiveFrom,
+      })),
     });
     return { assigned: dto.employeeIds.length };
   }

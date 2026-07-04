@@ -15,8 +15,22 @@ import {
 } from 'class-validator';
 import { AttendanceStatus, ShiftType } from '@prisma/client';
 
-
 export class CheckInDto {
+  @ApiProperty({ description: 'Stable device identifier registered to this employee' })
+  @IsString()
+  @IsNotEmpty()
+  deviceId!: string;
+
+  @ApiPropertyOptional({ description: 'Human-readable device name, e.g. "Chrome on Android"' })
+  @IsOptional()
+  @IsString()
+  deviceName?: string;
+
+  @ApiPropertyOptional({ description: 'Device platform, e.g. "Android"' })
+  @IsOptional()
+  @IsString()
+  platform?: string;
+
   @ApiPropertyOptional({ description: 'Device latitude at punch time' })
   @IsOptional()
   @Type(() => Number)
@@ -28,6 +42,27 @@ export class CheckInDto {
   @Type(() => Number)
   @IsNumber()
   geoLng?: number;
+
+  @ApiPropertyOptional({ description: 'GPS accuracy radius in meters' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  geoAccuracy?: number;
+
+  @ApiPropertyOptional({
+    description: 'Epoch ms timestamp of the GPS fix (stale fixes are rejected)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  fixAt?: number;
+}
+
+export class CheckOutDto {
+  @ApiProperty({ description: 'Stable device identifier registered to this employee' })
+  @IsString()
+  @IsNotEmpty()
+  deviceId!: string;
 }
 
 export class ListAttendanceDto {

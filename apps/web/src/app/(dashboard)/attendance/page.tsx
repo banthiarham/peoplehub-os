@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CalendarClock, Clock, LogIn, LogOut, MapPin } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
+import { getDeviceId, getDeviceInfo } from '@/lib/device';
+import { captureFreshFix } from '@/lib/geo';
 import { formatTime } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
@@ -25,35 +27,18 @@ import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toaster';
 
 interface TodayRow {
-  employee: { id: string; firstName: string; lastName: string; employeeCode: string; department: { name: string } | null };
+  employee: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    employeeCode: string;
+    department: { name: string } | null;
+  };
   status: string;
   punchIn: string | null;
   punchOut: string | null;
   workingMinutes: number | null;
   punchSource: string | null;
-}
-
-interface GeoCoords {
-  geoLat: number;
-  geoLng: number;
-}
-
-function getPosition(): Promise<GeoCoords | undefined> {
-  return new Promise((resolve) => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) return resolve(undefined);
-    const timer = setTimeout(() => resolve(undefined), 6000);
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        clearTimeout(timer);
-        resolve({ geoLat: pos.coords.latitude, geoLng: pos.coords.longitude });
-      },
-      () => {
-        clearTimeout(timer);
-        resolve(undefined);
-      },
-      { enableHighAccuracy: true, timeout: 5000, maximumAge: 60000 },
-    );
-  });
 }
 
 function apiError(err: unknown): string {
@@ -80,8 +65,16 @@ export default function AttendancePage() {
 
   const checkIn = useMutation({
     mutationFn: async () => {
-      const coords = await getPosition();
-      return api.post('/attendance/check-in', coords ?? {}).then((r) => ({ record: r.data, coords }));
+      const fix = await captureFreshFix();
+      return api
+        .post('/attendance/check-in', {
+          deviceId: getDeviceId(),
+          ...getDeviceInfo(),
+          ...(fix
+            ? { geoLat: fix.lat, geoLng: fix.lng, geoAccuracy: fix.accuracy, fixAt: fix.timestamp }
+            : {}),
+        })
+        .then((r) => ({ record: r.data, coords: fix }));
     },
     onSuccess: ({ record, coords }) => {
       toast(
@@ -96,7 +89,8 @@ export default function AttendancePage() {
   });
 
   const checkOut = useMutation({
-    mutationFn: () => api.post('/attendance/check-out').then((r) => r.data),
+    mutationFn: () =>
+      api.post('/attendance/check-out', { deviceId: getDeviceId() }).then((r) => r.data),
     onSuccess: (record) => {
       const h = Math.floor((record.workingMinutes ?? 0) / 60);
       const m = (record.workingMinutes ?? 0) % 60;
@@ -133,7 +127,12 @@ export default function AttendancePage() {
             <Button variant="ghost" size="sm" onClick={() => setRegularizeOpen(true)}>
               <CalendarClock className="h-3.5 w-3.5" /> Regularize
             </Button>
-            <Button variant="outline" size="sm" onClick={() => checkOut.mutate()} disabled={checkOut.isPending}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => checkOut.mutate()}
+              disabled={checkOut.isPending}
+            >
               <LogOut className="h-3.5 w-3.5" /> Check out
             </Button>
             <Button size="sm" onClick={() => checkIn.mutate()} disabled={checkIn.isPending}>
@@ -182,7 +181,9 @@ export default function AttendancePage() {
                           <span className="block font-medium">
                             {r.employee.firstName} {r.employee.lastName}
                           </span>
-                          <span className="block text-xs text-ink-muted">{r.employee.employeeCode}</span>
+                          <span className="block text-xs text-ink-muted">
+                            {r.employee.employeeCode}
+                          </span>
                         </span>
                       </div>
                     </TD>
@@ -197,7 +198,9 @@ export default function AttendancePage() {
                     </TD>
                     <TD>{formatTime(r.punchOut)}</TD>
                     <TD className="text-ink-muted">
-                      {r.workingMinutes ? `${Math.floor(r.workingMinutes / 60)}h ${r.workingMinutes % 60}m` : '—'}
+                      {r.workingMinutes
+                        ? `${Math.floor(r.workingMinutes / 60)}h ${r.workingMinutes % 60}m`
+                        : '—'}
                     </TD>
                     <TD>
                       <Badge variant={statusVariant(r.status)}>{r.status.replace(/_/g, ' ')}</Badge>
@@ -246,7 +249,10 @@ export default function AttendancePage() {
             <Button variant="outline" onClick={() => setRegularizeOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={() => regularize.mutate()} disabled={!regReason || regularize.isPending}>
+            <Button
+              onClick={() => regularize.mutate()}
+              disabled={!regReason || regularize.isPending}
+            >
               Submit
             </Button>
           </DialogFooter>

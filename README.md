@@ -112,6 +112,7 @@ npm run dev
 | Super Admin | admin@democorp.com |
 | HR Admin | hr@democorp.com |
 | Payroll Admin | payroll@democorp.com |
+| Employee (self-service portal at `/me`) | employee@democorp.com |
 
 ### Environment Variables
 

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -7,6 +7,7 @@ import { AttendanceService } from './attendance.service';
 import {
   AssignShiftDto,
   CheckInDto,
+  CheckOutDto,
   CreateShiftDto,
   ListAttendanceDto,
   MonthQueryDto,
@@ -27,8 +28,28 @@ export class AttendanceController {
 
   @Post('check-out')
   @ApiOperation({ summary: 'Punch out for today' })
-  checkOut(@CurrentUser() user: AuthUser) {
-    return this.attendance.checkOut(user);
+  checkOut(@CurrentUser() user: AuthUser, @Body() dto: CheckOutDto) {
+    return this.attendance.checkOut(user, dto);
+  }
+
+  @Get('device/me')
+  @ApiOperation({ summary: 'Own registered punch device, if any' })
+  myDevice(@CurrentUser() user: AuthUser) {
+    return this.attendance.myDevice(user);
+  }
+
+  @Get('device/:employeeId')
+  @Roles('Super Admin', 'HR Admin')
+  @ApiOperation({ summary: "An employee's registered punch device, if any" })
+  deviceOf(@CurrentUser() user: AuthUser, @Param('employeeId') employeeId: string) {
+    return this.attendance.deviceOf(user.tenantId, employeeId);
+  }
+
+  @Delete('device/:employeeId')
+  @Roles('Super Admin', 'HR Admin')
+  @ApiOperation({ summary: 'Reset an employee device binding (e.g. phone change)' })
+  resetDevice(@CurrentUser() user: AuthUser, @Param('employeeId') employeeId: string) {
+    return this.attendance.resetDevice(user.tenantId, employeeId);
   }
 
   @Get('today')

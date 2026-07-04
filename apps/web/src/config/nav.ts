@@ -12,6 +12,7 @@ import {
   Network,
   ReceiptText,
   Settings,
+  Smartphone,
   Sparkles,
   Target,
   Timer,
@@ -39,6 +40,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { label: 'Copilot', href: '/copilot', icon: Sparkles },
       { label: 'Reports', href: '/reports', icon: BarChart3 },
+      { label: 'My Portal', href: '/me', icon: Smartphone },
     ],
   },
   {
