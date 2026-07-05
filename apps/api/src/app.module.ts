@@ -25,6 +25,9 @@ import { SearchModule } from './modules/search/search.module';
 import { TaxModule } from './modules/tax/tax.module';
 import { EmailModule } from './modules/email/email.module';
 import { LocationsModule } from './modules/locations/locations.module';
+import { FilesModule } from './modules/files/files.module';
+import { OrganizationModule } from './modules/organization/organization.module';
+import { RbacModule } from './modules/rbac/rbac.module';
 
 @Module({
   imports: [
@@ -54,6 +57,9 @@ import { LocationsModule } from './modules/locations/locations.module';
     TaxModule,
     EmailModule,
     LocationsModule,
+    FilesModule,
+    OrganizationModule,
+    RbacModule,
   ],
 })
 export class AppModule {}

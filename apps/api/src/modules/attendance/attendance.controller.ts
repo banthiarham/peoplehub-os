@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query, Res } from '@nestjs/common';
+import { FastifyReply } from 'fastify';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -68,6 +69,20 @@ export class AttendanceController {
   @ApiOperation({ summary: 'Monthly org attendance stats' })
   stats(@CurrentUser() user: AuthUser, @Query() q: MonthQueryDto) {
     return this.attendance.stats(user.tenantId, q.month);
+  }
+
+  @Get('export')
+  @Roles('Super Admin', 'HR Admin')
+  @ApiOperation({ summary: 'Download a month of org attendance as CSV' })
+  async exportCsv(
+    @CurrentUser() user: AuthUser,
+    @Query() q: MonthQueryDto,
+    @Res({ passthrough: true }) res: FastifyReply,
+  ) {
+    const { csv, month } = await this.attendance.exportMonthCsv(user.tenantId, q.month);
+    res.header('Content-Type', 'text/csv; charset=utf-8');
+    res.header('Content-Disposition', `attachment; filename="attendance-${month}.csv"`);
+    return csv;
   }
 
   @Get('shifts')

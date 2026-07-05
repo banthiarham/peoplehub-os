@@ -1,14 +1,24 @@
 import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
 import {
+  IsArray,
   IsBoolean,
   IsDateString,
   IsEmail,
   IsEnum,
   IsNotEmpty,
+  IsNumber,
+  IsObject,
   IsOptional,
   IsString,
 } from 'class-validator';
-import { EmployeeStatus, EmploymentType, Gender, TaxRegime, WorkMode } from '@prisma/client';
+import {
+  EmployeeStatus,
+  EmploymentType,
+  Gender,
+  MaritalStatus,
+  TaxRegime,
+  WorkMode,
+} from '@prisma/client';
 
 export class CreateEmployeeDto {
   @ApiProperty()
@@ -20,6 +30,11 @@ export class CreateEmployeeDto {
   @IsString()
   @IsNotEmpty()
   lastName!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  preferredName?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -46,6 +61,16 @@ export class CreateEmployeeDto {
   @IsEnum(Gender)
   gender?: Gender;
 
+  @ApiPropertyOptional({ enum: MaritalStatus })
+  @IsOptional()
+  @IsEnum(MaritalStatus)
+  maritalStatus?: MaritalStatus;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  bloodGroup?: string;
+
   @ApiPropertyOptional()
   @IsOptional()
   @IsDateString()
@@ -55,6 +80,26 @@ export class CreateEmployeeDto {
   @IsOptional()
   @IsDateString()
   joiningDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  confirmationDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  probationEndDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  exitDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  noticePeriodDays?: number;
 
   @ApiPropertyOptional({ enum: EmployeeStatus })
   @IsOptional()
@@ -94,7 +139,22 @@ export class CreateEmployeeDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  costCenterId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  businessUnitId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
   managerId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  dottedManagerId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -104,12 +164,37 @@ export class CreateEmployeeDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  aadhaar?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
   uan?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  esicNumber?: string;
 
   @ApiPropertyOptional({ enum: TaxRegime })
   @IsOptional()
   @IsEnum(TaxRegime)
   taxRegime?: TaxRegime;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  address?: Record<string, unknown>;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  emergencyContact?: Record<string, unknown>;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  bankDetails?: Record<string, unknown>;
 
   @ApiPropertyOptional({ description: 'Also create a login user with this employee' })
   @IsOptional()
@@ -160,4 +245,66 @@ export class CreateLifecycleEventDto {
   @IsOptional()
   @IsString()
   remarks?: string;
+}
+
+export class BulkImportEmployeesDto {
+  @ApiProperty({ type: [CreateEmployeeDto] })
+  @IsArray()
+  employees!: CreateEmployeeDto[];
+}
+
+export class BulkUpdateEmployeesDto {
+  @ApiProperty({ type: [String] })
+  @IsArray()
+  employeeIds!: string[];
+
+  @ApiProperty()
+  @IsObject()
+  updates!: UpdateEmployeeDto;
+}
+
+export class BulkDocumentDto {
+  @ApiProperty({ type: [String] })
+  @IsArray()
+  employeeIds!: string[];
+
+  @ApiProperty()
+  @IsString()
+  type!: string;
+
+  @ApiProperty()
+  @IsString()
+  name!: string;
+
+  @ApiProperty()
+  @IsString()
+  fileKey!: string;
+}
+
+export class BulkManagerChangeDto {
+  @ApiProperty({ type: [String] })
+  @IsArray()
+  employeeIds!: string[];
+
+  @ApiProperty()
+  @IsString()
+  managerId!: string;
+}
+
+export class BulkSalaryAssignmentDto {
+  @ApiProperty({ type: [String] })
+  @IsArray()
+  employeeIds!: string[];
+
+  @ApiProperty()
+  @IsString()
+  salaryStructureId!: string;
+
+  @ApiProperty()
+  @IsNumber()
+  ctc!: number;
+
+  @ApiProperty()
+  @IsDateString()
+  effectiveFrom!: string;
 }

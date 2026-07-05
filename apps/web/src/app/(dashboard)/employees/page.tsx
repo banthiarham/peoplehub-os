@@ -29,11 +29,18 @@ interface EmployeeRow {
   department: { name: string } | null;
   designation: { name: string } | null;
   location: { name: string } | null;
+  legalEntity: { name: string } | null;
+  manager: { firstName: string; lastName: string } | null;
+  roles?: string[];
 }
 
 export default function EmployeesPage() {
   const [search, setSearch] = useState('');
   const [departmentId, setDepartmentId] = useState('');
+  const [locationId, setLocationId] = useState('');
+  const [legalEntityId, setLegalEntityId] = useState('');
+  const [managerId, setManagerId] = useState('');
+  const [role, setRole] = useState('');
   const [page, setPage] = useState(1);
 
   const { data: options } = useQuery({
@@ -42,12 +49,28 @@ export default function EmployeesPage() {
   });
 
   const { data, isLoading } = useQuery({
-    queryKey: ['employees', { search, departmentId, page }],
+    queryKey: ['employees', { search, departmentId, locationId, legalEntityId, managerId, role, page }],
     queryFn: () =>
       api
-        .get('/employees', { params: { search: search || undefined, departmentId: departmentId || undefined, page, pageSize: 15 } })
+        .get('/employees', {
+          params: {
+            search: search || undefined,
+            departmentId: departmentId || undefined,
+            locationId: locationId || undefined,
+            legalEntityId: legalEntityId || undefined,
+            managerId: managerId || undefined,
+            role: role || undefined,
+            page,
+            pageSize: 15,
+          },
+        })
         .then((r) => r.data),
   });
+
+  const resetPage = (setter: (value: string) => void) => (value: string) => {
+    setter(value);
+    setPage(1);
+  };
 
   return (
     <div>
@@ -73,14 +96,45 @@ export default function EmployeesPage() {
           <Select
             value={departmentId}
             onChange={(e) => {
-              setDepartmentId(e.target.value);
-              setPage(1);
+              resetPage(setDepartmentId)(e.target.value);
             }}
           >
             <option value="">All departments</option>
             {options?.departments?.map((d: { id: string; name: string }) => (
               <option key={d.id} value={d.id}>
                 {d.name}
+              </option>
+            ))}
+          </Select>
+          <Select value={locationId} onChange={(e) => resetPage(setLocationId)(e.target.value)}>
+            <option value="">All locations</option>
+            {options?.locations?.map((l: { id: string; name: string }) => (
+              <option key={l.id} value={l.id}>
+                {l.name}
+              </option>
+            ))}
+          </Select>
+          <Select value={legalEntityId} onChange={(e) => resetPage(setLegalEntityId)(e.target.value)}>
+            <option value="">All legal entities</option>
+            {options?.legalEntities?.map((le: { id: string; name: string }) => (
+              <option key={le.id} value={le.id}>
+                {le.name}
+              </option>
+            ))}
+          </Select>
+          <Select value={managerId} onChange={(e) => resetPage(setManagerId)(e.target.value)}>
+            <option value="">All managers</option>
+            {options?.managers?.map((m: { id: string; firstName: string; lastName: string }) => (
+              <option key={m.id} value={m.id}>
+                {m.firstName} {m.lastName}
+              </option>
+            ))}
+          </Select>
+          <Select value={role} onChange={(e) => resetPage(setRole)(e.target.value)}>
+            <option value="">All roles</option>
+            {options?.roles?.map((r: { id: string; name: string }) => (
+              <option key={r.id} value={r.name}>
+                {r.name}
               </option>
             ))}
           </Select>
@@ -100,6 +154,8 @@ export default function EmployeesPage() {
                   <TH>Department</TH>
                   <TH>Designation</TH>
                   <TH>Location</TH>
+                  <TH>Manager</TH>
+                  <TH>Role</TH>
                   <TH>Joined</TH>
                   <TH>Status</TH>
                 </TR>
@@ -122,7 +178,16 @@ export default function EmployeesPage() {
                     </TD>
                     <TD>{e.department?.name ?? '—'}</TD>
                     <TD>{e.designation?.name ?? '—'}</TD>
-                    <TD className="text-ink-muted">{e.location?.name ?? '—'}</TD>
+                    <TD className="text-ink-muted">
+                      <span className="block">{e.location?.name ?? '—'}</span>
+                      <span className="block text-xs">{e.legalEntity?.name ?? '—'}</span>
+                    </TD>
+                    <TD className="text-ink-muted">
+                      {e.manager ? `${e.manager.firstName} ${e.manager.lastName}` : '—'}
+                    </TD>
+                    <TD className="text-ink-muted">
+                      {e.roles?.slice(0, 2).join(', ') || '—'}
+                    </TD>
                     <TD className="text-ink-muted">{formatDate(e.joiningDate)}</TD>
                     <TD>
                       <Badge variant={statusVariant(e.status)}>{e.status.replace(/_/g, ' ')}</Badge>

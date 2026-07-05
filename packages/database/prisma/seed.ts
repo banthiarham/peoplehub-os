@@ -90,15 +90,39 @@ async function main() {
     prisma.designation.create({ data: { tenantId: tenant.id, name: 'Director', grade: 'L6' } }),
   ]);
 
-  // Roles
-  await Promise.all([
-    prisma.role.create({ data: { tenantId: tenant.id, name: 'Super Admin', isSystem: true } }),
-    prisma.role.create({ data: { tenantId: tenant.id, name: 'HR Admin', isSystem: true } }),
-    prisma.role.create({ data: { tenantId: tenant.id, name: 'Payroll Admin', isSystem: true } }),
-    prisma.role.create({ data: { tenantId: tenant.id, name: 'Manager', isSystem: true } }),
-    prisma.role.create({ data: { tenantId: tenant.id, name: 'Employee', isSystem: true } }),
-    prisma.role.create({ data: { tenantId: tenant.id, name: 'Recruiter', isSystem: true } }),
+  const costCenters = await Promise.all([
+    prisma.costCenter.create({ data: { tenantId: tenant.id, name: 'Engineering Delivery', code: 'CC-ENG' } }),
+    prisma.costCenter.create({ data: { tenantId: tenant.id, name: 'Go To Market', code: 'CC-GTM' } }),
+    prisma.costCenter.create({ data: { tenantId: tenant.id, name: 'People Operations', code: 'CC-POPS' } }),
+    prisma.costCenter.create({ data: { tenantId: tenant.id, name: 'Corporate Finance', code: 'CC-FIN' } }),
   ]);
+
+  const businessUnits = await Promise.all([
+    prisma.businessUnit.create({ data: { tenantId: tenant.id, name: 'PeopleHub Platform', code: 'BU-PHUB' } }),
+    prisma.businessUnit.create({ data: { tenantId: tenant.id, name: 'Implementation Services', code: 'BU-IMPL' } }),
+    prisma.businessUnit.create({ data: { tenantId: tenant.id, name: 'Internal Operations', code: 'BU-OPS' } }),
+  ]);
+
+  // Roles
+  const defaultRoles = [
+    'Super Admin',
+    'Tenant Owner',
+    'HR Admin',
+    'Payroll Admin',
+    'Finance Admin',
+    'Recruiter',
+    'Manager',
+    'Employee',
+    'Auditor',
+    'Integration Admin',
+    'Developer',
+    'Read-only Leadership User',
+  ];
+  await Promise.all(
+    defaultRoles.map((name) =>
+      prisma.role.create({ data: { tenantId: tenant.id, name, isSystem: true } }),
+    ),
+  );
 
   // Salary structure
   const salaryStructure = await prisma.salaryStructure.create({
@@ -545,11 +569,76 @@ async function main() {
   await prisma.userRole.createMany({
     data: [
       { userId: adminUser.id, roleId: roleId('Super Admin') },
+      { userId: adminUser.id, roleId: roleId('Tenant Owner') },
       { userId: hrUser.id, roleId: roleId('HR Admin') },
       { userId: hrUser.id, roleId: roleId('Manager') },
       { userId: payrollUser.id, roleId: roleId('Payroll Admin') },
+      { userId: payrollUser.id, roleId: roleId('Finance Admin') },
       { userId: employeeUser.id, roleId: roleId('Employee') },
     ],
+    skipDuplicates: true,
+  });
+
+  const permissionMatrix: Record<string, Array<{ module: string; permissionType: any; scopeType: any }>> = {
+    'Super Admin': ['organization', 'employees', 'roles', 'settings', 'payroll', 'developer'].flatMap((module) =>
+      ['VIEW', 'CREATE', 'EDIT', 'DELETE', 'APPROVE', 'EXPORT', 'IMPORT', 'CONFIGURE'].map((permissionType) => ({
+        module,
+        permissionType,
+        scopeType: 'ENTIRE_TENANT',
+      })),
+    ),
+    'Tenant Owner': ['organization', 'employees', 'roles', 'settings', 'developer'].flatMap((module) =>
+      ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'EXPORT', 'CONFIGURE'].map((permissionType) => ({
+        module,
+        permissionType,
+        scopeType: 'ENTIRE_TENANT',
+      })),
+    ),
+    'HR Admin': ['employees', 'organization', 'leave', 'attendance', 'onboarding'].flatMap((module) =>
+      ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'EXPORT', 'IMPORT'].map((permissionType) => ({
+        module,
+        permissionType,
+        scopeType: 'ENTIRE_TENANT',
+      })),
+    ),
+    'Payroll Admin': ['payroll', 'employees', 'tax'].flatMap((module) =>
+      ['VIEW', 'EDIT', 'APPROVE', 'EXPORT', 'RUN_PAYROLL', 'LOCK_PAYROLL', 'UNLOCK_PAYROLL'].map((permissionType) => ({
+        module,
+        permissionType,
+        scopeType: 'ENTIRE_TENANT',
+      })),
+    ),
+    Manager: ['employees', 'attendance', 'leave', 'performance'].map((module) => ({
+      module,
+      permissionType: 'VIEW',
+      scopeType: 'DIRECT_REPORTS',
+    })),
+    Employee: ['employees', 'attendance', 'leave', 'payslips'].map((module) => ({
+      module,
+      permissionType: 'VIEW',
+      scopeType: 'OWN_DATA',
+    })),
+    Auditor: ['employees', 'payroll', 'audit'].map((module) => ({
+      module,
+      permissionType: 'VIEW',
+      scopeType: 'ENTIRE_TENANT',
+    })),
+  };
+  await prisma.permission.createMany({
+    data: Object.entries(permissionMatrix).flatMap(([roleName, permissions]) =>
+      permissions.map((permission) => ({ roleId: roleId(roleName), ...permission })),
+    ),
+    skipDuplicates: true,
+  });
+  await prisma.permission.createMany({
+    data: ['salary', 'bankDetails', 'taxIds', 'documents', 'personal'].flatMap((field) =>
+      ['Super Admin', 'Tenant Owner', 'HR Admin', 'Payroll Admin', 'Finance Admin', 'Auditor'].map((roleName) => ({
+        roleId: roleId(roleName),
+        module: `employee.field.${field}`,
+        permissionType: 'VIEW_SENSITIVE' as any,
+        scopeType: 'ENTIRE_TENANT' as any,
+      })),
+    ),
     skipDuplicates: true,
   });
 
@@ -574,18 +663,20 @@ async function main() {
   const dayMs = 24 * 3600 * 1000;
   const employees: Array<Awaited<ReturnType<typeof prisma.employee.create>>> = [];
 
-  for (let i = 0; i < 35; i++) {
+  for (let i = 0; i < 50; i++) {
     const deptIdx = i % 8;
     const isHead = i < 8;
     const joinDaysAgo = i < 3 ? 20 + i * 15 : Math.floor(rnd() * 1400) + 90;
     const joiningDate = new Date(today0.getTime() - joinDaysAgo * dayMs);
+    const first = FIRST[i % FIRST.length]!;
+    const last = LAST[(i * 7) % LAST.length]!;
     const emp = await prisma.employee.create({
       data: {
         tenantId: tenant.id,
         employeeCode: `EMP-${String(i + 1).padStart(4, '0')}`,
-        firstName: FIRST[i]!,
-        lastName: LAST[i]!,
-        workEmail: `${FIRST[i]!.toLowerCase()}.${LAST[i]!.toLowerCase()}@democorp.com`,
+        firstName: first,
+        lastName: last,
+        workEmail: `${first.toLowerCase()}.${last.toLowerCase()}${i >= FIRST.length ? i + 1 : ''}@democorp.com`,
         phone: `+91 98${String(10000000 + i * 13579).slice(0, 8)}`,
         gender: i % 2 === 0 ? 'MALE' : 'FEMALE',
         dateOfBirth: new Date(1980 + (i % 20), i % 12, (i % 27) + 1),
@@ -597,6 +688,8 @@ async function main() {
         designationId: designations[isHead ? 7 : i % 7]!.id,
         locationId: locations[i % 4]!.id,
         legalEntityId: entity1.id,
+        costCenterId: costCenters[i % costCenters.length]!.id,
+        businessUnitId: businessUnits[i % businessUnits.length]!.id,
         managerId: isHead ? (i === 0 ? null : employees[0]!.id) : employees[deptIdx]!.id,
         pan: `ABCDE${String(1000 + i)}F`,
         uan: `1000${String(10000000 + i * 7)}`,
@@ -819,14 +912,16 @@ async function main() {
   const CAND_FIRST = ['Ishaan','Zara','Kabir','Myra','Vivaan','Anika','Reyansh','Sara','Ayaan','Diya','Advait','Kiara','Dhruv','Navya'];
   const CAND_LAST = ['Bajaj','Fernandes','Oberoi','Mathur','Chandra','Rana','Tandon','Bhalla','Sethi','Grover','Anand','Kohli','Vohra','Sood'];
   const candidates: Array<Awaited<ReturnType<typeof prisma.candidate.create>>> = [];
-  for (let i = 0; i < 14; i++) {
+  for (let i = 0; i < 15; i++) {
+    const first = CAND_FIRST[i % CAND_FIRST.length]!;
+    const last = CAND_LAST[(i * 5) % CAND_LAST.length]!;
     const cand = await prisma.candidate.create({
       data: {
         tenantId: tenant.id,
         jobRequisitionId: jobs[i % jobs.length]!.id,
-        firstName: CAND_FIRST[i]!,
-        lastName: CAND_LAST[i]!,
-        email: `${CAND_FIRST[i]!.toLowerCase()}.${CAND_LAST[i]!.toLowerCase()}@example.com`,
+        firstName: first,
+        lastName: last,
+        email: `${first.toLowerCase()}.${last.toLowerCase()}${i >= CAND_FIRST.length ? i + 1 : ''}@example.com`,
         phone: `+91 97${String(10000000 + i * 24681).slice(0, 8)}`,
         currentStage: CAND_STAGES[i]!,
         source: CAND_SOURCES[i % CAND_SOURCES.length],
@@ -1075,7 +1170,7 @@ async function main() {
     });
   }
 
-  console.log(`   35 employees, ${attendanceRows.length} attendance records, 25 leave requests`);
+  console.log(`   ${employees.length} employees, ${attendanceRows.length} attendance records, 25 leave requests`);
   console.log('   6 payroll runs (5 published + current), payslips, 14 candidates, tickets, assets');
   console.log('   Password for all demo users: Demo@123');
 

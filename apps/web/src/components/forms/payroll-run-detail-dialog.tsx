@@ -1,9 +1,10 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Download } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
+import { downloadFile } from '@/lib/download';
 import { formatINR } from '@/lib/utils';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -39,6 +40,9 @@ interface RunEntry {
   totalDeductions: number;
   netPay: number;
   components: PayslipComponent[];
+  errors?: string[];
+  warnings?: string[];
+  explanation?: string[];
   employee: {
     id: string;
     firstName: string;
@@ -54,7 +58,13 @@ interface RunDetail {
   year: number;
   status: string;
   entries: RunEntry[];
-  totals: { totalNet: number; totalGross: number; totalDeductions: number };
+  totals: {
+    totalNet: number;
+    totalGross: number;
+    totalDeductions: number;
+    errors?: number;
+    warnings?: number;
+  };
 }
 
 interface PayrollRunDetailDialogProps {
@@ -109,6 +119,15 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
               netPay={entry.netPay}
               components={entry.components ?? []}
             />
+            {!!entry.errors?.length && (
+              <IssueList title="Critical issues" variant="destructive" items={entry.errors} />
+            )}
+            {!!entry.warnings?.length && (
+              <IssueList title="Warnings" variant="warning" items={entry.warnings} />
+            )}
+            {!!entry.explanation?.length && (
+              <IssueList title="Calculation explanation" variant="outline" items={entry.explanation} />
+            )}
           </>
         ) : (
           <>
@@ -123,6 +142,32 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
                   : 'Loading run details…'}
               </DialogDescription>
             </DialogHeader>
+            {run && ((run.totals.errors ?? 0) > 0 || (run.totals.warnings ?? 0) > 0) && (
+              <div className="rounded-lg border border-line bg-canvas p-3 text-sm">
+                {(run.totals.errors ?? 0) > 0 && (
+                  <p className="font-medium text-danger">
+                    {run.totals.errors} critical issue(s) block payroll approval.
+                  </p>
+                )}
+                {(run.totals.warnings ?? 0) > 0 && (
+                  <p className="text-ink-muted">
+                    {run.totals.warnings} warning(s) need payroll review before publishing.
+                  </p>
+                )}
+              </div>
+            )}
+            {run && run.entries.length > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-fit"
+                onClick={() =>
+                  downloadFile(`/payroll/runs/${run.id}/export`, 'payroll-register.csv')
+                }
+              >
+                <Download className="h-3.5 w-3.5" /> Export register CSV
+              </Button>
+            )}
             {isLoading || !run ? (
               <div className="space-y-2">
                 {[...Array(6)].map((_, i) => (
@@ -134,6 +179,7 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
                 <THead>
                   <TR>
                     <TH>Employee</TH>
+                    <TH>Checks</TH>
                     <TH className="text-right">Gross</TH>
                     <TH className="text-right">Deductions</TH>
                     <TH className="text-right">Net</TH>
@@ -153,6 +199,19 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
                         <span className="block text-xs text-ink-muted">
                           {e.employee.employeeCode} · {e.employee.department?.name ?? '—'}
                         </span>
+                      </TD>
+                      <TD>
+                        <div className="flex gap-1">
+                          {!!e.errors?.length && (
+                            <Badge variant="destructive">{e.errors.length} errors</Badge>
+                          )}
+                          {!!e.warnings?.length && (
+                            <Badge variant="warning">{e.warnings.length} warnings</Badge>
+                          )}
+                          {!e.errors?.length && !e.warnings?.length && (
+                            <Badge variant="success">Clear</Badge>
+                          )}
+                        </div>
                       </TD>
                       <TD className="text-right tabular-nums text-ink-muted">
                         {formatINR(e.grossPay)}
@@ -174,5 +233,28 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+function IssueList({
+  title,
+  variant,
+  items,
+}: {
+  title: string;
+  variant: 'destructive' | 'warning' | 'outline';
+  items: string[];
+}) {
+  return (
+    <div className="rounded-lg border border-line p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <Badge variant={variant}>{title}</Badge>
+      </div>
+      <ul className="space-y-1 text-sm text-ink-muted">
+        {items.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>
+    </div>
   );
 }

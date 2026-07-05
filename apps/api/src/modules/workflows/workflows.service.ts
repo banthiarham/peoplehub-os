@@ -72,12 +72,57 @@ export class WorkflowsService {
       ...(Array.isArray(request.comments) ? (request.comments as unknown[]) : []),
       { by: user.name ?? user.email, decision, comment: comment ?? null, at: new Date().toISOString() },
     ];
-    return this.prisma.approvalRequest.update({
-      where: { id },
-      data: {
-        status: decision,
-        resolvedAt: new Date(),
-        comments: comments as Prisma.InputJsonValue,
+    return this.prisma.$transaction(async (tx) => {
+      if (decision === 'APPROVED' && request.module === 'attendance' && request.objectType === 'AttendanceRegularization') {
+        await this.applyAttendanceRegularization(tx, request);
+      }
+      return tx.approvalRequest.update({
+        where: { id },
+        data: {
+          status: decision,
+          resolvedAt: new Date(),
+          comments: comments as Prisma.InputJsonValue,
+        },
+      });
+    });
+  }
+
+  private async applyAttendanceRegularization(
+    tx: Prisma.TransactionClient,
+    request: { tenantId: string; objectId: string; requestData: Prisma.JsonValue | null },
+  ) {
+    const [employeeId, datePart] = request.objectId.split(':');
+    if (!employeeId || !datePart || !request.requestData || typeof request.requestData !== 'object') {
+      throw new BadRequestException('Invalid attendance regularization request data');
+    }
+    const data = request.requestData as Record<string, unknown>;
+    const date = new Date(`${datePart}T00:00:00.000Z`);
+    const punchIn = typeof data.punchIn === 'string' ? new Date(data.punchIn) : undefined;
+    const punchOut = typeof data.punchOut === 'string' ? new Date(data.punchOut) : undefined;
+    const reason = typeof data.reason === 'string' ? data.reason : 'Approved regularization';
+    const workingMinutes =
+      punchIn && punchOut ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000)) : undefined;
+
+    await tx.attendanceRecord.upsert({
+      where: { employeeId_date: { employeeId, date } },
+      create: {
+        tenantId: request.tenantId,
+        employeeId,
+        date,
+        status: 'PRESENT',
+        punchIn,
+        punchOut,
+        workingMinutes,
+        punchSource: 'MANUAL',
+        remarks: `Regularization approved: ${reason}`,
+      },
+      update: {
+        status: 'PRESENT',
+        punchIn,
+        punchOut,
+        workingMinutes,
+        punchSource: 'MANUAL',
+        remarks: `Regularization approved: ${reason}`,
       },
     });
   }

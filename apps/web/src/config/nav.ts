@@ -2,6 +2,7 @@ import {
   BarChart3,
   Briefcase,
   CalendarDays,
+  ClipboardCheck,
   Clock,
   Code2,
   HeartHandshake,
@@ -39,6 +40,7 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { label: 'Copilot', href: '/copilot', icon: Sparkles },
+      { label: 'Approvals', href: '/approvals', icon: ClipboardCheck },
       { label: 'Reports', href: '/reports', icon: BarChart3 },
       { label: 'My Portal', href: '/me', icon: Smartphone },
     ],

@@ -7,6 +7,7 @@ import {
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { toCsv } from '../../common/utils/csv';
 import {
   AssignShiftDto,
   CheckInDto,
@@ -320,6 +321,39 @@ export class AttendanceService {
     return { data, meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
   }
 
+  async exportMonthCsv(tenantId: string, month?: string): Promise<{ csv: string; month: string }> {
+    const { start, end } = parseMonth(month);
+    const records = await this.prisma.attendanceRecord.findMany({
+      where: { tenantId, date: { gte: start, lt: end } },
+      include: {
+        employee: {
+          select: {
+            employeeCode: true,
+            firstName: true,
+            lastName: true,
+            department: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: [{ date: 'asc' }, { employeeId: 'asc' }],
+    });
+    const csv = toCsv(
+      records.map((r) => ({
+        date: r.date.toISOString().slice(0, 10),
+        employeeCode: r.employee.employeeCode,
+        name: `${r.employee.firstName} ${r.employee.lastName}`,
+        department: r.employee.department?.name ?? '',
+        status: r.status,
+        punchIn: r.punchIn,
+        punchOut: r.punchOut,
+        workingMinutes: r.workingMinutes,
+        source: r.punchSource ?? '',
+        gpsAccuracyM: r.geoAccuracy,
+      })),
+    );
+    return { csv, month: start.toISOString().slice(0, 7) };
+  }
+
   async me(user: AuthUser, month?: string) {
     const employeeId = this.requireEmployee(user);
     const { start, end } = parseMonth(month);
@@ -348,23 +382,89 @@ export class AttendanceService {
   async regularize(user: AuthUser, dto: RegularizeDto) {
     const employeeId = dto.employeeId ?? this.requireEmployee(user);
     const date = dateOnly(new Date(dto.date));
+    const punchIn = dto.punchIn ? new Date(dto.punchIn) : undefined;
+    const punchOut = dto.punchOut ? new Date(dto.punchOut) : undefined;
+    const canApplyDirectly =
+      user.isSuperAdmin || user.roles.some((role) => ['HR Admin', 'Manager'].includes(role));
+
+    if (!canApplyDirectly) {
+      const employee = await this.prisma.employee.findFirst({
+        where: { id: employeeId, tenantId: user.tenantId },
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          managerId: true,
+        },
+      });
+      if (!employee) throw new NotFoundException('Employee not found');
+      const fallbackApprover = await this.prisma.employee.findFirst({
+        where: {
+          tenantId: user.tenantId,
+          user: { userRoles: { some: { role: { name: { in: ['HR Admin', 'Super Admin'] } } } } },
+        },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      });
+      const request = await this.prisma.approvalRequest.create({
+        data: {
+          tenantId: user.tenantId,
+          requesterId: employeeId,
+          approverId: employee.managerId ?? fallbackApprover?.id,
+          module: 'attendance',
+          objectType: 'AttendanceRegularization',
+          objectId: `${employeeId}:${date.toISOString().slice(0, 10)}`,
+          requestData: {
+            title: 'Attendance regularization',
+            employeeName: `${employee.firstName} ${employee.lastName}`,
+            date: date.toISOString().slice(0, 10),
+            punchIn: punchIn?.toISOString() ?? null,
+            punchOut: punchOut?.toISOString() ?? null,
+            reason: dto.reason,
+          },
+        },
+      });
+      return { approvalRequired: true, request };
+    }
+
+    const applied = await this.applyRegularization(user.tenantId, employeeId, {
+      date,
+      punchIn,
+      punchOut,
+      reason: dto.reason,
+    });
+    return { approvalRequired: false, record: applied };
+  }
+
+  async applyRegularization(
+    tenantId: string,
+    employeeId: string,
+    input: { date: Date; punchIn?: Date; punchOut?: Date; reason: string },
+  ) {
+    const workingMinutes =
+      input.punchIn && input.punchOut
+        ? Math.max(0, Math.round((input.punchOut.getTime() - input.punchIn.getTime()) / 60000))
+        : undefined;
     return this.prisma.attendanceRecord.upsert({
-      where: { employeeId_date: { employeeId, date } },
+      where: { employeeId_date: { employeeId, date: input.date } },
       create: {
-        tenantId: user.tenantId,
+        tenantId,
         employeeId,
-        date,
+        date: input.date,
         status: 'PRESENT',
-        punchIn: dto.punchIn ? new Date(dto.punchIn) : undefined,
-        punchOut: dto.punchOut ? new Date(dto.punchOut) : undefined,
+        punchIn: input.punchIn,
+        punchOut: input.punchOut,
+        workingMinutes,
         punchSource: 'MANUAL',
-        remarks: `Regularization: ${dto.reason}`,
+        remarks: `Regularization: ${input.reason}`,
       },
       update: {
-        punchIn: dto.punchIn ? new Date(dto.punchIn) : undefined,
-        punchOut: dto.punchOut ? new Date(dto.punchOut) : undefined,
+        punchIn: input.punchIn,
+        punchOut: input.punchOut,
+        workingMinutes,
         status: 'PRESENT',
-        remarks: `Regularization: ${dto.reason}`,
+        punchSource: 'MANUAL',
+        remarks: `Regularization: ${input.reason}`,
       },
     });
   }

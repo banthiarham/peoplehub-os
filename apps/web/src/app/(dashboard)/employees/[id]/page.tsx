@@ -2,7 +2,17 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
-import { Building2, FileText, Mail, MapPin, Phone, Send, Smartphone, Users } from 'lucide-react';
+import {
+  Building2,
+  Download,
+  FileText,
+  Mail,
+  MapPin,
+  Phone,
+  Send,
+  Smartphone,
+  Users,
+} from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
 import { EmployeeSendEmailDialog } from '@/components/forms/employee-send-email-dialog';
@@ -18,6 +28,7 @@ interface DocumentRow {
   id: string;
   type: string;
   name: string;
+  fileKey: string;
   isVerified: boolean;
   createdAt: string;
 }
@@ -124,14 +135,42 @@ export default function EmployeeProfilePage() {
             </CardHeader>
             <CardContent className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
               <Field label="Joined" value={formatDate(e.joiningDate)} />
+              <Field label="Confirmation" value={formatDate(e.confirmationDate)} />
+              <Field label="Probation end" value={formatDate(e.probationEndDate)} />
               <Field label="Employment type" value={e.employmentType?.replace(/_/g, ' ')} />
               <Field label="Work mode" value={e.workMode} />
+              <Field label="Notice period" value={e.noticePeriodDays ? `${e.noticePeriodDays} days` : '—'} />
               <Field
                 label="Reporting manager"
                 value={e.manager ? `${e.manager.firstName} ${e.manager.lastName}` : '—'}
               />
+              <Field
+                label="Dotted-line manager"
+                value={e.dottedManager ? `${e.dottedManager.firstName} ${e.dottedManager.lastName}` : '—'}
+              />
+              <Field label="Legal entity" value={e.legalEntity?.name ?? '—'} />
+              <Field label="Cost center" value={e.costCenter?.name ?? '—'} />
+              <Field label="Business unit" value={e.businessUnit?.name ?? '—'} />
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Personal, statutory and tax</CardTitle>
+            </CardHeader>
+            <CardContent className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+              <Field label="Preferred name" value={e.preferredName ?? '—'} />
+              <Field label="Personal email" value={e.personalEmail ?? '—'} />
+              <Field label="Date of birth" value={formatDate(e.dateOfBirth)} />
+              <Field label="Gender" value={e.gender ?? '—'} />
+              <Field label="Marital status" value={e.maritalStatus ?? '—'} />
+              <Field label="Blood group" value={e.bloodGroup ?? '—'} />
               <Field label="PAN" value={e.pan ?? '—'} />
+              <Field label="Aadhaar" value={e.aadhaar ?? '—'} />
+              <Field label="UAN" value={e.uan ?? '—'} />
+              <Field label="ESIC" value={e.esicNumber ?? '—'} />
               <Field label="Tax regime" value={e.taxRegime} />
+              <Field label="Bank details" value={summarizeObject(e.bankDetails)} />
             </CardContent>
           </Card>
 
@@ -219,9 +258,31 @@ export default function EmployeeProfilePage() {
                         {d.type} · {formatDate(d.createdAt)}
                       </p>
                     </div>
-                    <Badge variant={d.isVerified ? 'success' : 'outline'}>
-                      {d.isVerified ? 'Verified' : 'Unverified'}
-                    </Badge>
+                    <div className="flex items-center gap-1.5">
+                      <Badge variant={d.isVerified ? 'success' : 'outline'}>
+                        {d.isVerified ? 'Verified' : 'Unverified'}
+                      </Badge>
+                      {d.fileKey.includes('/') && (
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7"
+                          aria-label={`Download ${d.name}`}
+                          onClick={async () => {
+                            try {
+                              const { url } = await api
+                                .get('/files/download-url', { params: { key: d.fileKey } })
+                                .then((r) => r.data);
+                              window.open(url, '_blank');
+                            } catch {
+                              toast('Download failed — file not found in storage', 'error');
+                            }
+                          }}
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 ))
               ) : (
@@ -307,4 +368,12 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
       <p className="mt-0.5 font-medium">{value}</p>
     </div>
   );
+}
+
+function summarizeObject(value: unknown) {
+  if (!value || typeof value !== 'object') return '—';
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .slice(0, 3);
+  return entries.length ? entries.map(([key, v]) => `${key}: ${String(v)}`).join(' · ') : '—';
 }

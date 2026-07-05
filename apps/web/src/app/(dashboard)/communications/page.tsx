@@ -3,11 +3,11 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useSession } from 'next-auth/react';
-import { MailCheck, MailWarning, RefreshCcw, Send, ShieldCheck, SquarePen } from 'lucide-react';
+import { MailCheck, MailWarning, RefreshCcw, ShieldCheck } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { NewTemplateDialog, SendTestEmailButton } from '@/components/forms/comms-actions';
 import { Badge, statusVariant } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { PageHeader } from '@/components/ui/page-header';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -70,26 +70,35 @@ export default function CommunicationsPage() {
 
   const { data: providers, isLoading: providersLoading } = useQuery({
     queryKey: ['email', 'smtp-config', tenantId],
-    queryFn: () => api.get('/email/smtp-config', { params: { tenantId } }).then((r) => r.data as SmtpConfig[]),
+    queryFn: () =>
+      api.get('/email/smtp-config', { params: { tenantId } }).then((r) => r.data as SmtpConfig[]),
     enabled: Boolean(tenantId),
   });
 
   const { data: templates, isLoading: templatesLoading } = useQuery({
     queryKey: ['email', 'templates', tenantId],
-    queryFn: () => api.get('/email/templates', { params: { tenantId } }).then((r) => r.data as EmailTemplate[]),
+    queryFn: () =>
+      api.get('/email/templates', { params: { tenantId } }).then((r) => r.data as EmailTemplate[]),
     enabled: Boolean(tenantId),
   });
 
   const { data: logs } = useQuery({
     queryKey: ['email', 'logs', tenantId],
-    queryFn: () => api.get('/email/logs', { params: { tenantId, limit: 8 } }).then((r) => r.data as LogsResponse),
+    queryFn: () =>
+      api
+        .get('/email/logs', { params: { tenantId, limit: 8 } })
+        .then((r) => r.data as LogsResponse),
     enabled: Boolean(tenantId),
   });
 
   const activeProvider = providers?.find((provider) => provider.isActive) ?? providers?.[0];
-  const moduleCount = useMemo(() => new Set((templates ?? []).map((template) => template.module)).size, [templates]);
+  const moduleCount = useMemo(
+    () => new Set((templates ?? []).map((template) => template.module)).size,
+    [templates],
+  );
   const mandatoryCount = templates?.filter((template) => template.isMandatory).length ?? 0;
-  const failedCount = logs?.items.filter((log) => ['FAILED', 'BOUNCED'].includes(log.status)).length ?? 0;
+  const failedCount =
+    logs?.items.filter((log) => ['FAILED', 'BOUNCED'].includes(log.status)).length ?? 0;
 
   if (providersLoading || templatesLoading) {
     return (
@@ -112,19 +121,21 @@ export default function CommunicationsPage() {
         description="SMTP configuration, transactional templates, delivery logs and retry operations"
         actions={
           <div className="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm">
-              <Send className="h-4 w-4" /> Send test
-            </Button>
-            <Button size="sm">
-              <SquarePen className="h-4 w-4" /> New template
-            </Button>
+            <SendTestEmailButton providerId={activeProvider?.id} />
+            <NewTemplateDialog />
           </div>
         }
       />
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Active provider" value={activeProvider?.providerType ?? 'None'} icon={ShieldCheck}>
-          <p className="text-xs text-ink-muted">{activeProvider?.name ?? 'Configure tenant SMTP to send production mail'}</p>
+        <StatCard
+          label="Active provider"
+          value={activeProvider?.providerType ?? 'None'}
+          icon={ShieldCheck}
+        >
+          <p className="text-xs text-ink-muted">
+            {activeProvider?.name ?? 'Configure tenant SMTP to send production mail'}
+          </p>
         </StatCard>
         <StatCard label="Templates" value={templates?.length ?? 0} icon={MailCheck}>
           <p className="text-xs text-ink-muted">{moduleCount} modules covered</p>
@@ -141,7 +152,9 @@ export default function CommunicationsPage() {
         <Card>
           <CardHeader>
             <CardTitle>SMTP Providers</CardTitle>
-            <CardDescription>Tenant-level delivery configuration with secure credentials.</CardDescription>
+            <CardDescription>
+              Tenant-level delivery configuration with secure credentials.
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             {(providers ?? []).map((provider) => (
@@ -160,8 +173,14 @@ export default function CommunicationsPage() {
                   </Badge>
                 </div>
                 <div className="mt-4 grid gap-2 text-sm">
-                  <Row label="From" value={provider.smtpConfig?.fromEmail ?? 'noreply@peoplehub.local'} />
-                  <Row label="Daily limit" value={provider.dailySendingLimit?.toLocaleString('en-IN') ?? 'Not capped'} />
+                  <Row
+                    label="From"
+                    value={provider.smtpConfig?.fromEmail ?? 'noreply@peoplehub.local'}
+                  />
+                  <Row
+                    label="Daily limit"
+                    value={provider.dailySendingLimit?.toLocaleString('en-IN') ?? 'Not capped'}
+                  />
                   <Row label="Created" value={formatDate(provider.createdAt)} />
                 </div>
               </div>
@@ -177,7 +196,9 @@ export default function CommunicationsPage() {
         <Card>
           <CardHeader>
             <CardTitle>Template Library</CardTitle>
-            <CardDescription>System defaults plus tenant customizations for HRMS workflows.</CardDescription>
+            <CardDescription>
+              System defaults plus tenant customizations for HRMS workflows.
+            </CardDescription>
           </CardHeader>
           <Table>
             <THead>
@@ -216,7 +237,9 @@ export default function CommunicationsPage() {
       <Card>
         <CardHeader>
           <CardTitle>Delivery Logs</CardTitle>
-          <CardDescription>Recent queue outcomes, provider status and retry visibility.</CardDescription>
+          <CardDescription>
+            Recent queue outcomes, provider status and retry visibility.
+          </CardDescription>
         </CardHeader>
         <Table>
           <THead>
@@ -234,7 +257,9 @@ export default function CommunicationsPage() {
               <TR key={log.id}>
                 <TD className="font-medium">{log.to.join(', ')}</TD>
                 <TD>
-                  <p className="max-w-md truncate">{log.subject || log.templateKey || 'Queued email'}</p>
+                  <p className="max-w-md truncate">
+                    {log.subject || log.templateKey || 'Queued email'}
+                  </p>
                   {log.errorMessage && <p className="text-xs text-danger">{log.errorMessage}</p>}
                 </TD>
                 <TD className="capitalize text-ink-muted">{log.module ?? '-'}</TD>

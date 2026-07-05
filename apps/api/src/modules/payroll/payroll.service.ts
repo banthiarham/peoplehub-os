@@ -2,6 +2,7 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { toCsv } from '../../common/utils/csv';
 import {
   AssignSalaryDto,
   CreateExpenseDto,
@@ -154,7 +155,38 @@ export class PayrollService {
     const totalNet = run.entries.reduce((s, e) => s + e.netPay, 0);
     const totalGross = run.entries.reduce((s, e) => s + e.grossPay, 0);
     const totalDeductions = run.entries.reduce((s, e) => s + e.totalDeductions, 0);
-    return { ...run, totals: { totalNet, totalGross, totalDeductions } };
+    const entries = run.entries.map((entry) => ({
+      ...entry,
+      errors: this.jsonStringArray(entry.errors),
+      warnings: this.jsonStringArray(entry.warnings),
+      explanation: this.explainPayrollEntry(entry),
+    }));
+    return {
+      ...run,
+      entries,
+      totals: {
+        totalNet,
+        totalGross,
+        totalDeductions,
+        errors: entries.reduce((sum, entry) => sum + entry.errors.length, 0),
+        warnings: entries.reduce((sum, entry) => sum + entry.warnings.length, 0),
+      },
+    };
+  }
+
+  async exportRunCsv(tenantId: string, id: string): Promise<{ csv: string; period: string }> {
+    const run = await this.getRun(tenantId, id);
+    const csv = toCsv(
+      run.entries.map((e) => ({
+        employeeCode: e.employee.employeeCode,
+        name: `${e.employee.firstName} ${e.employee.lastName}`,
+        department: e.employee.department?.name ?? '',
+        grossPay: e.grossPay,
+        totalDeductions: e.totalDeductions,
+        netPay: e.netPay,
+      })),
+    );
+    return { csv, period: `${run.year}-${String(run.month).padStart(2, '0')}` };
   }
 
   async createRun(tenantId: string, dto: CreateRunDto) {
@@ -182,6 +214,12 @@ export class PayrollService {
       where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] } },
       select: {
         id: true,
+        employeeCode: true,
+        firstName: true,
+        lastName: true,
+        pan: true,
+        uan: true,
+        bankDetails: true,
         employeeSalaries: {
           where: { effectiveFrom: { lte: monthEnd } },
           orderBy: { effectiveFrom: 'desc' },
@@ -194,6 +232,8 @@ export class PayrollService {
         },
       },
     });
+
+    const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
 
     // Unpaid leave days (LWP) reduce payable days
     const lwpRequests = await this.prisma.leaveRequest.findMany({
@@ -212,18 +252,59 @@ export class PayrollService {
     }
 
     let processed = 0;
+    let errorCount = 0;
+    let warningCount = 0;
     for (const emp of employees) {
       const salary = emp.employeeSalaries[0];
-      if (!salary) continue;
+      const errors: string[] = [];
+      const warnings: string[] = [];
+      if (!salary) errors.push('Missing active salary structure or CTC for this payroll month');
+      if (!emp.pan) warnings.push('PAN is missing; TDS and Form 16 data should be reviewed');
+      if (!emp.uan) warnings.push('UAN is missing; PF reporting should be reviewed');
+      if (!emp.bankDetails) warnings.push('Bank details are missing; bank file payout may fail');
+      const unfinalized = attendanceWarnings.get(emp.id);
+      if (unfinalized) warnings.push(`${unfinalized} attendance record(s) are not finalized`);
+
       const lopDays = Math.min(lwpByEmployee.get(emp.id) ?? 0, daysInMonth);
       const payableDays = daysInMonth - lopDays;
       const emi = emp.loans.reduce((s, l) => s + l.emiAmount, 0);
+      if (!salary) {
+        await this.prisma.payrollRunEmployee.upsert({
+          where: { payrollRunId_employeeId: { payrollRunId: run.id, employeeId: emp.id } },
+          create: {
+            payrollRunId: run.id,
+            employeeId: emp.id,
+            grossPay: 0,
+            totalDeductions: 0,
+            netPay: 0,
+            lopDays,
+            payableDays: 0,
+            components: [],
+            errors,
+            warnings,
+          },
+          update: {
+            grossPay: 0,
+            totalDeductions: 0,
+            netPay: 0,
+            lopDays,
+            payableDays: 0,
+            components: [],
+            errors,
+            warnings,
+          },
+        });
+        errorCount += errors.length;
+        warningCount += warnings.length;
+        continue;
+      }
       const result = this.calculator.calculateMonth({
         ctc: salary.ctc,
         payableDays,
         daysInMonth,
         monthlyEmiDeduction: emi,
       });
+      if (result.netPay < 0) errors.push('Net pay is negative after deductions');
       await this.prisma.payrollRunEmployee.upsert({
         where: { payrollRunId_employeeId: { payrollRunId: run.id, employeeId: emp.id } },
         create: {
@@ -235,6 +316,8 @@ export class PayrollService {
           lopDays,
           payableDays,
           components: result.components as unknown as Prisma.InputJsonValue,
+          errors,
+          warnings,
         },
         update: {
           grossPay: result.grossPay,
@@ -243,18 +326,33 @@ export class PayrollService {
           lopDays,
           payableDays,
           components: result.components as unknown as Prisma.InputJsonValue,
+          errors,
+          warnings,
         },
       });
+      errorCount += errors.length;
+      warningCount += warnings.length;
       processed++;
     }
     await this.prisma.payrollRun.update({ where: { id }, data: { status: 'REVIEW' } });
-    return { processed, status: 'REVIEW' };
+    return { processed, errors: errorCount, warnings: warningCount, status: 'REVIEW' };
   }
 
   async approveRun(tenantId: string, id: string, userId: string) {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
     if (run.status !== 'REVIEW') throw new BadRequestException('Run must be in REVIEW to approve');
+    const entries = await this.prisma.payrollRunEmployee.findMany({
+      where: { payrollRunId: id },
+      select: { errors: true },
+    });
+    const criticalErrors = entries.reduce((sum, entry) => sum + this.jsonStringArray(entry.errors).length, 0);
+    if (!entries.length) throw new BadRequestException('Process the run before approving payroll');
+    if (criticalErrors > 0) {
+      throw new BadRequestException(
+        `Payroll has ${criticalErrors} critical validation error(s). Fix them before approval.`,
+      );
+    }
     return this.prisma.payrollRun.update({
       where: { id },
       data: { status: 'APPROVED', lockedAt: new Date(), lockedById: userId },
@@ -377,6 +475,53 @@ export class PayrollService {
         .reverse(),
       statutory,
     };
+  }
+
+  private async attendanceWarningMap(tenantId: string, monthStart: Date, monthEnd: Date) {
+    const grouped = await this.prisma.attendanceRecord.groupBy({
+      by: ['employeeId'],
+      where: {
+        tenantId,
+        date: { gte: monthStart, lte: monthEnd },
+        isFinalized: false,
+      },
+      _count: true,
+    });
+    return new Map(grouped.map((row) => [row.employeeId, row._count]));
+  }
+
+  private jsonStringArray(value: Prisma.JsonValue | null | undefined): string[] {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  }
+
+  private explainPayrollEntry(entry: {
+    grossPay: number;
+    totalDeductions: number;
+    netPay: number;
+    lopDays: number;
+    payableDays: number;
+    components: Prisma.JsonValue;
+  }): string[] {
+    const components = Array.isArray(entry.components)
+      ? (entry.components as Array<{ code?: string; name?: string; type?: string; monthly?: number }>)
+      : [];
+    const earnings = components.filter((c) => c.type === 'EARNING');
+    const deductions = components.filter((c) => c.type === 'DEDUCTION');
+    const lines = [
+      `Payable days: ${entry.payableDays}${entry.lopDays ? ` after ${entry.lopDays} LOP day(s)` : ''}.`,
+      `Gross pay is ${Math.round(entry.grossPay)} from ${earnings.map((c) => c.name ?? c.code).join(', ') || 'earnings'}.`,
+    ];
+    if (deductions.length) {
+      lines.push(
+        `Deductions total ${Math.round(entry.totalDeductions)} from ${deductions
+          .map((c) => `${c.name ?? c.code}: ${Math.round(c.monthly ?? 0)}`)
+          .join(', ')}.`,
+      );
+    } else {
+      lines.push('No statutory or loan deductions were applied.');
+    }
+    lines.push(`Net pay is ${Math.round(entry.netPay)}.`);
+    return lines;
   }
 
   // ── Expenses ──────────────────────────────────────────────────────────────

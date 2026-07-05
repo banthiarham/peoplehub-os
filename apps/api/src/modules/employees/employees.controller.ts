@@ -4,6 +4,11 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import {
+  BulkDocumentDto,
+  BulkImportEmployeesDto,
+  BulkManagerChangeDto,
+  BulkSalaryAssignmentDto,
+  BulkUpdateEmployeesDto,
   CreateDocumentDto,
   CreateEmployeeDto,
   CreateLifecycleEventDto,
@@ -21,7 +26,7 @@ export class EmployeesController {
   @Get()
   @ApiOperation({ summary: 'Paginated employee directory' })
   list(@CurrentUser() user: AuthUser, @Query() q: ListEmployeesDto) {
-    return this.employees.list(user.tenantId, q);
+    return this.employees.list(user, q);
   }
 
   @Get('stats')
@@ -36,10 +41,34 @@ export class EmployeesController {
     return this.employees.options(user.tenantId);
   }
 
+  @Get('profile-changes/pending')
+  @Roles('Super Admin', 'HR Admin')
+  pendingProfileChanges(@CurrentUser() user: AuthUser) {
+    return this.employees.pendingProfileChanges(user);
+  }
+
+  @Patch('profile-changes/:id/approve')
+  @Roles('Super Admin', 'HR Admin')
+  approveProfileChange(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.employees.approveProfileChange(user, id);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Full employee profile' })
   get(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.employees.get(user.tenantId, id);
+    return this.employees.get(user, id);
+  }
+
+  @Get(':id/manager')
+  @ApiOperation({ summary: "Employee's reporting manager" })
+  manager(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.employees.manager(user, id);
+  }
+
+  @Get(':id/team')
+  @ApiOperation({ summary: "Employee's direct reports" })
+  team(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.employees.team(user, id);
   }
 
   @Post()
@@ -53,35 +82,40 @@ export class EmployeesController {
   @Roles('Super Admin', 'HR Admin')
   @ApiOperation({ summary: 'Update employee (audited)' })
   update(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateEmployeeDto) {
-    return this.employees.update(user.tenantId, id, dto, user.userId);
+    return this.employees.update(user, id, dto);
   }
 
   @Delete(':id')
   @Roles('Super Admin', 'HR Admin')
   @ApiOperation({ summary: 'Deactivate employee (soft delete)' })
   deactivate(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.employees.deactivate(user.tenantId, id, user.userId);
+    return this.employees.deactivate(user, id);
   }
 
   @Get(':id/documents')
   listDocuments(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.employees.listDocuments(user.tenantId, id);
+    return this.employees.listDocuments(user, id);
   }
 
   @Post(':id/documents')
   addDocument(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateDocumentDto) {
-    return this.employees.addDocument(user.tenantId, id, dto, user.userId);
+    return this.employees.addDocument(user, id, dto);
   }
 
   @Delete('documents/:docId')
   @Roles('Super Admin', 'HR Admin')
   removeDocument(@CurrentUser() user: AuthUser, @Param('docId') docId: string) {
-    return this.employees.removeDocument(user.tenantId, docId);
+    return this.employees.removeDocument(user, docId);
   }
 
   @Get(':id/lifecycle')
   lifecycle(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.employees.lifecycle(user.tenantId, id);
+    return this.employees.lifecycle(user, id);
+  }
+
+  @Get(':id/lifecycle-events')
+  lifecycleEvents(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.employees.lifecycle(user, id);
   }
 
   @Post(':id/lifecycle')
@@ -91,6 +125,45 @@ export class EmployeesController {
     @Param('id') id: string,
     @Body() dto: CreateLifecycleEventDto,
   ) {
-    return this.employees.addLifecycleEvent(user.tenantId, id, dto, user.userId);
+    return this.employees.addLifecycleEvent(user, id, dto);
+  }
+
+  @Post('bulk/import')
+  @Roles('Super Admin', 'HR Admin')
+  bulkImport(@CurrentUser() user: AuthUser, @Body() dto: BulkImportEmployeesDto) {
+    return this.employees.bulkImport(user, dto);
+  }
+
+  @Post('bulk/update')
+  @Roles('Super Admin', 'HR Admin')
+  bulkUpdate(@CurrentUser() user: AuthUser, @Body() dto: BulkUpdateEmployeesDto) {
+    return this.employees.bulkUpdate(user, dto);
+  }
+
+  @Post('bulk/documents')
+  @Roles('Super Admin', 'HR Admin')
+  bulkDocuments(@CurrentUser() user: AuthUser, @Body() dto: BulkDocumentDto) {
+    return this.employees.bulkDocuments(user, dto);
+  }
+
+  @Post('bulk/manager')
+  @Roles('Super Admin', 'HR Admin')
+  bulkManager(@CurrentUser() user: AuthUser, @Body() dto: BulkManagerChangeDto) {
+    return this.employees.bulkManager(user, dto);
+  }
+
+  @Post('bulk/salary-structure')
+  @Roles('Super Admin', 'HR Admin', 'Payroll Admin')
+  bulkSalary(@CurrentUser() user: AuthUser, @Body() dto: BulkSalaryAssignmentDto) {
+    return this.employees.bulkSalary(user, dto);
+  }
+
+  @Post('bulk/assign-policies')
+  @Roles('Super Admin', 'HR Admin')
+  bulkAssignPolicies(
+    @CurrentUser() user: AuthUser,
+    @Body() body: { employeeIds: string[]; policyType: string; policyId: string },
+  ) {
+    return this.employees.bulkAssignPolicies(user, body);
   }
 }

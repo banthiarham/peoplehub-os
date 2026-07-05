@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, Res } from '@nestjs/common';
+import { FastifyReply } from 'fastify';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -55,6 +56,20 @@ export class PayrollController {
   @Roles(...PAYROLL_ROLES)
   getRun(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.getRun(user.tenantId, id);
+  }
+
+  @Get('runs/:id/export')
+  @Roles(...PAYROLL_ROLES)
+  @ApiOperation({ summary: 'Download the payroll register for a run as CSV' })
+  async exportRun(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res: FastifyReply,
+  ) {
+    const { csv, period } = await this.payroll.exportRunCsv(user.tenantId, id);
+    res.header('Content-Type', 'text/csv; charset=utf-8');
+    res.header('Content-Disposition', `attachment; filename="payroll-register-${period}.csv"`);
+    return csv;
   }
 
   @Post('runs')

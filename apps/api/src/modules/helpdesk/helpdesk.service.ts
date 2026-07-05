@@ -9,12 +9,16 @@ export class HelpdeskService {
 
   async list(
     tenantId: string,
+    user: AuthUser,
     q: { page?: number; pageSize?: number; status?: TicketStatus; priority?: TicketPriority; category?: string; search?: string },
   ) {
     const page = q.page ?? 1;
     const pageSize = q.pageSize ?? 20;
     const where: Prisma.TicketWhereInput = {
       tenantId,
+      ...(user.roles.length === 1 && user.roles.includes('Employee') && user.employeeId
+        ? { employeeId: user.employeeId }
+        : {}),
       ...(q.status && { status: q.status }),
       ...(q.priority && { priority: q.priority }),
       ...(q.category && { category: q.category }),
@@ -34,6 +38,16 @@ export class HelpdeskService {
       this.prisma.ticket.count({ where }),
     ]);
     return { data, meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
+  }
+
+  async myTickets(user: AuthUser) {
+    if (!user.employeeId) throw new ForbiddenException('No employee profile linked');
+    return this.prisma.ticket.findMany({
+      where: { tenantId: user.tenantId, employeeId: user.employeeId },
+      include: { _count: { select: { comments: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
   }
 
   async get(tenantId: string, id: string) {

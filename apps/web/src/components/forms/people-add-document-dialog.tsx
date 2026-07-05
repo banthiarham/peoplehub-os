@@ -17,11 +17,12 @@ import { Input } from '@/components/ui/input';
 import { useToast } from '@/components/ui/toaster';
 import { apiErrorMessage } from './people-form-utils';
 
-const initialForm = { type: '', name: '', fileKey: '' };
+const initialForm = { type: '', name: '' };
 
 export function PeopleAddDocumentDialog({ employeeId }: { employeeId: string }) {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState(initialForm);
+  const [file, setFile] = useState<File | null>(null);
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -29,17 +30,32 @@ export function PeopleAddDocumentDialog({ employeeId }: { employeeId: string }) 
     setForm((f) => ({ ...f, [key]: e.target.value }));
 
   const create = useMutation({
-    mutationFn: () => api.post(`/employees/${employeeId}/documents`, form).then((r) => r.data),
+    mutationFn: async () => {
+      // Upload the binary to object storage first, then attach its key.
+      const data = new FormData();
+      data.append('file', file!);
+      const uploaded = await api
+        .post('/files/upload', data, { headers: { 'Content-Type': 'multipart/form-data' } })
+        .then((r) => r.data as { key: string; name: string });
+      return api
+        .post(`/employees/${employeeId}/documents`, {
+          type: form.type,
+          name: form.name.trim() || uploaded.name,
+          fileKey: uploaded.key,
+        })
+        .then((r) => r.data);
+    },
     onSuccess: () => {
-      toast('Document added');
+      toast('Document uploaded');
       queryClient.invalidateQueries({ queryKey: ['employees', employeeId, 'documents'] });
       setForm(initialForm);
+      setFile(null);
       setOpen(false);
     },
     onError: (err) => toast(apiErrorMessage(err), 'error'),
   });
 
-  const isValid = form.type.trim() && form.name.trim() && form.fileKey.trim();
+  const isValid = form.type.trim() && file;
 
   return (
     <>
@@ -61,22 +77,36 @@ export function PeopleAddDocumentDialog({ employeeId }: { employeeId: string }) 
           >
             <label className="block text-sm">
               <span className="mb-1 block text-xs font-medium text-ink-muted">Type</span>
-              <Input value={form.type} onChange={set('type')} placeholder="e.g. PAN, OFFER_LETTER" required />
+              <Input
+                value={form.type}
+                onChange={set('type')}
+                placeholder="e.g. PAN, OFFER_LETTER"
+                required
+              />
             </label>
             <label className="block text-sm">
-              <span className="mb-1 block text-xs font-medium text-ink-muted">Name</span>
-              <Input value={form.name} onChange={set('name')} placeholder="Document name" required />
+              <span className="mb-1 block text-xs font-medium text-ink-muted">
+                Name (defaults to file name)
+              </span>
+              <Input value={form.name} onChange={set('name')} placeholder="Document name" />
             </label>
             <label className="block text-sm">
-              <span className="mb-1 block text-xs font-medium text-ink-muted">File reference</span>
-              <Input value={form.fileKey} onChange={set('fileKey')} placeholder="Storage key or link" required />
+              <span className="mb-1 block text-xs font-medium text-ink-muted">
+                File (max 10 MB)
+              </span>
+              <input
+                type="file"
+                required
+                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                className="block w-full text-sm text-ink-muted file:mr-3 file:rounded-lg file:border file:border-line file:bg-white file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-ink hover:file:bg-canvas"
+              />
             </label>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setOpen(false)}>
                 Cancel
               </Button>
               <Button type="submit" disabled={!isValid || create.isPending}>
-                {create.isPending ? 'Adding…' : 'Add document'}
+                {create.isPending ? 'Uploading…' : 'Upload document'}
               </Button>
             </DialogFooter>
           </form>

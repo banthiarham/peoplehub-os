@@ -1,9 +1,10 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CalendarClock, Clock, LogIn, LogOut, MapPin } from 'lucide-react';
+import { CalendarClock, Clock, Download, LogIn, LogOut, MapPin } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
+import { downloadFile } from '@/lib/download';
 import { getDeviceId, getDeviceInfo } from '@/lib/device';
 import { captureFreshFix } from '@/lib/geo';
 import { formatTime } from '@/lib/utils';
@@ -109,7 +110,7 @@ export default function AttendancePage() {
         reason: regReason,
       }),
     onSuccess: () => {
-      toast('Attendance regularized');
+      toast('Attendance regularization submitted for approval');
       setRegularizeOpen(false);
       setRegReason('');
       refresh();
@@ -124,6 +125,17 @@ export default function AttendancePage() {
         description="Live team attendance for today — check-in captures your GPS location"
         actions={
           <>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                downloadFile('/attendance/export', 'attendance.csv').catch(() =>
+                  toast('Export failed — HR/Admin role required', 'error'),
+                )
+              }
+            >
+              <Download className="h-3.5 w-3.5" /> Export CSV
+            </Button>
             <Button variant="ghost" size="sm" onClick={() => setRegularizeOpen(true)}>
               <CalendarClock className="h-3.5 w-3.5" /> Regularize
             </Button>
@@ -218,7 +230,8 @@ export default function AttendancePage() {
           <DialogHeader>
             <DialogTitle>Regularize attendance</DialogTitle>
             <DialogDescription>
-              Correct a missed or wrong punch — this updates the record with a MANUAL source.
+              Correct a missed or wrong punch. Employee requests are routed for approval before
+              the MANUAL record is applied.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">

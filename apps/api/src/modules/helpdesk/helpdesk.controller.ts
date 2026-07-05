@@ -13,7 +13,12 @@ export class HelpdeskController {
 
   @Get('tickets')
   list(@CurrentUser() user: AuthUser, @Query() q: ListTicketsDto) {
-    return this.helpdesk.list(user.tenantId, q);
+    return this.helpdesk.list(user.tenantId, user, q);
+  }
+
+  @Get('tickets/me')
+  myTickets(@CurrentUser() user: AuthUser) {
+    return this.helpdesk.myTickets(user);
   }
 
   @Get('tickets/:id')
