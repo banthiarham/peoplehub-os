@@ -6,7 +6,9 @@ import {
   CreateJobDto,
   CreateOfferDto,
   ListCandidatesDto,
+  PublicApplicationDto,
   ScheduleInterviewDto,
+  SubmitInterviewScorecardDto,
   UpdateCandidateDto,
   UpdateInterviewDto,
   UpdateJobDto,
@@ -60,6 +62,67 @@ export class RecruitmentService {
     const job = await this.prisma.jobRequisition.findFirst({ where: { id, tenantId } });
     if (!job) throw new NotFoundException('Job not found');
     return this.prisma.jobRequisition.update({ where: { id }, data: dto });
+  }
+
+  async publicJobs(tenantSlug: string) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { slug: tenantSlug },
+      select: { id: true, name: true, slug: true, logoUrl: true, brandColor: true },
+    });
+    if (!tenant) throw new NotFoundException('Career site not found');
+    const jobs = await this.prisma.jobRequisition.findMany({
+      where: { tenantId: tenant.id, status: 'OPEN' },
+      select: {
+        id: true,
+        title: true,
+        openings: true,
+        jobDescription: true,
+        requirements: true,
+        type: true,
+        locationId: true,
+        departmentId: true,
+        designationId: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    return { tenant, jobs };
+  }
+
+  async publicApply(tenantSlug: string, jobId: string, dto: PublicApplicationDto) {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { slug: tenantSlug },
+      select: { id: true },
+    });
+    if (!tenant) throw new NotFoundException('Career site not found');
+    const job = await this.prisma.jobRequisition.findFirst({
+      where: { id: jobId, tenantId: tenant.id, status: 'OPEN' },
+      select: { id: true },
+    });
+    if (!job) throw new NotFoundException('Open role not found');
+    return this.prisma.candidate.create({
+      data: {
+        tenantId: tenant.id,
+        jobRequisitionId: job.id,
+        firstName: dto.firstName,
+        lastName: dto.lastName,
+        email: dto.email,
+        phone: dto.phone,
+        resumeKey: dto.resumeKey,
+        expectedCTC: dto.expectedCTC,
+        notes: dto.notes,
+        source: 'CAREERS_PAGE',
+        tags: ['public-application'],
+      },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        currentStage: true,
+        createdAt: true,
+      },
+    });
   }
 
   async pipeline(tenantId: string, jobId?: string) {
@@ -191,6 +254,40 @@ export class RecruitmentService {
         ...(dto.feedback !== undefined && { feedback: dto.feedback }),
         ...(dto.rating !== undefined && { rating: dto.rating }),
         ...(dto.result !== undefined && { result: dto.result }),
+      },
+    });
+  }
+
+  async submitInterviewScorecard(tenantId: string, id: string, dto: SubmitInterviewScorecardDto) {
+    const interview = await this.prisma.interview.findFirst({ where: { id, tenantId } });
+    if (!interview) throw new NotFoundException('Interview not found');
+    const totalWeight = dto.competencies.reduce((sum, item) => sum + (item.weight ?? 1), 0) || 1;
+    const weightedRating = dto.competencies.reduce(
+      (sum, item) => sum + item.rating * (item.weight ?? 1),
+      0,
+    ) / totalWeight;
+    const rating = Math.max(1, Math.min(5, Math.round(weightedRating)));
+    const recommendation = dto.recommendation ?? (rating >= 4 ? 'HIRE' : rating <= 2 ? 'NO_HIRE' : 'HOLD');
+    const result = recommendation === 'NO_HIRE' ? 'FAIL' : recommendation === 'HOLD' ? 'ON_HOLD' : 'PASS';
+    return this.prisma.interview.update({
+      where: { id },
+      data: {
+        scorecard: {
+          competencies: dto.competencies,
+          strengths: dto.strengths ?? '',
+          concerns: dto.concerns ?? '',
+          recommendation,
+          weightedRating: Math.round(weightedRating * 10) / 10,
+          metadata: dto.metadata ?? {},
+          submittedAt: new Date().toISOString(),
+        } as unknown as Prisma.InputJsonValue,
+        feedback: dto.feedback ?? dto.strengths ?? interview.feedback,
+        rating,
+        result,
+      },
+      include: {
+        candidate: { select: { id: true, firstName: true, lastName: true, currentStage: true } },
+        jobRequisition: { select: { id: true, title: true } },
       },
     });
   }

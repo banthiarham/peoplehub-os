@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Header, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -37,6 +37,18 @@ export class TimesheetsController {
   @Get('summary')
   summary(@CurrentUser() user: AuthUser) {
     return this.timesheets.summary(user.tenantId);
+  }
+
+  @Get('utilization')
+  utilization(@CurrentUser() user: AuthUser) {
+    return this.timesheets.utilization(user.tenantId);
+  }
+
+  @Get('billing/export')
+  @Header('Content-Type', 'text/csv')
+  @Header('Content-Disposition', 'attachment; filename="timesheet-billing.csv"')
+  billingCsv(@CurrentUser() user: AuthUser) {
+    return this.timesheets.billingCsv(user.tenantId);
   }
 
   @Get()

@@ -1,9 +1,10 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ReceiptText } from 'lucide-react';
+import { Download, ReceiptText } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
+import { downloadFile } from '@/lib/download';
 import { formatINR } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
@@ -23,16 +24,20 @@ interface ExpenseRow {
   amount: number;
   description: string;
   status: string;
+  receiptKey?: string | null;
+  reimbursementMethod: string;
+  clarificationNote?: string | null;
   createdAt: string;
   employee: { firstName: string; lastName: string; employeeCode: string };
 }
 
-type ExpenseAction = 'approve' | 'reject' | 'reimburse';
+type ExpenseAction = 'approve' | 'reject' | 'reimburse' | 'clarify';
 
 const ACTION_SUCCESS: Record<ExpenseAction, string> = {
   approve: 'Expense approved',
   reject: 'Expense rejected',
   reimburse: 'Expense marked reimbursed',
+  clarify: 'Clarification requested',
 };
 
 export function PayrollExpensesTab() {
@@ -48,7 +53,7 @@ export function PayrollExpensesTab() {
 
   const act = useMutation({
     mutationFn: ({ id, action }: { id: string; action: ExpenseAction }) =>
-      api.patch(`/payroll/expenses/${id}/${action}`),
+      api.patch(`/payroll/expenses/${id}/${action}`, action === 'clarify' ? { note: window.prompt('Clarification note') ?? '' } : {}),
     onSuccess: (_res, { action }) => {
       queryClient.invalidateQueries({ queryKey: ['payroll'] });
       toast(ACTION_SUCCESS[action], 'success');
@@ -65,10 +70,22 @@ export function PayrollExpensesTab() {
           <option value="">All</option>
           <option value="SUBMITTED">Submitted</option>
           <option value="APPROVED">Approved</option>
+          <option value="CLARIFICATION_REQUESTED">Needs clarification</option>
           <option value="REJECTED">Rejected</option>
-          <option value="REIMBURSED">Reimbursed</option>
+          <option value="PAID">Paid</option>
         </Select>
-        <PayrollNewExpenseDialog />
+        <div className="flex gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              downloadFile(`/payroll/expenses/export${status ? `?status=${status}` : ''}`, 'expense-report.csv')
+            }
+          >
+            <Download className="h-3.5 w-3.5" /> Export
+          </Button>
+          <PayrollNewExpenseDialog />
+        </div>
       </div>
       {isLoading ? (
         <div className="space-y-2 p-4">
@@ -84,6 +101,7 @@ export function PayrollExpensesTab() {
               <TH>Category</TH>
               <TH>Amount</TH>
               <TH>Description</TH>
+              <TH>Receipt</TH>
               <TH>Status</TH>
               <TH></TH>
             </TR>
@@ -106,7 +124,12 @@ export function PayrollExpensesTab() {
                   <Badge variant="outline">{r.category}</Badge>
                 </TD>
                 <TD className="font-medium tabular-nums">{formatINR(r.amount)}</TD>
-                <TD className="max-w-56 truncate text-ink-muted">{r.description}</TD>
+                <TD className="max-w-56 truncate text-ink-muted">
+                  <span className="block">{r.description}</span>
+                  <span className="block text-xs">{r.reimbursementMethod === 'DIRECT' ? 'Direct' : 'Through payroll'}</span>
+                  {r.clarificationNote && <span className="block text-xs text-warning">{r.clarificationNote}</span>}
+                </TD>
+                <TD className="max-w-36 truncate text-xs text-ink-muted">{r.receiptKey ?? '—'}</TD>
                 <TD>
                   <Badge variant={statusVariant(r.status)}>{r.status}</Badge>
                 </TD>
@@ -130,9 +153,17 @@ export function PayrollExpensesTab() {
                       >
                         Reject
                       </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={act.isPending}
+                        onClick={() => act.mutate({ id: r.id, action: 'clarify' })}
+                      >
+                        Clarify
+                      </Button>
                     </div>
                   )}
-                  {r.status === 'APPROVED' && (
+                  {r.status === 'APPROVED' && r.reimbursementMethod === 'DIRECT' && (
                     <Button
                       size="sm"
                       variant="secondary"

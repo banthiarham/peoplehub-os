@@ -22,6 +22,8 @@ interface TicketRow {
   priority: string;
   status: string;
   createdAt: string;
+  assignedTo?: string | null;
+  sla?: { dueAt: string; hours: number; breached: boolean };
   employee: { firstName: string; lastName: string };
   _count: { comments: number };
 }
@@ -53,6 +55,8 @@ export default function HelpdeskPage() {
           label="Avg resolution"
           value={stats?.avgResolutionHours != null ? `${stats.avgResolutionHours}h` : '—'}
         />
+        <StatCard label="SLA breached" value={stats?.slaBreached ?? '—'} />
+        <StatCard label="Due soon" value={stats?.dueSoon ?? '—'} />
       </div>
 
       <Card>
@@ -74,6 +78,8 @@ export default function HelpdeskPage() {
                 <TH>Raised by</TH>
                 <TH>Category</TH>
                 <TH>Priority</TH>
+                <TH>Queue</TH>
+                <TH>SLA</TH>
                 <TH>Status</TH>
                 <TH>Created</TH>
               </TR>
@@ -105,6 +111,12 @@ export default function HelpdeskPage() {
                   <TD>
                     <Badge variant={t.priority === 'URGENT' || t.priority === 'HIGH' ? 'destructive' : 'outline'}>
                       {t.priority}
+                    </Badge>
+                  </TD>
+                  <TD className="text-ink-muted">{t.assignedTo ?? 'Unassigned'}</TD>
+                  <TD>
+                    <Badge variant={t.sla?.breached ? 'destructive' : 'outline'}>
+                      {t.sla?.breached ? 'Breached' : t.sla?.dueAt ? `Due ${formatDate(t.sla.dueAt)}` : '—'}
                     </Badge>
                   </TD>
                   <TD>

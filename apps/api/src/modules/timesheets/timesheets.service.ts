@@ -22,13 +22,27 @@ export class TimesheetsService {
   }
 
   async createProject(tenantId: string, dto: CreateProjectDto) {
-    return this.prisma.project.create({ data: { ...dto, tenantId } });
+    return this.prisma.project.create({
+      data: {
+        ...dto,
+        tenantId,
+        ...(dto.startDate && { startDate: new Date(dto.startDate) }),
+        ...(dto.endDate && { endDate: new Date(dto.endDate) }),
+      },
+    });
   }
 
   async updateProject(tenantId: string, id: string, dto: CreateProjectDto) {
     const project = await this.prisma.project.findFirst({ where: { id, tenantId } });
     if (!project) throw new NotFoundException('Project not found');
-    return this.prisma.project.update({ where: { id }, data: dto });
+    return this.prisma.project.update({
+      where: { id },
+      data: {
+        ...dto,
+        ...(dto.startDate && { startDate: new Date(dto.startDate) }),
+        ...(dto.endDate && { endDate: new Date(dto.endDate) }),
+      },
+    });
   }
 
   async list(tenantId: string, q: ListTimesheetsDto) {
@@ -117,13 +131,15 @@ export class TimesheetsService {
   }
 
   async summary(tenantId: string) {
-    const monthStart = new Date();
-    monthStart.setDate(1);
-    monthStart.setHours(0, 0, 0, 0);
-    const sheets = await this.prisma.timesheet.findMany({
-      where: { tenantId, weekStart: { gte: monthStart } },
-      include: { project: { select: { name: true } } },
-    });
+    const periodStart = new Date(Date.now() - 35 * 24 * 3600 * 1000);
+    periodStart.setHours(0, 0, 0, 0);
+    const [sheets, activeEmployees] = await Promise.all([
+      this.prisma.timesheet.findMany({
+        where: { tenantId, weekStart: { gte: periodStart } },
+        include: { project: { select: { name: true } } },
+      }),
+      this.prisma.employee.count({ where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE'] } } }),
+    ]);
     const byProject = new Map<string, { total: number; billable: number }>();
     for (const s of sheets) {
       const key = s.project?.name ?? 'No project';
@@ -136,6 +152,107 @@ export class TimesheetsService {
       byProject: [...byProject.entries()].map(([project, v]) => ({ project, ...v })),
       totalHours: sheets.reduce((s, t) => s + t.totalHours, 0),
       billableHours: sheets.reduce((s, t) => s + t.billableHours, 0),
+      nonBillableHours: sheets.reduce((s, t) => s + Math.max(0, t.totalHours - t.billableHours), 0),
+      billableRate: sheets.length
+        ? Math.round(
+            (sheets.reduce((s, t) => s + t.billableHours, 0) /
+              Math.max(1, sheets.reduce((s, t) => s + t.totalHours, 0))) *
+              100,
+          )
+        : 0,
+      capacityHours: activeEmployees * 160,
+      utilizationRate: activeEmployees
+        ? Math.round((sheets.reduce((s, t) => s + t.totalHours, 0) / (activeEmployees * 160)) * 100)
+        : 0,
     };
+  }
+
+  async utilization(tenantId: string) {
+    const periodStart = new Date(Date.now() - 35 * 24 * 3600 * 1000);
+    periodStart.setHours(0, 0, 0, 0);
+    const sheets = await this.prisma.timesheet.findMany({
+      where: { tenantId, weekStart: { gte: periodStart } },
+      include: {
+        employee: { select: { id: true, firstName: true, lastName: true, employeeCode: true } },
+        project: { select: { id: true, name: true, code: true, budgetHours: true, billingRate: true } },
+      },
+      orderBy: { weekStart: 'desc' },
+    });
+
+    const employees = new Map<string, { employee: string; employeeCode: string; total: number; billable: number }>();
+    const projects = new Map<
+      string,
+      { project: string; code: string | null; budgetHours: number | null; billingRate: number | null; total: number; billable: number; revenue: number }
+    >();
+
+    for (const sheet of sheets) {
+      const employeeName = `${sheet.employee.firstName} ${sheet.employee.lastName}`;
+      const employee = employees.get(sheet.employeeId) ?? {
+        employee: employeeName,
+        employeeCode: sheet.employee.employeeCode,
+        total: 0,
+        billable: 0,
+      };
+      employee.total += sheet.totalHours;
+      employee.billable += sheet.billableHours;
+      employees.set(sheet.employeeId, employee);
+
+      const projectKey = sheet.projectId ?? 'unassigned';
+      const project = projects.get(projectKey) ?? {
+        project: sheet.project?.name ?? 'No project',
+        code: sheet.project?.code ?? null,
+        budgetHours: sheet.project?.budgetHours ?? null,
+        billingRate: sheet.project?.billingRate ?? null,
+        total: 0,
+        billable: 0,
+        revenue: 0,
+      };
+      project.total += sheet.totalHours;
+      project.billable += sheet.billableHours;
+      project.revenue += sheet.billableHours * (sheet.project?.billingRate ?? 0);
+      projects.set(projectKey, project);
+    }
+
+    return {
+      employees: [...employees.values()].map((row) => ({
+        ...row,
+        nonBillable: Math.max(0, row.total - row.billable),
+        utilizationRate: Math.round((row.total / 160) * 100),
+        billableRate: Math.round((row.billable / Math.max(1, row.total)) * 100),
+      })),
+      projects: [...projects.values()].map((row) => ({
+        ...row,
+        nonBillable: Math.max(0, row.total - row.billable),
+        budgetBurn: row.budgetHours ? Math.round((row.total / row.budgetHours) * 100) : null,
+      })),
+    };
+  }
+
+  async billingCsv(tenantId: string) {
+    const utilization = await this.utilization(tenantId);
+    const rows = [
+      ['Project', 'Code', 'Total Hours', 'Billable Hours', 'Non-billable Hours', 'Billing Rate', 'Estimated Revenue', 'Budget Hours', 'Budget Burn %'],
+      ...utilization.projects.map((project) => [
+        project.project,
+        project.code ?? '',
+        project.total,
+        project.billable,
+        project.nonBillable,
+        project.billingRate ?? 0,
+        project.revenue,
+        project.budgetHours ?? '',
+        project.budgetBurn ?? '',
+      ]),
+    ];
+    return rows
+      .map((row) =>
+        row
+          .map((value) => {
+            const text = String(value ?? '');
+            return text.includes(',') || text.includes('"') ? `"${text.replace(/"/g, '""')}"` : text;
+          })
+          .join(','),
+      )
+      .join('\n');
   }
 }

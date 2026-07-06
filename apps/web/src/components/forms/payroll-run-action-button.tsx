@@ -33,12 +33,33 @@ const RUN_ACTIONS: Record<string, RunAction> = {
   REVIEW: {
     label: 'Approve',
     success: 'Payroll run approved',
-    run: (id) => api.patch(`/payroll/runs/${id}/approve`),
+    run: async (id) => {
+      try {
+        return await api.patch(`/payroll/runs/${id}/approve`);
+      } catch (err) {
+        const message = payrollApiError(err);
+        if (!message.toLowerCase().includes('warning')) throw err;
+        const reason = window.prompt('Enter the warning override reason before approval');
+        if (!reason?.trim()) throw err;
+        await api.post(`/payroll/runs/${id}/override-warnings`, { reason: reason.trim() });
+        return api.patch(`/payroll/runs/${id}/approve`);
+      }
+    },
   },
   APPROVED: {
+    label: 'Lock',
+    success: 'Payroll run locked',
+    run: (id) => api.patch(`/payroll/runs/${id}/lock`),
+  },
+  LOCKED: {
     label: 'Publish payslips',
     success: 'Payslips published',
     run: (id) => api.post(`/payroll/runs/${id}/publish`),
+  },
+  PUBLISHED: {
+    label: 'Close',
+    success: 'Payroll run closed',
+    run: (id) => api.patch(`/payroll/runs/${id}/close`),
   },
 };
 

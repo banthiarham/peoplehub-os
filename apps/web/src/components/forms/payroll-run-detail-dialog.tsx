@@ -157,16 +157,68 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
               </div>
             )}
             {run && run.entries.length > 0 && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="w-fit"
-                onClick={() =>
-                  downloadFile(`/payroll/runs/${run.id}/export`, 'payroll-register.csv')
-                }
-              >
-                <Download className="h-3.5 w-3.5" /> Export register CSV
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() =>
+                    downloadFile(`/payroll/runs/${run.id}/export`, 'payroll-register.csv')
+                  }
+                >
+                  <Download className="h-3.5 w-3.5" /> Register
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() =>
+                    downloadFile(`/payroll/runs/${run.id}/bank-file`, 'bank-file.csv')
+                  }
+                >
+                  <Download className="h-3.5 w-3.5" /> Bank file
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() =>
+                    downloadFile(`/payroll/runs/${run.id}/statutory/pf-ecr`, 'pf-ecr.txt')
+                  }
+                >
+                  <Download className="h-3.5 w-3.5" /> PF ECR
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() =>
+                    downloadFile(`/payroll/runs/${run.id}/statutory/form-16`, 'form-16-data.csv')
+                  }
+                >
+                  <Download className="h-3.5 w-3.5" /> Form 16
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() =>
+                    downloadFile(`/payroll/runs/${run.id}/statutory/24q`, '24q-tds-data.csv')
+                  }
+                >
+                  <Download className="h-3.5 w-3.5" /> 24Q
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() =>
+                    downloadFile(`/payroll/runs/${run.id}/accounting/gl`, 'payroll-gl.csv')
+                  }
+                >
+                  <Download className="h-3.5 w-3.5" /> GL
+                </Button>
+              </div>
             )}
             {isLoading || !run ? (
               <div className="space-y-2">

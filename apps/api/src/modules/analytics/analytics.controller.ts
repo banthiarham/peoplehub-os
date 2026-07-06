@@ -1,4 +1,5 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, Query, Res } from '@nestjs/common';
+import { FastifyReply } from 'fastify';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthUser } from '../../common/types/auth-user';
@@ -29,5 +30,31 @@ export class AnalyticsController {
   @Get('demographics')
   demographics(@CurrentUser() user: AuthUser) {
     return this.analytics.demographics(user.tenantId);
+  }
+
+  @Get('reports/builder')
+  reportBuilder(
+    @CurrentUser() user: AuthUser,
+    @Query('report') report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets' = 'employees',
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('status') status?: string,
+  ) {
+    return this.analytics.reportBuilder(user.tenantId, report, { from, to, status });
+  }
+
+  @Get('reports/builder/export')
+  async reportBuilderExport(
+    @CurrentUser() user: AuthUser,
+    @Query('report') report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets' = 'employees',
+    @Query('from') from: string | undefined,
+    @Query('to') to: string | undefined,
+    @Query('status') status: string | undefined,
+    @Res({ passthrough: true }) res: FastifyReply,
+  ) {
+    const { csv, filename } = await this.analytics.reportBuilderCsv(user.tenantId, report, { from, to, status });
+    res.header('Content-Type', 'text/csv; charset=utf-8');
+    res.header('Content-Disposition', `attachment; filename="${filename}"`);
+    return csv;
   }
 }

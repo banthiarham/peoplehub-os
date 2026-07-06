@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Public } from '../../common/decorators/public.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import {
@@ -8,7 +9,9 @@ import {
   CreateJobDto,
   CreateOfferDto,
   ListCandidatesDto,
+  PublicApplicationDto,
   ScheduleInterviewDto,
+  SubmitInterviewScorecardDto,
   UpdateCandidateDto,
   UpdateInterviewDto,
   UpdateJobDto,
@@ -23,6 +26,22 @@ const HIRING_ROLES = ['Super Admin', 'HR Admin', 'Manager'];
 @Controller('recruitment')
 export class RecruitmentController {
   constructor(private readonly recruitment: RecruitmentService) {}
+
+  @Public()
+  @Get('public/:tenantSlug/jobs')
+  publicJobs(@Param('tenantSlug') tenantSlug: string) {
+    return this.recruitment.publicJobs(tenantSlug);
+  }
+
+  @Public()
+  @Post('public/:tenantSlug/jobs/:jobId/apply')
+  publicApply(
+    @Param('tenantSlug') tenantSlug: string,
+    @Param('jobId') jobId: string,
+    @Body() dto: PublicApplicationDto,
+  ) {
+    return this.recruitment.publicApply(tenantSlug, jobId, dto);
+  }
 
   @Get('jobs')
   listJobs(@CurrentUser() user: AuthUser, @Query('status') status?: string) {
@@ -95,6 +114,16 @@ export class RecruitmentController {
     @Body() dto: UpdateInterviewDto,
   ) {
     return this.recruitment.updateInterview(user.tenantId, id, dto);
+  }
+
+  @Post('interviews/:id/scorecard')
+  @Roles(...HIRING_ROLES)
+  submitInterviewScorecard(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: SubmitInterviewScorecardDto,
+  ) {
+    return this.recruitment.submitInterviewScorecard(user.tenantId, id, dto);
   }
 
   @Post('offers')

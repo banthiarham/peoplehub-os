@@ -1,10 +1,11 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { Briefcase, CalendarClock, FileSignature, Users } from 'lucide-react';
+import { Briefcase, CalendarClock, ExternalLink, FileSignature, Star, Users } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { PageHeader } from '@/components/ui/page-header';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -21,6 +22,21 @@ interface PipelineStage {
     source: string | null;
     jobRequisition: { title: string };
   }>;
+}
+
+interface InterviewRow {
+  id: string;
+  stage: string;
+  scheduledAt?: string | null;
+  rating?: number | null;
+  result?: string | null;
+  scorecard?: {
+    recommendation?: string;
+    weightedRating?: number;
+    competencies?: Array<{ name: string; rating: number }>;
+  };
+  candidate: { firstName: string; lastName: string; currentStage: string };
+  jobRequisition: { title: string };
 }
 
 const STAGE_LABELS: Record<string, string> = {
@@ -47,6 +63,10 @@ export default function RecruitmentPage() {
     queryKey: ['recruitment', 'pipeline'],
     queryFn: () => api.get('/recruitment/pipeline').then((r) => r.data),
   });
+  const { data: interviews } = useQuery({
+    queryKey: ['recruitment', 'interviews'],
+    queryFn: () => api.get('/recruitment/interviews').then((r) => r.data as InterviewRow[]),
+  });
 
   const stages: PipelineStage[] = (pipeline ?? []).filter(
     (s: PipelineStage) => s.stage !== 'JOINED' || s.count > 0,
@@ -60,6 +80,60 @@ export default function RecruitmentPage() {
         <StatCard label="Total candidates" value={stats?.totalCandidates ?? '—'} icon={Users} />
         <StatCard label="Interviews this week" value={stats?.interviewsThisWeek ?? '—'} icon={CalendarClock} />
         <StatCard label="Offers pending" value={stats?.offersPending ?? '—'} icon={FileSignature} />
+      </div>
+
+      <div className="mb-4 grid gap-4 lg:grid-cols-[1fr_1.2fr]">
+        <Card className="p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium">Public careers page</p>
+              <p className="mt-1 text-sm text-ink-muted">
+                Published roles are visible at the tenant career URL and flow into this pipeline.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => window.open('/careers/demo-corp', '_blank', 'noreferrer')}
+            >
+              <ExternalLink className="h-3.5 w-3.5" /> Open
+            </Button>
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div>
+              <p className="text-sm font-medium">Interview scorecards</p>
+              <p className="text-xs text-ink-muted">Structured competency ratings and hiring recommendations</p>
+            </div>
+            <Badge variant="outline">{interviews?.length ?? 0}</Badge>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {(interviews ?? []).slice(0, 4).map((interview) => (
+              <div key={interview.id} className="rounded border border-line p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">
+                      {interview.candidate.firstName} {interview.candidate.lastName}
+                    </p>
+                    <p className="truncate text-xs text-ink-muted">{interview.jobRequisition.title}</p>
+                  </div>
+                  <Badge variant={interview.result === 'PASS' ? 'success' : interview.result === 'FAIL' ? 'destructive' : 'outline'}>
+                    {interview.scorecard?.recommendation ?? interview.result ?? 'Pending'}
+                  </Badge>
+                </div>
+                <p className="mt-2 flex items-center gap-1 text-xs text-ink-muted">
+                  <Star className="h-3.5 w-3.5" />
+                  {interview.scorecard?.weightedRating ?? interview.rating ?? '—'} / 5 · {interview.stage}
+                </p>
+              </div>
+            ))}
+            {!(interviews ?? []).length && (
+              <p className="text-sm text-ink-muted">No interviews scheduled yet.</p>
+            )}
+          </div>
+        </Card>
       </div>
 
       {isLoading ? (

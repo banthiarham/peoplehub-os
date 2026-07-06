@@ -8,9 +8,13 @@ import { api } from '@/lib/api';
 import { CHART_COLORS } from '@/lib/colors';
 import { formatINR } from '@/lib/utils';
 import { PayrollExpensesTab } from '@/components/forms/payroll-expenses-tab';
+import { PayrollInputsTab } from '@/components/forms/payroll-inputs-tab';
+import { PayrollLoansTab } from '@/components/forms/payroll-loans-tab';
 import { PayrollNewRunDialog } from '@/components/forms/payroll-new-run-dialog';
 import { PayrollRunActionButton } from '@/components/forms/payroll-run-action-button';
 import { PayrollRunDetailDialog } from '@/components/forms/payroll-run-detail-dialog';
+import { PayrollSalariesTab } from '@/components/forms/payroll-salaries-tab';
+import { PayrollStructuresTab } from '@/components/forms/payroll-structures-tab';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -24,15 +28,25 @@ interface RunRow {
   month: number;
   year: number;
   status: string;
+  runType?: string;
+  payGroup?: string | null;
   employees: number;
   totalNet: number;
   totalGross: number;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const PAYROLL_TABS = [
+  { id: 'runs', label: 'Runs', description: 'Process and lock payroll' },
+  { id: 'structures', label: 'Structures', description: 'CTC templates and components' },
+  { id: 'salaries', label: 'Salaries', description: 'Assign employee salary' },
+  { id: 'inputs', label: 'Inputs', description: 'Bonus, arrears and overtime' },
+  { id: 'expenses', label: 'Expenses', description: 'Claims and reimbursements' },
+  { id: 'loans', label: 'Loans', description: 'Advances and EMI recovery' },
+] as const;
 
 export default function PayrollPage() {
-  const [tab, setTab] = useState<'runs' | 'expenses'>('runs');
+  const [tab, setTab] = useState<(typeof PAYROLL_TABS)[number]['id']>('runs');
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const { data: stats, isLoading } = useQuery({
     queryKey: ['payroll', 'stats'],
@@ -95,25 +109,33 @@ export default function PayrollPage() {
         />
       </div>
 
-      <div className="mb-4 flex w-fit gap-1 rounded-lg border border-line bg-white p-1">
-        <Button
-          size="sm"
-          variant={tab === 'runs' ? 'secondary' : 'ghost'}
-          onClick={() => setTab('runs')}
-        >
-          Runs
-        </Button>
-        <Button
-          size="sm"
-          variant={tab === 'expenses' ? 'secondary' : 'ghost'}
-          onClick={() => setTab('expenses')}
-        >
-          Expenses
-        </Button>
+      <div className="mb-4 grid gap-2 rounded-lg border border-line bg-white p-2 sm:grid-cols-2 xl:grid-cols-6">
+        {PAYROLL_TABS.map((item) => (
+          <Button
+            key={item.id}
+            type="button"
+            variant={tab === item.id ? 'secondary' : 'ghost'}
+            onClick={() => setTab(item.id)}
+            className="h-auto justify-start px-3 py-2 text-left"
+          >
+            <span>
+              <span className="block text-sm font-semibold">{item.label}</span>
+              <span className="mt-0.5 block text-xs font-normal text-ink-muted">{item.description}</span>
+            </span>
+          </Button>
+        ))}
       </div>
 
       {tab === 'expenses' ? (
         <PayrollExpensesTab />
+      ) : tab === 'structures' ? (
+        <PayrollStructuresTab />
+      ) : tab === 'salaries' ? (
+        <PayrollSalariesTab />
+      ) : tab === 'inputs' ? (
+        <PayrollInputsTab />
+      ) : tab === 'loans' ? (
+        <PayrollLoansTab />
       ) : (
         <div className="grid gap-4 lg:grid-cols-3">
           <Card className="lg:col-span-1">
@@ -152,6 +174,8 @@ export default function PayrollPage() {
                   <TR key={r.id} className="cursor-pointer" onClick={() => setSelectedRunId(r.id)}>
                     <TD className="font-medium">
                       {MONTHS[r.month - 1]} {r.year}
+                      {r.runType && <span className="ml-2 text-xs text-ink-muted">{r.runType.replace(/_/g, ' ')}</span>}
+                      {r.payGroup && <span className="block text-xs text-ink-muted">{r.payGroup}</span>}
                     </TD>
                     <TD>{r.employees}</TD>
                     <TD className="text-ink-muted">{formatINR(r.totalGross, true)}</TD>

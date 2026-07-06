@@ -16,7 +16,16 @@ interface GoalRow {
   type: string;
   progress: number;
   status: string;
+  keyResults?: Array<{ title: string; current?: number; target?: number; unit?: string; status?: string }>;
   employee: { firstName: string; lastName: string };
+}
+
+interface ReviewCycleRow {
+  id: string;
+  name: string;
+  status: string;
+  completionPct: number;
+  questions?: Array<{ id: string; label: string; type?: string; competency?: string; required?: boolean }>;
 }
 
 interface FeedbackRow {
@@ -41,6 +50,12 @@ export default function PerformancePage() {
     queryKey: ['performance', 'feedback'],
     queryFn: () => api.get('/performance/feedback').then((r) => r.data),
   });
+  const { data: cycles } = useQuery({
+    queryKey: ['performance', 'cycles'],
+    queryFn: () => api.get('/performance/cycles').then((r) => r.data as ReviewCycleRow[]),
+  });
+
+  const activeCycle = (cycles ?? []).find((cycle) => cycle.status === 'ACTIVE') ?? cycles?.[0];
 
   return (
     <div>
@@ -77,6 +92,20 @@ export default function PerformancePage() {
                 <p className="mt-1 text-[11px] text-ink-muted">
                   {g.employee.firstName} {g.employee.lastName} · {g.type}
                 </p>
+                {!!g.keyResults?.length && (
+                  <div className="mt-2 space-y-1 rounded border border-line bg-canvas p-2">
+                    {g.keyResults.slice(0, 3).map((kr) => (
+                      <div key={kr.title} className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="truncate text-ink-muted">{kr.title}</span>
+                        <span className="shrink-0 tabular-nums text-ink">
+                          {kr.current ?? 0}
+                          {kr.target ? ` / ${kr.target}` : ''}
+                          {kr.unit ? ` ${kr.unit}` : ''}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </CardContent>
@@ -84,9 +113,38 @@ export default function PerformancePage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Recent feedback</CardTitle>
+            <CardTitle>Review questionnaire</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
+            {activeCycle ? (
+              <>
+                <div>
+                  <p className="text-sm font-medium">{activeCycle.name}</p>
+                  <p className="text-xs text-ink-muted">{activeCycle.completionPct}% complete</p>
+                </div>
+                {(activeCycle.questions ?? []).slice(0, 6).map((question) => (
+                  <div key={question.id} className="rounded border border-line p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-sm font-medium">{question.label}</p>
+                      <Badge variant="outline">{question.type ?? 'TEXT'}</Badge>
+                    </div>
+                    <p className="mt-1 text-xs text-ink-muted">
+                      {question.competency ?? 'General'} {question.required ? '· Required' : ''}
+                    </p>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <p className="text-sm text-ink-muted">No review cycle configured.</p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Recent feedback</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-4 lg:grid-cols-2">
             {(feedback ?? []).slice(0, 6).map((f: FeedbackRow) => (
               <div key={f.id} className="flex gap-3">
                 <Avatar name={`${f.giver.firstName} ${f.giver.lastName}`} size="sm" />

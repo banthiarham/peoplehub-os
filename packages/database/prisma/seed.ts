@@ -66,6 +66,21 @@ async function main() {
     }),
   ]);
 
+  await prisma.attendanceCaptureSetting.createMany({
+    data: [
+      { tenantId: tenant.id, mode: 'WEB', enabled: true, requiresGps: false, requiresGeofence: false, notes: 'Browser punch enabled for all employees.' },
+      { tenantId: tenant.id, mode: 'MOBILE', enabled: true, requiresGps: false, requiresGeofence: false, notes: 'Mobile browser punch enabled.' },
+      { tenantId: tenant.id, mode: 'GPS', enabled: true, requiresGps: true, requiresGeofence: true, notes: 'GPS punch requires a fresh fix and geofence where location has coordinates.' },
+      { tenantId: tenant.id, mode: 'QR', enabled: true, requiresGps: false, requiresGeofence: false, notes: 'QR punch must match assigned location.' },
+      { tenantId: tenant.id, mode: 'BIOMETRIC', enabled: true, requiresGps: false, requiresGeofence: false, notes: 'Biometric device import enabled for HR.' },
+      { tenantId: tenant.id, mode: 'MANUAL', enabled: true, requiresGps: false, requiresGeofence: false, notes: 'Manual HR corrections enabled.' },
+      { tenantId: tenant.id, mode: 'API_IMPORT', enabled: true, requiresGps: false, requiresGeofence: false, notes: 'External attendance API sync enabled.' },
+      { tenantId: tenant.id, locationId: locations[3]!.id, mode: 'GPS', enabled: true, requiresGps: true, requiresGeofence: false, notes: 'Remote location accepts GPS without office radius.' },
+      { tenantId: tenant.id, locationId: locations[3]!.id, mode: 'QR', enabled: false, requiresGps: false, requiresGeofence: false, notes: 'Remote employees do not use office QR.' },
+    ],
+    skipDuplicates: true,
+  });
+
   // Departments
   const departments = await Promise.all([
     prisma.department.create({ data: { tenantId: tenant.id, name: 'Engineering', code: 'ENG' } }),
@@ -146,45 +161,80 @@ async function main() {
 
   // Leave types
   const leaveTypes = await Promise.all([
-    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Casual Leave', code: 'CL', isPaid: true, isCarryForward: false } }),
-    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Sick Leave', code: 'SL', isPaid: true, isCarryForward: false } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Casual Leave', code: 'CL', isPaid: true, isCarryForward: false, maxDuration: 3 } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Sick Leave', code: 'SL', isPaid: true, isCarryForward: false, requiresAttachment: true, maxDuration: 10 } }),
     prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Earned Leave', code: 'EL', isPaid: true, isCarryForward: true, maxCarryForwardDays: 30, isEncashable: true } }),
-    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Maternity Leave', code: 'ML', isPaid: true, isCarryForward: false, genderRestriction: 'FEMALE' } }),
-    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Leave Without Pay', code: 'LWP', isPaid: false, isCarryForward: false } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Privilege Leave', code: 'PL', isPaid: true, isCarryForward: true, maxCarryForwardDays: 45, isEncashable: true } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Maternity Leave', code: 'ML', isPaid: true, isCarryForward: false, genderRestriction: 'FEMALE', requiresAttachment: true } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Paternity Leave', code: 'PAT', isPaid: true, isCarryForward: false, genderRestriction: 'MALE', maxDuration: 15 } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Bereavement Leave', code: 'BL', isPaid: true, isCarryForward: false, maxDuration: 5 } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Comp Off', code: 'CO', isPaid: true, isCarryForward: false, allowNegativeBalance: false } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Optional Holiday', code: 'OH', isPaid: true, isCarryForward: false, maxDuration: 2 } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Leave Without Pay', code: 'LWP', isPaid: false, isCarryForward: false, allowNegativeBalance: true } }),
+    prisma.leaveType.create({ data: { tenantId: tenant.id, name: 'Study Leave', code: 'STUDY', isPaid: false, isCarryForward: false, requiresAttachment: true } }),
   ]);
 
+  await Promise.all(leaveTypes.map((lt) => prisma.leavePolicy.create({
+    data: {
+      tenantId: tenant.id,
+      leaveTypeId: lt.id,
+      name: `${lt.name} Default Policy`,
+      accrualType: lt.code === 'EL' || lt.code === 'PL' ? 'MONTHLY' : 'UPFRONT',
+      accrualDays: lt.code === 'EL' ? 1.25 : lt.code === 'PL' ? 1.5 : 0,
+      maxAnnualDays: ({ CL: 12, SL: 12, EL: 15, PL: 18, ML: 182, PAT: 15, BL: 5, CO: 12, OH: 2, LWP: 365, STUDY: 30 } as Record<string, number>)[lt.code] ?? 12,
+      maxCarryForwardDays: lt.maxCarryForwardDays,
+      encashmentAllowed: lt.isEncashable,
+      encashmentMaxDays: lt.isEncashable ? 15 : null,
+      expiryDays: lt.code === 'CO' ? 90 : null,
+      minDuration: lt.minDuration,
+      maxDuration: lt.maxDuration,
+      requiresAttachment: lt.requiresAttachment,
+      allowNegativeBalance: lt.allowNegativeBalance,
+      genderRestriction: lt.genderRestriction,
+      employmentTypes: lt.code === 'ML' || lt.code === 'PAT' ? ['FULL_TIME'] : [],
+      probationAllowed: ['SL', 'LWP', 'BL'].includes(lt.code),
+      noticePeriodAllowed: ['SL', 'LWP', 'BL'].includes(lt.code),
+      sandwichRule: lt.code === 'EL' || lt.code === 'PL',
+    },
+  })));
+
   // Holiday calendar
+  const seedYear = new Date().getFullYear();
   const holidayCalendar = await prisma.holidayCalendar.create({
     data: {
       tenantId: tenant.id,
-      name: 'India 2025 Holidays',
-      year: 2025,
+      name: `India ${seedYear} Holidays`,
+      year: seedYear,
       isDefault: true,
       holidays: {
         create: [
-          { name: 'Republic Day', date: new Date('2025-01-26') },
-          { name: 'Holi', date: new Date('2025-03-14') },
-          { name: 'Good Friday', date: new Date('2025-04-18') },
-          { name: 'Independence Day', date: new Date('2025-08-15') },
-          { name: 'Gandhi Jayanti', date: new Date('2025-10-02') },
-          { name: 'Diwali', date: new Date('2025-10-20') },
-          { name: 'Christmas', date: new Date('2025-12-25') },
+          { name: 'Republic Day', date: new Date(`${seedYear}-01-26`) },
+          { name: 'Holi', date: new Date(`${seedYear}-03-14`) },
+          { name: 'Good Friday', date: new Date(`${seedYear}-04-03`) },
+          { name: 'Independence Day', date: new Date(`${seedYear}-08-15`) },
+          { name: 'Gandhi Jayanti', date: new Date(`${seedYear}-10-02`) },
+          { name: 'Diwali', date: new Date(`${seedYear}-11-08`) },
+          { name: 'Christmas', date: new Date(`${seedYear}-12-25`) },
+          { name: 'Founders Day', date: new Date(`${seedYear}-07-20`), isOptional: true },
         ],
       },
     },
   });
 
-  // Default shift
-  await prisma.shift.create({
-    data: {
-      tenantId: tenant.id,
-      name: 'Standard Shift',
-      type: 'FIXED',
-      startTime: '09:00',
-      endTime: '18:00',
-      gracePeriodMins: 15,
-      weeklyOffDays: [0, 6],
-    },
+  // Shifts and attendance rules
+  const shifts = await Promise.all([
+    prisma.shift.create({ data: { tenantId: tenant.id, name: 'Standard Shift', type: 'FIXED', startTime: '09:00', endTime: '18:00', gracePeriodMins: 15, weeklyOffDays: [0, 6], minWorkingMinutes: 480, overtimeAfterMinutes: 540 } }),
+    prisma.shift.create({ data: { tenantId: tenant.id, name: 'Flexible Shift', type: 'FLEXIBLE', startTime: '10:00', endTime: '19:00', gracePeriodMins: 30, weeklyOffDays: [0, 6], remoteAllowed: true, minWorkingMinutes: 450, overtimeAfterMinutes: 540 } }),
+    prisma.shift.create({ data: { tenantId: tenant.id, name: 'Night Operations', type: 'NIGHT', startTime: '21:00', endTime: '06:00', gracePeriodMins: 20, weeklyOffDays: [0, 6], shiftAllowanceAmount: 750, minWorkingMinutes: 420, overtimeAfterMinutes: 510 } }),
+    prisma.shift.create({ data: { tenantId: tenant.id, name: 'Split Support', type: 'SPLIT', startTime: '08:00', endTime: '20:00', breakDurationMins: 180, weeklyOffDays: [0, 6], shiftAllowanceAmount: 300 } }),
+    prisma.shift.create({ data: { tenantId: tenant.id, name: 'Rotational Weekend', type: 'ROTATIONAL', startTime: '09:00', endTime: '18:00', weeklyOffDays: [1, 2], weekendWorkAllowed: true, holidayWorkAllowed: true, compOffEligible: true, shiftAllowanceAmount: 500 } }),
+  ]);
+  await prisma.attendanceRule.createMany({
+    data: [
+      { tenantId: tenant.id, name: 'Default India Attendance Rule', isDefault: true, gracePeriodMins: 15, lateMarkAfterMins: 15, earlyLeavingGraceMins: 15, minWorkingMinutes: 480, halfDayAfterMinutes: 240, overtimeAfterMinutes: 540, weekendWorkAllowed: false, holidayWorkAllowed: false },
+      { tenantId: tenant.id, name: 'Remote/Flexible Rule', shiftId: shifts[1]!.id, gracePeriodMins: 30, lateMarkAfterMins: 30, minWorkingMinutes: 450, halfDayAfterMinutes: 225, overtimeAfterMinutes: 540, remoteAttendanceAllowed: true },
+      { tenantId: tenant.id, name: 'Operations Weekend Rule', shiftId: shifts[4]!.id, gracePeriodMins: 10, lateMarkAfterMins: 10, minWorkingMinutes: 480, halfDayAfterMinutes: 240, overtimeAfterMinutes: 480, weekendWorkAllowed: true, holidayWorkAllowed: true, compOffEligible: true },
+    ],
   });
 
   // Seed users (super admin + HR admins)
@@ -341,6 +391,12 @@ async function main() {
       selfReview: true,
       managerReview: true,
       peerReview: true,
+      questions: [
+        { id: 'impact', label: 'What measurable impact did this employee create?', type: 'TEXT', required: true },
+        { id: 'execution', label: 'Execution quality', type: 'RATING', competency: 'Delivery', weight: 1, required: true },
+        { id: 'collaboration', label: 'Collaboration and communication', type: 'RATING', competency: 'Collaboration', weight: 1, required: true },
+        { id: 'growth', label: 'What should this employee focus on next cycle?', type: 'TEXT', required: false },
+      ],
     },
   });
 
@@ -357,6 +413,26 @@ async function main() {
         { id: '2', text: 'Do you feel valued by your manager?', type: 'RATING', scale: 5 },
         { id: '3', text: 'How likely are you to recommend working here to a friend?', type: 'NPS' },
         { id: '4', text: 'Any feedback or suggestions?', type: 'TEXT' },
+      ],
+      startDate: new Date('2025-07-01'),
+      endDate: new Date('2025-07-31'),
+    },
+  });
+
+  await prisma.survey.create({
+    data: {
+      tenantId: tenant.id,
+      title: 'Friday Townhall Preference',
+      type: 'POLL',
+      status: 'ACTIVE',
+      isAnonymous: false,
+      questions: [
+        {
+          id: 'format',
+          text: 'Which townhall format should we use this month?',
+          type: 'CHOICE',
+          options: ['Product demos', 'Ask-me-anything', 'Customer stories'],
+        },
       ],
       startDate: new Date('2025-07-01'),
       endDate: new Date('2025-07-31'),
@@ -647,8 +723,6 @@ async function main() {
     data: { status: 'OPEN' },
   });
 
-  const shift = (await prisma.shift.findFirst({ where: { tenantId: tenant.id } }))!;
-
   // Deterministic pseudo-random
   let rndState = 42;
   const rnd = () => {
@@ -705,6 +779,39 @@ async function main() {
   await prisma.employee.update({ where: { id: employees[5]!.id }, data: { userId: payrollUser.id } });
   await prisma.employee.update({ where: { id: employees[7]!.id }, data: { userId: employeeUser.id } });
 
+  await prisma.shiftAssignment.createMany({
+    data: employees.map((emp, i) => ({
+      employeeId: emp.id,
+      shiftId: shifts[i % shifts.length]!.id,
+      effectiveFrom: new Date(today0.getFullYear(), today0.getMonth() - 2, 1),
+      source: 'MANUAL',
+    })),
+  });
+  const rosterUpload = await prisma.rosterUpload.create({
+    data: {
+      tenantId: tenant.id,
+      name: 'July operations roster import',
+      periodStart: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 1)),
+      periodEnd: new Date(Date.UTC(today0.getFullYear(), today0.getMonth() + 1, 0)),
+      uploadedById: employees[4]!.id,
+      status: 'IMPORTED',
+      importedCount: 10,
+      failedCount: 0,
+    },
+  });
+  for (let i = 0; i < 10; i++) {
+    await prisma.rosterUploadRow.create({
+      data: {
+        rosterUploadId: rosterUpload.id,
+        employeeId: employees[i]!.id,
+        employeeCode: employees[i]!.employeeCode,
+        shiftId: shifts[(i + 1) % shifts.length]!.id,
+        shiftName: shifts[(i + 1) % shifts.length]!.name,
+        date: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 8 + i)),
+      },
+    });
+  }
+
   // Salaries
   const ctcFor = (i: number) => (i < 8 ? 3200000 + i * 150000 : 450000 + Math.floor(rnd() * 1800000));
   const buildComponents = (ctc: number) => {
@@ -752,17 +859,21 @@ async function main() {
     for (let i = 0; i < employees.length; i++) {
       const emp = employees[i]!;
       if (emp.joiningDate && emp.joiningDate > day) continue;
+      const assignedShift = shifts[i % shifts.length]!;
       const roll = rnd();
       let status = 'PRESENT';
       if (roll > 0.96) status = 'ABSENT';
       else if (roll > 0.9) status = 'ON_LEAVE';
       else if (roll > 0.82) status = 'LATE';
       const inMin = status === 'LATE' ? 40 + Math.floor(rnd() * 60) : Math.floor(rnd() * 30) - 15;
-      const punchIn = new Date(day.getTime() + (9 * 60 + inMin) * 60000);
-      const workMins = 8 * 60 + Math.floor(rnd() * 90);
+      const [startH, startM] = assignedShift.startTime.split(':').map(Number);
+      const punchIn = new Date(day.getTime() + (startH * 60 + startM + inMin) * 60000);
+      const workMins = 7 * 60 + Math.floor(rnd() * 180);
+      const overtimeMinutes = status === 'ABSENT' || status === 'ON_LEAVE' ? null : Math.max(0, workMins - assignedShift.overtimeAfterMinutes);
       attendanceRows.push({
         tenantId: tenant.id,
         employeeId: emp.id,
+        shiftId: assignedShift.id,
         date: day,
         status,
         punchIn: status === 'ABSENT' || status === 'ON_LEAVE' ? null : punchIn,
@@ -771,15 +882,52 @@ async function main() {
             ? null
             : new Date(punchIn.getTime() + workMins * 60000),
         workingMinutes: status === 'ABSENT' || status === 'ON_LEAVE' ? null : workMins,
+        overtimeMinutes,
         punchSource: 'WEB',
+        isFinalized: true,
       });
     }
   }
   await prisma.attendanceRecord.createMany({ data: attendanceRows as never, skipDuplicates: true });
+  const attendanceFinalization = await prisma.attendanceFinalization.create({
+    data: {
+      tenantId: tenant.id,
+      month: today0.getMonth() + 1,
+      year: today0.getFullYear(),
+      finalizedById: employees[4]!.id,
+      notes: 'Seeded finalized attendance for payroll preview',
+      summary: {
+        importedRecords: attendanceRows.length,
+        source: 'seed',
+      },
+    },
+  });
+  await prisma.attendanceRecord.updateMany({
+    where: {
+      tenantId: tenant.id,
+      date: {
+        gte: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 1)),
+        lt: new Date(Date.UTC(today0.getFullYear(), today0.getMonth() + 1, 1)),
+      },
+    },
+    data: { finalizationId: attendanceFinalization.id, isFinalized: true },
+  });
 
   // Leave balances + requests
   const year = today0.getFullYear();
-  const allocation: Record<string, number> = { CL: 12, SL: 12, EL: 15, ML: 26, LWP: 0 };
+  const allocation: Record<string, number> = {
+    CL: 12,
+    SL: 12,
+    EL: 15,
+    PL: 18,
+    ML: 182,
+    PAT: 15,
+    BL: 5,
+    CO: 2,
+    OH: 2,
+    LWP: 0,
+    STUDY: 0,
+  };
   for (const emp of employees) {
     for (const lt of leaveTypes) {
       if (lt.code === 'ML' && emp.gender !== 'FEMALE') continue;
@@ -820,6 +968,42 @@ async function main() {
       },
     });
   }
+  const lwpType = leaveTypes.find((lt) => lt.code === 'LWP')!;
+  await prisma.leaveRequest.create({
+    data: {
+      tenantId: tenant.id,
+      employeeId: employees[8]!.id,
+      leaveTypeId: lwpType.id,
+      fromDate: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 3)),
+      toDate: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 4)),
+      days: 2,
+      reason: 'Approved unpaid personal leave',
+      status: 'APPROVED',
+    },
+  });
+  await prisma.compOffGrant.create({
+    data: {
+      tenantId: tenant.id,
+      employeeId: employees[9]!.id,
+      earnedDate: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 5)),
+      days: 1,
+      expiresAt: new Date(today0.getTime() + 75 * dayMs),
+      notes: 'Weekend release support',
+    },
+  });
+  await prisma.shiftSwapRequest.create({
+    data: {
+      tenantId: tenant.id,
+      requesterEmployeeId: employees[10]!.id,
+      counterpartEmployeeId: employees[11]!.id,
+      requestedShiftId: shifts[0]!.id,
+      targetShiftId: shifts[2]!.id,
+      requestedDate: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 12)),
+      targetDate: new Date(Date.UTC(today0.getFullYear(), today0.getMonth(), 13)),
+      reason: 'Covering night release support',
+      status: 'REQUESTED',
+    },
+  });
 
   // Payroll: previous 5 months published runs + current run entries
   const calcMonth = (ctc: number, emi = 0) => {
@@ -943,7 +1127,23 @@ async function main() {
         scheduledAt: new Date(today0.getTime() + (upcoming ? (i + 1) * dayMs : -(i * 2 + 1) * dayMs)),
         interviewers: [`${FIRST[i]} ${LAST[i]}`],
         mode: i % 2 === 0 ? 'VIDEO' : 'IN_PERSON',
-        ...(upcoming ? {} : { rating: 3 + (i % 3), result: i % 3 === 2 ? 'ON_HOLD' : 'PASS', feedback: 'Strong fundamentals, good communication.' }),
+        ...(upcoming ? {} : {
+          rating: 3 + (i % 3),
+          result: i % 3 === 2 ? 'ON_HOLD' : 'PASS',
+          feedback: 'Strong fundamentals, good communication.',
+          scorecard: {
+            competencies: [
+              { name: 'Technical depth', rating: 3 + (i % 3), weight: 2, notes: 'Clear problem decomposition.' },
+              { name: 'Communication', rating: 4, weight: 1, notes: 'Structured and concise.' },
+              { name: 'Role fit', rating: i % 3 === 2 ? 3 : 4, weight: 1, notes: 'Good alignment with team needs.' },
+            ],
+            strengths: 'Strong fundamentals and ownership signals.',
+            concerns: i % 3 === 2 ? 'Needs another discussion on system design scope.' : '',
+            recommendation: i % 3 === 2 ? 'HOLD' : 'HIRE',
+            weightedRating: i % 3 === 2 ? 3.5 : 4,
+            submittedAt: new Date(today0.getTime() - i * dayMs).toISOString(),
+          },
+        }),
       },
     });
   }
@@ -964,6 +1164,10 @@ async function main() {
         employeeId: employees[(i * 2) % employees.length]!.id,
         title: GOAL_TITLES[i]!,
         type: i % 5 === 0 ? 'COMPANY' : i % 3 === 0 ? 'TEAM' : 'INDIVIDUAL',
+        keyResults: [
+          { title: 'Milestone progress', current: progress, target: 100, unit: '%', weight: 2, status: progress >= 100 ? 'DONE' : progress < 40 ? 'AT_RISK' : 'ON_TRACK' },
+          { title: 'Stakeholder confidence', current: Math.min(5, 2 + (i % 4)), target: 5, unit: 'score', weight: 1, status: progress >= 70 ? 'ON_TRACK' : 'NOT_STARTED' },
+        ],
         progress,
         status: progress === 100 ? 'COMPLETED' : progress < 30 && i % 4 === 0 ? 'AT_RISK' : 'ACTIVE',
         targetDate: new Date(today0.getFullYear(), 11, 31),
@@ -1023,9 +1227,31 @@ async function main() {
         recipientId: employees[(i + 7) % employees.length]!.id,
         badge: BADGES[i % BADGES.length],
         message: RECOG_MSGS[i % RECOG_MSGS.length]!,
+        points: [10, 15, 20, 25, 30][i % 5]!,
       },
     });
   }
+
+  await prisma.announcement.createMany({
+    data: [
+      {
+        tenantId: tenant.id,
+        title: 'Q3 OKR planning starts next week',
+        body: 'Managers should complete team OKR drafts before Friday. HR will publish the final calendar after leadership review.',
+        audience: 'ALL',
+        status: 'PUBLISHED',
+        publishAt: new Date(today0.getTime() - 2 * dayMs),
+      },
+      {
+        tenantId: tenant.id,
+        title: 'Payroll proof window closes soon',
+        body: 'Employees should upload pending investment proofs by the end of this week to avoid higher projected TDS.',
+        audience: 'EMPLOYEES',
+        status: 'PUBLISHED',
+        publishAt: new Date(today0.getTime() - dayMs),
+      },
+    ],
+  });
 
   // Helpdesk tickets
   const TICKETS = [
@@ -1091,9 +1317,9 @@ async function main() {
 
   // Projects + timesheets
   const projects = await Promise.all([
-    prisma.project.create({ data: { tenantId: tenant.id, name: 'PeopleHub Platform', code: 'PHUB', status: 'ACTIVE' } }),
-    prisma.project.create({ data: { tenantId: tenant.id, name: 'Client Implementation — Acme', code: 'ACME', clientName: 'Acme Corp', status: 'ACTIVE' } }),
-    prisma.project.create({ data: { tenantId: tenant.id, name: 'Internal Tooling', code: 'INT', status: 'ACTIVE' } }),
+    prisma.project.create({ data: { tenantId: tenant.id, name: 'PeopleHub Platform', code: 'PHUB', status: 'ACTIVE', budgetHours: 900, billingRate: 0 } }),
+    prisma.project.create({ data: { tenantId: tenant.id, name: 'Client Implementation — Acme', code: 'ACME', clientName: 'Acme Corp', status: 'ACTIVE', budgetHours: 420, billingRate: 3200 } }),
+    prisma.project.create({ data: { tenantId: tenant.id, name: 'Internal Tooling', code: 'INT', status: 'ACTIVE', budgetHours: 240, billingRate: 0 } }),
   ]);
   const monday = new Date(today0);
   monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7) - 7); // last week's Monday
@@ -1103,7 +1329,7 @@ async function main() {
       date: new Date(monday.getTime() + d * dayMs).toISOString().slice(0, 10),
       hours: 7 + (d % 2),
       task: 'Feature development',
-      billable: true,
+      billable: projects[i % 3]!.billingRate ? d !== 4 : false,
     }));
     await prisma.timesheet.create({
       data: {
@@ -1113,7 +1339,7 @@ async function main() {
         weekStart: monday,
         entries,
         totalHours: entries.reduce((s, e) => s + e.hours, 0),
-        billableHours: entries.reduce((s, e) => s + e.hours, 0),
+        billableHours: entries.filter((e) => e.billable).reduce((s, e) => s + e.hours, 0),
         status: i < 3 ? 'APPROVED' : 'SUBMITTED',
         submittedAt: new Date(monday.getTime() + 5 * dayMs),
       },

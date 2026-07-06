@@ -3,10 +3,12 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import {
+  CreateReviewCycleDto,
   CreateGoalDto,
   GiveFeedbackDto,
   SubmitReviewDto,
   UpdateGoalDto,
+  UpdateReviewCycleDto,
 } from './dto/performance.dto';
 import { PerformanceService } from './performance.service';
 
@@ -43,6 +45,20 @@ export class PerformanceController {
   @Get('cycles')
   listCycles(@CurrentUser() user: AuthUser) {
     return this.performance.listCycles(user.tenantId);
+  }
+
+  @Post('cycles')
+  createCycle(@CurrentUser() user: AuthUser, @Body() dto: CreateReviewCycleDto) {
+    return this.performance.createCycle(user.tenantId, dto);
+  }
+
+  @Patch('cycles/:id')
+  updateCycle(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateReviewCycleDto,
+  ) {
+    return this.performance.updateCycle(user.tenantId, id, dto);
   }
 
   @Post('reviews')

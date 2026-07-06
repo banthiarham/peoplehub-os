@@ -8,10 +8,12 @@ import {
   IsInt,
   IsNotEmpty,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
   Max,
   Min,
+  ValidateNested,
 } from 'class-validator';
 import { CandidateStage } from '@prisma/client';
 
@@ -211,6 +213,102 @@ export class UpdateInterviewDto {
   @IsOptional()
   @IsString()
   result?: string;
+}
+
+export class ScorecardCompetencyDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiProperty({ minimum: 1, maximum: 5 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(5)
+  rating!: number;
+
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  weight?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class SubmitInterviewScorecardDto {
+  @ApiProperty({ type: [ScorecardCompetencyDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ScorecardCompetencyDto)
+  competencies!: ScorecardCompetencyDto[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  strengths?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  concerns?: string;
+
+  @ApiPropertyOptional({ enum: ['STRONG_HIRE', 'HIRE', 'NO_HIRE', 'HOLD'] })
+  @IsOptional()
+  @IsString()
+  recommendation?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  feedback?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
+}
+
+export class PublicApplicationDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  firstName!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  lastName!: string;
+
+  @ApiProperty()
+  @IsEmail()
+  email!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  phone?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  resumeKey?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  expectedCTC?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
 }
 
 export class CreateOfferDto {

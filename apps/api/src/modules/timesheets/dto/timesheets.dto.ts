@@ -34,6 +34,28 @@ export class CreateProjectDto {
   @IsOptional()
   @IsString()
   status?: string;
+
+  @ApiPropertyOptional({ description: 'Project hour budget for utilization/burn tracking' })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  budgetHours?: number;
+
+  @ApiPropertyOptional({ description: 'Billing rate per billable hour' })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  billingRate?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  startDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  endDate?: string;
 }
 
 export class TimesheetEntryDto {

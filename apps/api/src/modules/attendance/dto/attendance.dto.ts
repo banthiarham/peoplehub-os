@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsArray,
+  IsBoolean,
   IsDateString,
   IsEnum,
   IsInt,
@@ -12,8 +13,9 @@ import {
   Matches,
   Max,
   Min,
+  ValidateNested,
 } from 'class-validator';
-import { AttendanceStatus, ShiftType } from '@prisma/client';
+import { AttendanceCaptureMode, AttendanceStatus, ShiftSwapStatus, ShiftType } from '@prisma/client';
 
 export class CheckInDto {
   @ApiProperty({ description: 'Stable device identifier registered to this employee' })
@@ -56,6 +58,13 @@ export class CheckInDto {
   @Type(() => Number)
   @IsNumber()
   fixAt?: number;
+}
+
+export class QrPunchDto extends CheckInDto {
+  @ApiProperty({ description: 'QR payload generated for the location, e.g. PHUB:<locationId>' })
+  @IsString()
+  @IsNotEmpty()
+  qrCode!: string;
 }
 
 export class CheckOutDto {
@@ -160,10 +169,66 @@ export class CreateShiftDto {
   @IsInt()
   gracePeriodMins?: number;
 
+  @ApiPropertyOptional({ default: 15 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  earlyLeavingGraceMins?: number;
+
+  @ApiPropertyOptional({ default: 60 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  breakDurationMins?: number;
+
+  @ApiPropertyOptional({ default: 480 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  minWorkingMinutes?: number;
+
+  @ApiPropertyOptional({ default: 240 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  halfDayAfterMinutes?: number;
+
+  @ApiPropertyOptional({ default: 480 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  overtimeAfterMinutes?: number;
+
+  @ApiPropertyOptional({ default: 0 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  shiftAllowanceAmount?: number;
+
   @ApiPropertyOptional({ type: [Number], default: [0, 6] })
   @IsOptional()
   @IsArray()
   weeklyOffDays?: number[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  remoteAllowed?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  weekendWorkAllowed?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  holidayWorkAllowed?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  compOffEligible?: boolean;
 }
 
 export class AssignShiftDto {
@@ -181,4 +246,305 @@ export class AssignShiftDto {
   @IsOptional()
   @IsDateString()
   effectiveFrom?: string;
+}
+
+export class BiometricPunchRowDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeCode!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  date!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  punchIn?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  punchOut?: string;
+
+  @ApiPropertyOptional({ enum: AttendanceStatus })
+  @IsOptional()
+  @IsEnum(AttendanceStatus)
+  status?: AttendanceStatus;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  deviceId?: string;
+}
+
+export class ImportBiometricPunchesDto {
+  @ApiProperty({ type: [BiometricPunchRowDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => BiometricPunchRowDto)
+  rows!: BiometricPunchRowDto[];
+}
+
+export class ImportAttendanceRowsDto extends ImportBiometricPunchesDto {
+  @ApiPropertyOptional({ enum: ['MANUAL', 'API'] })
+  @IsOptional()
+  @IsString()
+  source?: 'MANUAL' | 'API';
+}
+
+export class UpsertAttendanceRuleDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  shiftId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  effectiveFrom?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  effectiveTo?: string;
+
+  @ApiPropertyOptional({ default: 15 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  gracePeriodMins?: number;
+
+  @ApiPropertyOptional({ default: 15 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  lateMarkAfterMins?: number;
+
+  @ApiPropertyOptional({ default: 15 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  earlyLeavingGraceMins?: number;
+
+  @ApiPropertyOptional({ default: 240 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  halfDayAfterMinutes?: number;
+
+  @ApiPropertyOptional({ default: 0 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  absentAfterMinutes?: number;
+
+  @ApiPropertyOptional({ default: 60 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  breakDurationMins?: number;
+
+  @ApiPropertyOptional({ default: 480 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  minWorkingMinutes?: number;
+
+  @ApiPropertyOptional({ default: 480 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  overtimeAfterMinutes?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  remoteAttendanceAllowed?: boolean;
+
+  @ApiPropertyOptional({ default: 0 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  shiftToleranceMins?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  weekendWorkAllowed?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  holidayWorkAllowed?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  compOffEligible?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  isDefault?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
+
+export class ListCaptureSettingsDto {
+  @ApiPropertyOptional({ description: 'Optional location override scope' })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+}
+
+export class UpsertCaptureSettingDto {
+  @ApiProperty({ enum: AttendanceCaptureMode })
+  @IsEnum(AttendanceCaptureMode)
+  mode!: AttendanceCaptureMode;
+
+  @ApiPropertyOptional({ description: 'Optional location override scope. Omit for tenant default.' })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiProperty()
+  @IsBoolean()
+  enabled!: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  requiresGps?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  requiresGeofence?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class RosterRowDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeCode!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  date!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  shiftId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  shiftName?: string;
+}
+
+export class ImportRosterDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiProperty({ type: [RosterRowDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => RosterRowDto)
+  rows!: RosterRowDto[];
+}
+
+export class FinalizeAttendanceDto {
+  @ApiProperty({ example: '2026-07' })
+  @Matches(/^\d{4}-\d{2}$/)
+  month!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class CreateShiftSwapDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  requestedShiftId!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  targetShiftId!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  requestedDate!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  targetDate!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  counterpartEmployeeId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
+
+export class DecideShiftSwapDto {
+  @ApiProperty({ enum: [ShiftSwapStatus.APPROVED, ShiftSwapStatus.REJECTED, ShiftSwapStatus.CANCELLED] })
+  @IsEnum(ShiftSwapStatus)
+  status!: ShiftSwapStatus;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  note?: string;
+}
+
+export class UpsertHolidayDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  date!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  isOptional?: boolean;
 }

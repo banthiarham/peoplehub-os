@@ -1,7 +1,8 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, ReviewCycleStatus } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { CreateReviewCycleDto, KeyResultDto, UpdateReviewCycleDto } from './dto/performance.dto';
 
 @Injectable()
 export class PerformanceService {
@@ -25,7 +26,7 @@ export class PerformanceService {
 
   async createGoal(
     tenantId: string,
-    data: { employeeId: string; title: string; description?: string; type?: string; weightage?: number; targetDate?: string },
+    data: { employeeId: string; title: string; description?: string; type?: string; weightage?: number; targetDate?: string; keyResults?: KeyResultDto[] },
   ) {
     const employee = await this.prisma.employee.findFirst({
       where: { id: data.employeeId, tenantId },
@@ -37,9 +38,11 @@ export class PerformanceService {
         employeeId: data.employeeId,
         title: data.title,
         description: data.description,
+        keyResults: (data.keyResults ?? []) as unknown as Prisma.InputJsonValue,
         type: data.type ?? 'INDIVIDUAL',
         weightage: data.weightage ?? 1,
         targetDate: data.targetDate ? new Date(data.targetDate) : undefined,
+        progress: data.keyResults?.length ? this.keyResultProgress(data.keyResults) : undefined,
       },
     });
   }
@@ -47,18 +50,20 @@ export class PerformanceService {
   async updateGoal(
     tenantId: string,
     id: string,
-    data: { progress?: number; status?: string; title?: string; description?: string },
+    data: { progress?: number; status?: string; title?: string; description?: string; keyResults?: KeyResultDto[] },
   ) {
     const goal = await this.prisma.goal.findFirst({ where: { id, tenantId } });
     if (!goal) throw new NotFoundException('Goal not found');
+    const progress = data.keyResults ? this.keyResultProgress(data.keyResults) : data.progress;
     return this.prisma.goal.update({
       where: { id },
       data: {
-        ...(data.progress !== undefined && { progress: data.progress }),
+        ...(progress !== undefined && { progress }),
         ...(data.status && { status: data.status }),
         ...(data.title && { title: data.title }),
         ...(data.description !== undefined && { description: data.description }),
-        ...(data.progress !== undefined && data.progress >= 100 && { status: 'COMPLETED' }),
+        ...(data.keyResults !== undefined && { keyResults: data.keyResults as unknown as Prisma.InputJsonValue }),
+        ...(progress !== undefined && progress >= 100 && { status: 'COMPLETED' }),
       },
     });
   }
@@ -80,6 +85,39 @@ export class PerformanceService {
         ? Math.round((c._count.reviewResponses / activeEmployees) * 100)
         : 0,
     }));
+  }
+
+  async createCycle(tenantId: string, data: CreateReviewCycleDto) {
+    return this.prisma.reviewCycle.create({
+      data: {
+        tenantId,
+        name: data.name,
+        type: data.type ?? 'ANNUAL',
+        status: this.reviewCycleStatus(data.status),
+        startDate: new Date(data.startDate),
+        endDate: new Date(data.endDate),
+        selfReview: data.selfReview ?? true,
+        managerReview: data.managerReview ?? true,
+        peerReview: data.peerReview ?? false,
+        review360: data.review360 ?? false,
+        questions: (data.questions ?? this.defaultReviewQuestions()) as unknown as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  async updateCycle(tenantId: string, id: string, data: UpdateReviewCycleDto) {
+    const cycle = await this.prisma.reviewCycle.findFirst({ where: { id, tenantId } });
+    if (!cycle) throw new NotFoundException('Review cycle not found');
+    return this.prisma.reviewCycle.update({
+      where: { id },
+      data: {
+        ...(data.name && { name: data.name }),
+        ...(data.status && { status: this.reviewCycleStatus(data.status) }),
+        ...(data.startDate && { startDate: new Date(data.startDate) }),
+        ...(data.endDate && { endDate: new Date(data.endDate) }),
+        ...(data.questions && { questions: data.questions as unknown as Prisma.InputJsonValue }),
+      },
+    });
   }
 
   async submitReview(
@@ -188,7 +226,35 @@ export class PerformanceService {
       },
       avgRating: ratings._avg.overallRating
         ? Math.round(ratings._avg.overallRating * 10) / 10
-        : null,
+      : null,
     };
+  }
+
+  private keyResultProgress(keyResults: KeyResultDto[]): number {
+    if (!keyResults.length) return 0;
+    const totalWeight = keyResults.reduce((sum, kr) => sum + (kr.weight ?? 1), 0) || 1;
+    const progress = keyResults.reduce((sum, kr) => {
+      if (kr.status === 'DONE') return sum + 100 * (kr.weight ?? 1);
+      if (!kr.target || kr.target <= 0) return sum;
+      return sum + Math.min(100, Math.max(0, ((kr.current ?? 0) / kr.target) * 100)) * (kr.weight ?? 1);
+    }, 0) / totalWeight;
+    return Math.round(progress);
+  }
+
+  private defaultReviewQuestions() {
+    return [
+      { id: 'impact', label: 'What business impact did this employee create?', type: 'TEXT', required: true },
+      { id: 'execution', label: 'Execution quality', type: 'RATING', competency: 'Delivery', weight: 1, required: true },
+      { id: 'collaboration', label: 'Collaboration and communication', type: 'RATING', competency: 'Collaboration', weight: 1, required: true },
+      { id: 'growth', label: 'Top growth area for the next cycle', type: 'TEXT', required: false },
+    ];
+  }
+
+  private reviewCycleStatus(status?: string): ReviewCycleStatus {
+    if (!status) return 'DRAFT';
+    if (status === 'DRAFT' || status === 'ACTIVE' || status === 'COMPLETED' || status === 'ARCHIVED') {
+      return status;
+    }
+    return 'DRAFT';
   }
 }

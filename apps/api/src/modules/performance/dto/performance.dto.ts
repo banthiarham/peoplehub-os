@@ -10,7 +10,80 @@ import {
   IsString,
   Max,
   Min,
+  ValidateNested,
 } from 'class-validator';
+
+export class KeyResultDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  title!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  target?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  current?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  weight?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  unit?: string;
+
+  @ApiPropertyOptional({ enum: ['NOT_STARTED', 'ON_TRACK', 'AT_RISK', 'DONE'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+}
+
+export class ReviewQuestionDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  id!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  label!: string;
+
+  @ApiPropertyOptional({ enum: ['TEXT', 'RATING', 'CHOICE'] })
+  @IsOptional()
+  @IsString()
+  type?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  competency?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  options?: string[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  weight?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  required?: boolean;
+}
 
 export class CreateGoalDto {
   @ApiProperty()
@@ -43,6 +116,12 @@ export class CreateGoalDto {
   @IsOptional()
   @IsDateString()
   targetDate?: string;
+
+  @ApiPropertyOptional({ type: [KeyResultDto] })
+  @IsOptional()
+  @ValidateNested({ each: true })
+  @Type(() => KeyResultDto)
+  keyResults?: KeyResultDto[];
 }
 
 export class UpdateGoalDto {
@@ -68,6 +147,91 @@ export class UpdateGoalDto {
   @IsOptional()
   @IsString()
   description?: string;
+
+  @ApiPropertyOptional({ type: [KeyResultDto] })
+  @IsOptional()
+  @ValidateNested({ each: true })
+  @Type(() => KeyResultDto)
+  keyResults?: KeyResultDto[];
+}
+
+export class CreateReviewCycleDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiPropertyOptional({ enum: ['ANNUAL', 'HALF_YEARLY', 'QUARTERLY'] })
+  @IsOptional()
+  @IsString()
+  type?: string;
+
+  @ApiPropertyOptional({ enum: ['DRAFT', 'ACTIVE', 'COMPLETED', 'ARCHIVED'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiProperty()
+  @IsDateString()
+  startDate!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  endDate!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  selfReview?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  managerReview?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  peerReview?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  review360?: boolean;
+
+  @ApiPropertyOptional({ type: [ReviewQuestionDto] })
+  @IsOptional()
+  @ValidateNested({ each: true })
+  @Type(() => ReviewQuestionDto)
+  questions?: ReviewQuestionDto[];
+}
+
+export class UpdateReviewCycleDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  name?: string;
+
+  @ApiPropertyOptional({ enum: ['DRAFT', 'ACTIVE', 'COMPLETED', 'ARCHIVED'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  startDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  endDate?: string;
+
+  @ApiPropertyOptional({ type: [ReviewQuestionDto] })
+  @IsOptional()
+  @ValidateNested({ each: true })
+  @Type(() => ReviewQuestionDto)
+  questions?: ReviewQuestionDto[];
 }
 
 export class SubmitReviewDto {

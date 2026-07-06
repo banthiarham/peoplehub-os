@@ -1,7 +1,8 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { TrendingDown, UserMinus, UserPlus, Users } from 'lucide-react';
+import { Download, TableProperties, TrendingDown, UserMinus, UserPlus, Users } from 'lucide-react';
+import { useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -18,8 +19,11 @@ import {
 } from 'recharts';
 import { api } from '@/lib/api';
 import { CHART_COLORS } from '@/lib/colors';
+import { downloadFile } from '@/lib/download';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { EmptyState } from '@/components/ui/empty-state';
+import { Select } from '@/components/ui/input';
 import { PageHeader } from '@/components/ui/page-header';
 import { Skeleton } from '@/components/ui/skeleton';
 import { StatCard } from '@/components/ui/stat-card';
@@ -66,6 +70,7 @@ function sortByOrder(items: NameValue[], order: string[]): NameValue[] {
 }
 
 export default function ReportsPage() {
+  const [report, setReport] = useState('employees');
   const { data: stats } = useQuery<EmployeeStats>({
     queryKey: ['employees', 'stats'],
     queryFn: () => api.get('/employees/stats').then((r) => r.data),
@@ -81,6 +86,10 @@ export default function ReportsPage() {
   const { data: demographics } = useQuery<Demographics>({
     queryKey: ['analytics', 'demographics'],
     queryFn: () => api.get('/analytics/demographics').then((r) => r.data),
+  });
+  const { data: builderRows } = useQuery<Array<Record<string, unknown>>>({
+    queryKey: ['analytics', 'report-builder', report],
+    queryFn: () => api.get('/analytics/reports/builder', { params: { report } }).then((r) => r.data),
   });
 
   const loading = !stats || !trend || !attrition || !demographics;
@@ -109,6 +118,56 @@ export default function ReportsPage() {
         title="Reports & Analytics"
         description="Workforce trends, attrition, and demographics across the organization."
       />
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <TableProperties className="h-4 w-4 text-primary-600" /> Report builder
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-wrap items-center gap-3">
+            <Select value={report} onChange={(event) => setReport(event.target.value)} className="w-56">
+              <option value="employees">Employees</option>
+              <option value="attendance">Attendance</option>
+              <option value="payroll">Payroll</option>
+              <option value="expenses">Expenses</option>
+              <option value="tickets">Helpdesk tickets</option>
+            </Select>
+            <Button
+              variant="outline"
+              onClick={() =>
+                downloadFile(`/analytics/reports/builder/export?report=${report}`, `${report}-report.csv`)
+              }
+            >
+              <Download className="h-4 w-4" /> Export CSV
+            </Button>
+            <span className="text-sm text-ink-muted">{builderRows?.length ?? 0} rows ready</span>
+          </div>
+          {!!builderRows?.length && (
+            <div className="mt-4 overflow-x-auto rounded border border-line">
+              <Table>
+                <THead>
+                  <TR>
+                    {Object.keys(builderRows[0]).slice(0, 6).map((key) => (
+                      <TH key={key}>{key}</TH>
+                    ))}
+                  </TR>
+                </THead>
+                <TBody>
+                  {builderRows.slice(0, 5).map((row, index) => (
+                    <TR key={index}>
+                      {Object.keys(builderRows[0]).slice(0, 6).map((key) => (
+                        <TD key={key}>{String(row[key] ?? '')}</TD>
+                      ))}
+                    </TR>
+                  ))}
+                </TBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Total employees" value={stats.total} icon={Users} />

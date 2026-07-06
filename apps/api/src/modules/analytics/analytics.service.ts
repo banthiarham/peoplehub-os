@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../common/database/prisma.service';
+import { toCsv } from '../../common/utils/csv';
 
 function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
@@ -301,5 +302,138 @@ export class AnalyticsService {
       tenureBuckets: toArr(byTenure),
       byLocation: toArr(byLocation),
     };
+  }
+
+  async reportBuilder(
+    tenantId: string,
+    report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets',
+    options: { from?: string; to?: string; status?: string },
+  ) {
+    const from = options.from ? new Date(options.from) : undefined;
+    const to = options.to ? new Date(options.to) : undefined;
+    const dateRange = from || to ? { ...(from && { gte: from }), ...(to && { lte: to }) } : undefined;
+
+    if (report === 'employees') {
+      const rows = await this.prisma.employee.findMany({
+        where: { tenantId, ...(options.status && { status: options.status as never }) },
+        include: {
+          department: { select: { name: true } },
+          designation: { select: { name: true } },
+          location: { select: { name: true } },
+          manager: { select: { firstName: true, lastName: true, employeeCode: true } },
+        },
+        orderBy: { employeeCode: 'asc' },
+        take: 1000,
+      });
+      return rows.map((employee) => ({
+        employeeCode: employee.employeeCode,
+        name: `${employee.firstName} ${employee.lastName}`,
+        workEmail: employee.workEmail ?? '',
+        status: employee.status,
+        department: employee.department?.name ?? '',
+        designation: employee.designation?.name ?? '',
+        location: employee.location?.name ?? '',
+        manager: employee.manager ? `${employee.manager.firstName} ${employee.manager.lastName}` : '',
+        joiningDate: employee.joiningDate?.toISOString().slice(0, 10) ?? '',
+      }));
+    }
+
+    if (report === 'attendance') {
+      const rows = await this.prisma.attendanceRecord.findMany({
+        where: { tenantId, ...(dateRange && { date: dateRange }), ...(options.status && { status: options.status as never }) },
+        include: {
+          employee: { select: { employeeCode: true, firstName: true, lastName: true, department: { select: { name: true } } } },
+        },
+        orderBy: [{ date: 'desc' }, { employeeId: 'asc' }],
+        take: 2000,
+      });
+      return rows.map((record) => ({
+        date: record.date.toISOString().slice(0, 10),
+        employeeCode: record.employee.employeeCode,
+        name: `${record.employee.firstName} ${record.employee.lastName}`,
+        department: record.employee.department?.name ?? '',
+        status: record.status,
+        punchIn: record.punchIn?.toISOString() ?? '',
+        punchOut: record.punchOut?.toISOString() ?? '',
+        workingMinutes: record.workingMinutes ?? '',
+        source: record.punchSource ?? '',
+      }));
+    }
+
+    if (report === 'payroll') {
+      const rows = await this.prisma.payrollRunEmployee.findMany({
+        where: {
+          payrollRun: {
+            tenantId,
+            ...(dateRange && {
+              createdAt: dateRange,
+            }),
+          },
+        },
+        include: {
+          payrollRun: { select: { month: true, year: true, status: true } },
+          employee: { select: { employeeCode: true, firstName: true, lastName: true, department: { select: { name: true } } } },
+        },
+        orderBy: [{ payrollRun: { year: 'desc' } }, { payrollRun: { month: 'desc' } }],
+        take: 2000,
+      });
+      return rows.map((entry) => ({
+        period: `${entry.payrollRun.year}-${String(entry.payrollRun.month).padStart(2, '0')}`,
+        payrollStatus: entry.payrollRun.status,
+        employeeCode: entry.employee.employeeCode,
+        name: `${entry.employee.firstName} ${entry.employee.lastName}`,
+        department: entry.employee.department?.name ?? '',
+        grossPay: entry.grossPay,
+        totalDeductions: entry.totalDeductions,
+        netPay: entry.netPay,
+        lopDays: entry.lopDays,
+      }));
+    }
+
+    if (report === 'expenses') {
+      const rows = await this.prisma.expenseClaim.findMany({
+        where: { tenantId, ...(dateRange && { createdAt: dateRange }), ...(options.status && { status: options.status as never }) },
+        include: { employee: { select: { employeeCode: true, firstName: true, lastName: true } } },
+        orderBy: { createdAt: 'desc' },
+        take: 2000,
+      });
+      return rows.map((claim) => ({
+        createdAt: claim.createdAt.toISOString(),
+        employeeCode: claim.employee.employeeCode,
+        name: `${claim.employee.firstName} ${claim.employee.lastName}`,
+        category: claim.category,
+        amount: claim.amount,
+        currency: claim.currency,
+        status: claim.status,
+        description: claim.description ?? '',
+      }));
+    }
+
+    const rows = await this.prisma.ticket.findMany({
+      where: { tenantId, ...(dateRange && { createdAt: dateRange }), ...(options.status && { status: options.status as never }) },
+      include: { employee: { select: { employeeCode: true, firstName: true, lastName: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 2000,
+    });
+    return rows.map((ticket) => ({
+      createdAt: ticket.createdAt.toISOString(),
+      employeeCode: ticket.employee.employeeCode,
+      name: `${ticket.employee.firstName} ${ticket.employee.lastName}`,
+      category: ticket.category,
+      priority: ticket.priority,
+      status: ticket.status,
+      assignedTo: ticket.assignedTo ?? '',
+      subject: ticket.subject,
+      resolvedAt: ticket.resolvedAt?.toISOString() ?? '',
+    }));
+  }
+
+  async reportBuilderCsv(
+    tenantId: string,
+    report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets',
+    options: { from?: string; to?: string; status?: string },
+  ) {
+    const rows = await this.reportBuilder(tenantId, report, options);
+    return { csv: toCsv(rows), filename: `${report}-report.csv` };
   }
 }

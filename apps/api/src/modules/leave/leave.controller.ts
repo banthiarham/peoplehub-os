@@ -3,7 +3,14 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
-import { ApplyLeaveDto, DecideLeaveDto, ListLeaveDto, LeaveMonthDto } from './dto/leave.dto';
+import {
+  ApplyLeaveDto,
+  DecideLeaveDto,
+  ListLeaveDto,
+  LeaveMonthDto,
+  UpsertLeavePolicyDto,
+  UpsertLeaveTypeDto,
+} from './dto/leave.dto';
 import { LeaveService } from './leave.service';
 
 @ApiTags('Leave')
@@ -15,6 +22,36 @@ export class LeaveController {
   @Get('types')
   types(@CurrentUser() user: AuthUser) {
     return this.leave.types(user.tenantId);
+  }
+
+  @Post('types')
+  @Roles('Super Admin', 'HR Admin')
+  createType(@CurrentUser() user: AuthUser, @Body() dto: UpsertLeaveTypeDto) {
+    return this.leave.createType(user.tenantId, dto);
+  }
+
+  @Patch('types/:id')
+  @Roles('Super Admin', 'HR Admin')
+  updateType(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpsertLeaveTypeDto) {
+    return this.leave.updateType(user.tenantId, id, dto);
+  }
+
+  @Get('policies')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  policies(@CurrentUser() user: AuthUser) {
+    return this.leave.policies(user.tenantId);
+  }
+
+  @Post('policies')
+  @Roles('Super Admin', 'HR Admin')
+  createPolicy(@CurrentUser() user: AuthUser, @Body() dto: UpsertLeavePolicyDto) {
+    return this.leave.createPolicy(user.tenantId, dto);
+  }
+
+  @Patch('policies/:id')
+  @Roles('Super Admin', 'HR Admin')
+  updatePolicy(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpsertLeavePolicyDto) {
+    return this.leave.updatePolicy(user.tenantId, id, dto);
   }
 
   @Get('balances/me')

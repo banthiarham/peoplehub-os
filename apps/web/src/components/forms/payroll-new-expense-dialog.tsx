@@ -28,16 +28,25 @@ export function PayrollNewExpenseDialog() {
   const [category, setCategory] = useState<string>('TRAVEL');
   const [amount, setAmount] = useState('');
   const [description, setDescription] = useState('');
+  const [receiptKey, setReceiptKey] = useState('');
+  const [reimbursementMethod, setReimbursementMethod] = useState('PAYROLL');
 
   const create = useMutation({
     mutationFn: () =>
-      api.post('/payroll/expenses', { category, amount: Number(amount), description }),
+      api.post('/payroll/expenses', {
+        category,
+        amount: Number(amount),
+        description,
+        receiptKey: receiptKey.trim() || undefined,
+        reimbursementMethod,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['payroll'] });
       toast('Expense claim submitted', 'success');
       setOpen(false);
       setAmount('');
       setDescription('');
+      setReceiptKey('');
     },
     onError: (err: unknown) => toast(payrollApiError(err), 'error'),
   });
@@ -88,6 +97,25 @@ export function PayrollNewExpenseDialog() {
               value={description}
               onChange={(e) => setDescription(e.target.value)}
             />
+          </label>
+          <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+            Receipt file key
+            <Input
+              placeholder="file_objects key or S3 key"
+              value={receiptKey}
+              onChange={(e) => setReceiptKey(e.target.value)}
+            />
+          </label>
+          <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+            Reimbursement
+            <Select
+              className="w-full"
+              value={reimbursementMethod}
+              onChange={(e) => setReimbursementMethod(e.target.value)}
+            >
+              <option value="PAYROLL">Through payroll</option>
+              <option value="DIRECT">Direct reimbursement</option>
+            </Select>
           </label>
         </div>
         <DialogFooter>
