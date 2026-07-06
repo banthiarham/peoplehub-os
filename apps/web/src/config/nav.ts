@@ -5,6 +5,8 @@ import {
   ClipboardCheck,
   Clock,
   Code2,
+  Bell,
+  FileText,
   HeartHandshake,
   Laptop,
   LayoutDashboard,
@@ -41,6 +43,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { label: 'Copilot', href: '/copilot', icon: Sparkles },
       { label: 'Approvals', href: '/approvals', icon: ClipboardCheck },
+      { label: 'Workflows', href: '/workflows', icon: Network },
       { label: 'Reports', href: '/reports', icon: BarChart3 },
       { label: 'My Portal', href: '/me', icon: Smartphone },
     ],
@@ -81,6 +84,8 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: 'Admin',
     items: [
+      { label: 'Documents', href: '/documents', icon: FileText },
+      { label: 'Notifications', href: '/notifications', icon: Bell },
       { label: 'Communications', href: '/communications', icon: Mail },
       { label: 'Developer', href: '/developer', icon: Code2 },
       { label: 'Settings', href: '/settings', icon: Settings },

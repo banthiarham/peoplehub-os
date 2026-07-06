@@ -5,8 +5,10 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import {
   CreateExitRequestDto,
+  CreateOnboardingTemplateDto,
   StartOnboardingDto,
   UpdateExitRequestDto,
+  UpdateExitTaskDto,
   UpdateOnboardingTaskDto,
 } from './dto/onboarding.dto';
 import { OnboardingService } from './onboarding.service';
@@ -28,6 +30,13 @@ export class OnboardingController {
     return this.onboarding.listTemplates(user.tenantId);
   }
 
+  @Post('templates')
+  @Roles('Super Admin', 'HR Admin')
+  @ApiOperation({ summary: 'Create an onboarding template with scoped checklists' })
+  createTemplate(@CurrentUser() user: AuthUser, @Body() dto: CreateOnboardingTemplateDto) {
+    return this.onboarding.createTemplate(user.tenantId, dto);
+  }
+
   @Post('start')
   @Roles('Super Admin', 'HR Admin')
   @ApiOperation({ summary: 'Instantiate template tasks for an employee' })
@@ -42,6 +51,12 @@ export class OnboardingController {
     @Body() dto: UpdateOnboardingTaskDto,
   ) {
     return this.onboarding.updateTask(user.tenantId, taskId, dto);
+  }
+
+  @Get('preboarding/:employeeId')
+  @ApiOperation({ summary: 'Preboarding portal data for document, form, policy, and checklist tasks' })
+  preboarding(@CurrentUser() user: AuthUser, @Param('employeeId') employeeId: string) {
+    return this.onboarding.preboardingPortal(user.tenantId, employeeId);
   }
 
   @Get('exits')
@@ -63,5 +78,15 @@ export class OnboardingController {
     @Body() dto: UpdateExitRequestDto,
   ) {
     return this.onboarding.updateExit(user.tenantId, id, dto, user.userId);
+  }
+
+  @Patch('exit-tasks/:taskId')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  updateExitTask(
+    @CurrentUser() user: AuthUser,
+    @Param('taskId') taskId: string,
+    @Body() dto: UpdateExitTaskDto,
+  ) {
+    return this.onboarding.updateExitTask(user.tenantId, taskId, dto);
   }
 }

@@ -7,6 +7,7 @@ import {
   IsNumber,
   IsObject,
   IsOptional,
+  IsArray,
   IsString,
   Max,
   Min,
@@ -288,4 +289,235 @@ export class GiveFeedbackDto {
   @IsOptional()
   @IsBoolean()
   isPublic?: boolean;
+}
+
+export class CreateCheckInDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeId!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  managerId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  goalId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  checkInDate?: string;
+
+  @ApiPropertyOptional({ enum: ['ON_TRACK', 'AT_RISK', 'BLOCKED', 'COMPLETE'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiPropertyOptional({ minimum: 0, maximum: 100 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  progress?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  blockers?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  nextSteps?: string;
+}
+
+export class CreateOneOnOneDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeId!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  managerId!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  scheduledAt!: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  agenda?: string[];
+}
+
+export class UpdateOneOnOneDto {
+  @ApiPropertyOptional({ enum: ['SCHEDULED', 'COMPLETED', 'CANCELLED'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  actionItems?: string[];
+}
+
+export class CreateCompetencyFrameworkDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  description?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsArray()
+  competencies?: Array<Record<string, unknown>>;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsArray()
+  ratingScale?: Array<Record<string, unknown>>;
+}
+
+export class CreateCalibrationDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  reviewCycleId!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  revieweeId!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  previousRating?: number;
+
+  @ApiProperty({ minimum: 1, maximum: 5 })
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  @Max(5)
+  calibratedRating!: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  performanceBand?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  potential?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  promotionRecommendation?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  pipRecommendation?: boolean;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  reason!: string;
+}
+
+export class CreatePromotionRecommendationDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeId!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  reviewCycleId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  currentRole?: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  recommendedRole!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  reason!: string;
+}
+
+export class CreatePipDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeId!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  reviewCycleId?: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  title!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  reason!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsArray()
+  successCriteria?: Array<Record<string, unknown>>;
+
+  @ApiProperty()
+  @IsDateString()
+  startDate!: string;
+
+  @ApiProperty()
+  @IsDateString()
+  endDate!: string;
+}
+
+export class UpdatePipDto {
+  @ApiPropertyOptional({ enum: ['ACTIVE', 'COMPLETED', 'EXTENDED', 'CLOSED'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
 }

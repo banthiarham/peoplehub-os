@@ -75,9 +75,17 @@ export default function EmployeesPage() {
   return (
     <div>
       <PageHeader
+        eyebrow="People"
         title="Employees"
         description={data ? `${data.meta.total} people in the directory` : 'Directory'}
         actions={<PeopleAddEmployeeDialog />}
+        meta={
+          <>
+            <Badge variant="outline">{data?.meta.total ?? 0} total</Badge>
+            <Badge variant="outline">{options?.departments?.length ?? 0} depts</Badge>
+            <Badge variant="outline">{options?.locations?.length ?? 0} locations</Badge>
+          </>
+        }
       />
       <Card>
         <div className="flex flex-wrap items-center gap-3 border-b border-line p-4">

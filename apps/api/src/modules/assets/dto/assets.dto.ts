@@ -80,3 +80,20 @@ export class ReturnAssetDto {
   @IsString()
   notes?: string;
 }
+
+export class CreateAssetDocumentDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  fileKey!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  fileName?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  mimeType?: string;
+}

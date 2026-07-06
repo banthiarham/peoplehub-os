@@ -24,7 +24,7 @@ export function TH({ className, ...props }: React.ThHTMLAttributes<HTMLTableCell
   return (
     <th
       className={cn(
-        'border-b border-line px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-muted',
+        'border-b border-line px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-[0.16em] text-ink-muted',
         className,
       )}
       {...props}
@@ -33,5 +33,5 @@ export function TH({ className, ...props }: React.ThHTMLAttributes<HTMLTableCell
 }
 
 export function TD({ className, ...props }: React.TdHTMLAttributes<HTMLTableCellElement>) {
-  return <td className={cn('px-4 py-3.5 align-middle', className)} {...props} />;
+  return <td className={cn('px-4 py-4 align-middle', className)} {...props} />;
 }

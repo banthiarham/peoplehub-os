@@ -54,4 +54,78 @@ describe('PerformanceService', () => {
       }),
     });
   });
+
+  it('blocks manager reviews from non-reporting managers', async () => {
+    const prisma = {
+      reviewCycle: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'cycle-1', tenantId: 'tenant-1', status: 'ACTIVE' }),
+      },
+      employee: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'emp-2', managerId: 'manager-real' }),
+      },
+    };
+    const service = new PerformanceService(prisma as any);
+
+    await expect(
+      service.submitReview(
+        {
+          tenantId: 'tenant-1',
+          employeeId: 'manager-wrong',
+          userId: 'user-1',
+          email: 'manager@example.com',
+          name: 'Manager',
+          isSuperAdmin: false,
+          roles: ['Manager'],
+        },
+        {
+          reviewCycleId: 'cycle-1',
+          revieweeId: 'emp-2',
+          reviewerType: 'MANAGER',
+          overallRating: 4,
+        },
+      ),
+    ).rejects.toThrow('Manager review can only be submitted by the reporting manager');
+  });
+
+  it('audit logs calibration changes', async () => {
+    const calibration = { id: 'cal-1', reviewCycleId: 'cycle-1', revieweeId: 'emp-2', calibratedRating: 4.5 };
+    const prisma = {
+      reviewCycle: { findFirst: jest.fn().mockResolvedValue({ id: 'cycle-1' }) },
+      employee: { findFirst: jest.fn().mockResolvedValue({ id: 'emp-2' }) },
+      performanceCalibration: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        upsert: jest.fn().mockResolvedValue(calibration),
+      },
+      auditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-1' }) },
+    };
+    const service = new PerformanceService(prisma as any);
+
+    await expect(
+      service.calibrate(
+        {
+          tenantId: 'tenant-1',
+          employeeId: 'hr-1',
+          userId: 'user-hr',
+          email: 'hr@example.com',
+          name: 'HR',
+          isSuperAdmin: false,
+          roles: ['HR Admin'],
+        },
+        {
+          reviewCycleId: 'cycle-1',
+          revieweeId: 'emp-2',
+          calibratedRating: 4.5,
+          reason: 'Leadership calibration evidence',
+        },
+      ),
+    ).resolves.toEqual(calibration);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: 'performance.calibration.created',
+        objectType: 'PerformanceCalibration',
+        objectId: 'cal-1',
+        reason: 'Leadership calibration evidence',
+      }),
+    });
+  });
 });

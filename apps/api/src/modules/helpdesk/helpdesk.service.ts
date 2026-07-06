@@ -11,8 +11,18 @@ export class HelpdeskService {
     return { URGENT: 4, HIGH: 8, MEDIUM: 24, LOW: 72 }[priority] ?? 24;
   }
 
-  private routeFor(category: string): string {
+  private async routeFor(tenantId: string, category: string, priority?: TicketPriority): Promise<string> {
     const normalized = category.trim().toUpperCase();
+    const rule = await this.prisma.helpdeskSlaRule.findFirst({
+      where: {
+        tenantId,
+        category: normalized,
+        isActive: true,
+        ...(priority && { OR: [{ priority }, { priority: null }] }),
+      },
+      orderBy: [{ priority: 'desc' }, { resolutionHours: 'asc' }],
+    });
+    if (rule) return rule.assigneeQueue;
     if (['PAYROLL', 'BENEFITS', 'EXPENSES'].includes(normalized)) return 'Payroll Admin';
     if (['IT', 'ASSETS'].includes(normalized)) return 'IT/Admin';
     if (['ATTENDANCE', 'LEAVE'].includes(normalized)) return 'HR Operations';
@@ -20,13 +30,32 @@ export class HelpdeskService {
     return 'HR Helpdesk';
   }
 
-  private withSla<T extends { createdAt: Date; priority: TicketPriority; status: TicketStatus; slaBreached: boolean }>(
+  private async slaFor(tenantId: string, category: string, priority: TicketPriority) {
+    const rule = await this.prisma.helpdeskSlaRule.findFirst({
+      where: {
+        tenantId,
+        category,
+        isActive: true,
+        ...(priority && { OR: [{ priority }, { priority: null }] }),
+      },
+      orderBy: [{ priority: 'desc' }, { resolutionHours: 'asc' }],
+    });
+    return {
+      hours: rule?.resolutionHours ?? this.slaHours(priority),
+      responseHours: rule?.responseHours ?? null,
+      assigneeQueue: rule?.assigneeQueue ?? null,
+    };
+  }
+
+  private async withSla<T extends { id: string; createdAt: Date; priority: TicketPriority; status: TicketStatus; slaBreached: boolean; category: string }>(
+    tenantId: string,
     ticket: T,
   ) {
-    const dueAt = new Date(ticket.createdAt.getTime() + this.slaHours(ticket.priority) * 3600000);
+    const sla = await this.slaFor(tenantId, ticket.category, ticket.priority);
+    const dueAt = new Date(ticket.createdAt.getTime() + sla.hours * 3600000);
     const isOpen = !['RESOLVED', 'CLOSED'].includes(ticket.status);
     const breached = ticket.slaBreached || (isOpen && Date.now() > dueAt.getTime());
-    return { ...ticket, sla: { dueAt, hours: this.slaHours(ticket.priority), breached } };
+    return { ...ticket, sla: { dueAt, hours: sla.hours, breached, responseHours: sla.responseHours, assigneeQueue: sla.assigneeQueue } };
   }
 
   async list(
@@ -60,7 +89,7 @@ export class HelpdeskService {
       this.prisma.ticket.count({ where }),
     ]);
     return {
-      data: data.map((ticket) => this.withSla(ticket)),
+      data: await Promise.all(data.map((ticket) => this.withSla(tenantId, ticket))),
       meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
     };
   }
@@ -73,7 +102,7 @@ export class HelpdeskService {
       orderBy: { createdAt: 'desc' },
       take: 50,
     });
-    return tickets.map((ticket) => this.withSla(ticket));
+    return Promise.all(tickets.map((ticket) => this.withSla(user.tenantId, ticket)));
   }
 
   async get(tenantId: string, id: string) {
@@ -85,22 +114,24 @@ export class HelpdeskService {
       },
     });
     if (!ticket) throw new NotFoundException('Ticket not found');
-    return this.withSla(ticket);
+    return this.withSla(tenantId, ticket);
   }
 
   async create(
     user: AuthUser,
-    data: { category: string; subject: string; description: string; priority?: TicketPriority },
+    data: { category: string; subject: string; description: string; priority?: TicketPriority; attachments?: string[] },
   ) {
     if (!user.employeeId) throw new ForbiddenException('No employee profile linked');
     const category = data.category.trim().toUpperCase();
     const priority = data.priority ?? (category === 'PAYROLL' ? 'HIGH' : 'MEDIUM');
+    const assignedTo = await this.routeFor(user.tenantId, category, priority);
     return this.prisma.ticket.create({
       data: {
         ...data,
         category,
         priority,
-        assignedTo: this.routeFor(category),
+        attachments: data.attachments ?? [],
+        assignedTo,
         tenantId: user.tenantId,
         employeeId: user.employeeId,
       },
@@ -125,11 +156,164 @@ export class HelpdeskService {
     });
   }
 
-  async comment(user: AuthUser, id: string, message: string) {
+  async comment(user: AuthUser, id: string, message: string, isInternal = false) {
     await this.get(user.tenantId, id);
     return this.prisma.ticketComment.create({
-      data: { ticketId: id, authorId: user.userId, message },
+      data: { ticketId: id, authorId: user.userId, message, isInternal },
     });
+  }
+
+  async escalate(user: AuthUser, id: string, assignedTo?: string, reason?: string) {
+    const ticket = await this.get(user.tenantId, id);
+    const queue = assignedTo ?? (await this.routeFor(user.tenantId, ticket.category, ticket.priority));
+    await this.prisma.ticketComment.create({
+      data: {
+        ticketId: id,
+        authorId: user.userId,
+        message: reason ?? `Escalated to ${queue}`,
+        isInternal: true,
+      },
+    });
+    return this.prisma.ticket.update({
+      where: { id },
+      data: { status: 'ESCALATED' as TicketStatus, escalatedAt: new Date(), escalatedTo: queue, assignedTo: queue },
+    });
+  }
+
+  async listSlaRules(tenantId: string) {
+    return this.prisma.helpdeskSlaRule.findMany({
+      where: { tenantId },
+      orderBy: [{ category: 'asc' }, { resolutionHours: 'asc' }],
+    });
+  }
+
+  async createSlaRule(
+    tenantId: string,
+    data: { category: string; priority?: TicketPriority; responseHours?: number; resolutionHours: number; assigneeQueue: string; isActive?: boolean },
+  ) {
+    return this.prisma.helpdeskSlaRule.create({
+      data: {
+        tenantId,
+        category: data.category.trim().toUpperCase(),
+        priority: data.priority,
+        responseHours: data.responseHours,
+        resolutionHours: data.resolutionHours,
+        assigneeQueue: data.assigneeQueue,
+        isActive: data.isActive ?? true,
+      },
+    });
+  }
+
+  async updateSlaRule(
+    tenantId: string,
+    id: string,
+    data: { category?: string; priority?: TicketPriority | null; responseHours?: number | null; resolutionHours?: number; assigneeQueue?: string; isActive?: boolean },
+  ) {
+    const rule = await this.prisma.helpdeskSlaRule.findFirst({ where: { id, tenantId } });
+    if (!rule) throw new NotFoundException('SLA rule not found');
+    return this.prisma.helpdeskSlaRule.update({
+      where: { id },
+      data: {
+        ...(data.category && { category: data.category.trim().toUpperCase() }),
+        ...(data.priority !== undefined && { priority: data.priority ?? null }),
+        ...(data.responseHours !== undefined && { responseHours: data.responseHours ?? null }),
+        ...(data.resolutionHours !== undefined && { resolutionHours: data.resolutionHours }),
+        ...(data.assigneeQueue && { assigneeQueue: data.assigneeQueue }),
+        ...(data.isActive !== undefined && { isActive: data.isActive }),
+      },
+    });
+  }
+
+  async listKnowledgeBase(tenantId: string, q?: { category?: string; search?: string }) {
+    return this.prisma.knowledgeBaseArticle.findMany({
+      where: {
+        tenantId,
+        ...(q?.category && { category: q.category }),
+        ...(q?.search && {
+          OR: [
+            { title: { contains: q.search, mode: 'insensitive' } },
+            { summary: { contains: q.search, mode: 'insensitive' } },
+            { body: { contains: q.search, mode: 'insensitive' } },
+          ],
+        }),
+      },
+      orderBy: [{ status: 'desc' }, { updatedAt: 'desc' }],
+      take: 100,
+    });
+  }
+
+  async createKnowledgeBaseArticle(
+    tenantId: string,
+    data: { title: string; summary?: string; body: string; category?: string; tags?: string[]; status?: string; sourceType?: string },
+  ) {
+    return this.prisma.knowledgeBaseArticle.create({
+      data: {
+        tenantId,
+        title: data.title,
+        summary: data.summary,
+        body: data.body,
+        category: data.category?.trim().toUpperCase() ?? 'GENERAL',
+        tags: (data.tags ?? []) as Prisma.InputJsonValue,
+        status: data.status ?? 'PUBLISHED',
+        sourceType: data.sourceType ?? 'ARTICLE',
+      },
+    });
+  }
+
+  async updateKnowledgeBaseArticle(
+    tenantId: string,
+    id: string,
+    data: { title?: string; summary?: string; body?: string; category?: string; tags?: string[]; status?: string; sourceType?: string },
+  ) {
+    const article = await this.prisma.knowledgeBaseArticle.findFirst({ where: { id, tenantId } });
+    if (!article) throw new NotFoundException('Knowledge base article not found');
+    return this.prisma.knowledgeBaseArticle.update({
+      where: { id },
+      data: {
+        ...(data.title && { title: data.title }),
+        ...(data.summary !== undefined && { summary: data.summary }),
+        ...(data.body && { body: data.body }),
+        ...(data.category && { category: data.category.trim().toUpperCase() }),
+        ...(data.tags !== undefined && { tags: data.tags as Prisma.InputJsonValue }),
+        ...(data.status && { status: data.status }),
+        ...(data.sourceType && { sourceType: data.sourceType }),
+      },
+    });
+  }
+
+  async aiAnswer(tenantId: string, question: string, category?: string) {
+    const articles = await this.prisma.knowledgeBaseArticle.findMany({
+      where: {
+        tenantId,
+        status: { in: ['APPROVED', 'PUBLISHED'] },
+        ...(category && { OR: [{ category: category.trim().toUpperCase() }, { sourceType: 'POLICY' }] }),
+      },
+      orderBy: [{ updatedAt: 'desc' }],
+      take: 50,
+    });
+    const scored = articles
+      .map((article) => {
+        const haystack = `${article.title} ${article.summary ?? ''} ${article.body} ${JSON.stringify(article.tags ?? [])}`.toLowerCase();
+        const score = question
+          .toLowerCase()
+          .split(/\s+/)
+          .filter(Boolean)
+          .reduce((sum, token) => sum + (haystack.includes(token) ? 1 : 0), 0);
+        return { article, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+    const citations = scored.map(({ article }) => ({
+      id: article.id,
+      title: article.title,
+      category: article.category,
+      sourceType: article.sourceType,
+      summary: article.summary,
+    }));
+    const answer = citations.length
+      ? `Based on approved knowledge-base content, the most relevant guidance is: ${citations[0].title}.`
+      : 'No approved knowledge-base content matched this question.';
+    return { answer, citations };
   }
 
   async stats(tenantId: string) {
@@ -147,10 +331,12 @@ export class HelpdeskService {
       }),
       this.prisma.ticket.findMany({
         where: { tenantId, status: { notIn: ['RESOLVED', 'CLOSED'] } },
-        select: { createdAt: true, priority: true, status: true, slaBreached: true },
+        select: { id: true, category: true, createdAt: true, priority: true, status: true, slaBreached: true },
       }),
     ]);
-    const slaOpen = openTickets.map((ticket) => this.withSla(ticket));
+    const slaOpen = await Promise.all(
+      openTickets.map((ticket) => this.withSla(tenantId, { ...ticket, id: 'stats', category: 'GENERAL' })),
+    );
     const count = (s: string) => byStatus.find((b) => b.status === s)?._count ?? 0;
     return {
       open: count('OPEN'),
@@ -174,5 +360,15 @@ export class HelpdeskService {
         : null,
       byCategory: byCategory.map((c) => ({ category: c.category, count: c._count })),
     };
+  }
+
+  async kbStats(tenantId: string) {
+    const [articles, approved, published, policies] = await Promise.all([
+      this.prisma.knowledgeBaseArticle.count({ where: { tenantId } }),
+      this.prisma.knowledgeBaseArticle.count({ where: { tenantId, status: 'APPROVED' } }),
+      this.prisma.knowledgeBaseArticle.count({ where: { tenantId, status: 'PUBLISHED' } }),
+      this.prisma.knowledgeBaseArticle.count({ where: { tenantId, sourceType: 'POLICY' } }),
+    ]);
+    return { articles, approved, published, policies };
   }
 }

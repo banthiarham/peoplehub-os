@@ -5,9 +5,13 @@ import { Public } from '../../common/decorators/public.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import {
+  CandidateCommunicationDto,
+  ConvertCandidateDto,
   CreateCandidateDto,
   CreateJobDto,
   CreateOfferDto,
+  DecideJobApprovalDto,
+  DecideOfferApprovalDto,
   ListCandidatesDto,
   PublicApplicationDto,
   ScheduleInterviewDto,
@@ -60,6 +64,16 @@ export class RecruitmentController {
     return this.recruitment.updateJob(user.tenantId, id, dto);
   }
 
+  @Patch('jobs/:id/approval')
+  @Roles(...HIRING_ROLES)
+  decideJobApproval(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: DecideJobApprovalDto,
+  ) {
+    return this.recruitment.decideJobApproval(user.tenantId, id, dto, user.userId);
+  }
+
   @Get('pipeline')
   pipeline(@CurrentUser() user: AuthUser, @Query('jobId') jobId?: string) {
     return this.recruitment.pipeline(user.tenantId, jobId);
@@ -89,6 +103,26 @@ export class RecruitmentController {
     @Body() dto: UpdateCandidateDto,
   ) {
     return this.recruitment.updateCandidate(user.tenantId, id, dto);
+  }
+
+  @Post('candidates/:id/communications')
+  @Roles(...HIRING_ROLES)
+  addCommunication(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: CandidateCommunicationDto,
+  ) {
+    return this.recruitment.addCommunication(user.tenantId, id, dto, user.userId);
+  }
+
+  @Post('candidates/:id/convert')
+  @Roles(...HIRING_ROLES)
+  convertCandidate(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: ConvertCandidateDto,
+  ) {
+    return this.recruitment.convertCandidate(user.tenantId, id, dto, user.userId);
   }
 
   @Get('interviews')
@@ -132,10 +166,31 @@ export class RecruitmentController {
     return this.recruitment.createOffer(user.tenantId, dto);
   }
 
+  @Get('offers')
+  listOffers(@CurrentUser() user: AuthUser) {
+    return this.recruitment.listOffers(user.tenantId);
+  }
+
   @Patch('offers/:id')
   @Roles(...HIRING_ROLES)
   updateOffer(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateOfferDto) {
     return this.recruitment.updateOffer(user.tenantId, id, dto);
+  }
+
+  @Patch('offers/:id/approval')
+  @Roles(...HIRING_ROLES)
+  decideOfferApproval(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: DecideOfferApprovalDto,
+  ) {
+    return this.recruitment.decideOfferApproval(user.tenantId, id, dto, user.userId);
+  }
+
+  @Post('offers/:id/generate-letter')
+  @Roles(...HIRING_ROLES)
+  generateOfferLetter(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.recruitment.generateOfferLetter(user.tenantId, id);
   }
 
   @Get('stats')

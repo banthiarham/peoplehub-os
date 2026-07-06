@@ -93,4 +93,81 @@ describe('EngagementService', () => {
       totalPoints: 25,
     });
   });
+
+  it('stores anonymous survey responses with respondent hash and segment snapshot', async () => {
+    const prisma = {
+      survey: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'survey-1', tenantId: 'tenant-1', status: 'ACTIVE', isAnonymous: true }),
+      },
+      surveyResponse: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({ id: 'response-1', employeeId: null }),
+      },
+      employee: {
+        findFirst: jest.fn().mockResolvedValue({
+          joiningDate: new Date('2025-01-01'),
+          department: { name: 'Engineering' },
+          location: { name: 'Bengaluru' },
+          manager: { firstName: 'Asha', lastName: 'Rao' },
+        }),
+      },
+    };
+    const service = new EngagementService(prisma as any);
+
+    await expect(
+      service.respond(
+        {
+          tenantId: 'tenant-1',
+          employeeId: 'emp-1',
+          userId: 'user-1',
+          email: 'employee@example.com',
+          name: 'Employee',
+          isSuperAdmin: false,
+          roles: ['Employee'],
+        },
+        'survey-1',
+        { enps: 9 },
+      ),
+    ).resolves.toEqual({ id: 'response-1', employeeId: null });
+    expect(prisma.surveyResponse.findFirst).toHaveBeenCalledWith({
+      where: { surveyId: 'survey-1', OR: [{ employeeId: 'emp-1' }, { respondentHash: expect.any(String) }] },
+    });
+    expect(prisma.surveyResponse.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        employeeId: null,
+        respondentHash: expect.any(String),
+        segment: expect.objectContaining({ department: 'Engineering', location: 'Bengaluru', manager: 'Asha Rao' }),
+      }),
+    });
+  });
+
+  it('suppresses segmented survey results below the anonymity threshold', async () => {
+    const prisma = {
+      survey: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'survey-1',
+          tenantId: 'tenant-1',
+          title: 'Pulse',
+          type: 'PULSE',
+          responses: [
+            { segment: { department: 'Engineering' }, responses: { q1: 9 } },
+            { segment: { department: 'Engineering' }, responses: { q1: 8 } },
+            { segment: { department: 'Engineering' }, responses: { q1: 7 } },
+            { segment: { department: 'HR' }, responses: { q1: 10 } },
+          ],
+        }),
+      },
+    };
+    const service = new EngagementService(prisma as any);
+
+    await expect(service.surveySegments('tenant-1', 'survey-1', 'department')).resolves.toEqual({
+      survey: { id: 'survey-1', title: 'Pulse', type: 'PULSE' },
+      segmentBy: 'department',
+      minResponses: 3,
+      segments: [
+        { segment: 'Engineering', responses: 3, suppressed: false, avgScaleScore: 8, enps: 33 },
+        { segment: 'HR', responses: 1, suppressed: true },
+      ],
+    });
+  });
 });

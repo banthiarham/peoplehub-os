@@ -28,3 +28,25 @@ export class ChangePasswordDto {
   @MinLength(8)
   newPassword!: string;
 }
+
+export class OAuthTokenDto {
+  @ApiProperty({ example: 'client_credentials' })
+  @IsString()
+  @IsNotEmpty()
+  grant_type!: string;
+
+  @ApiProperty({ example: 'phc_xxxxxxxxxxxx' })
+  @IsString()
+  @IsNotEmpty()
+  client_id!: string;
+
+  @ApiProperty({ example: 'phs_xxxxxxxxxxxx' })
+  @IsString()
+  @IsNotEmpty()
+  client_secret!: string;
+
+  @ApiPropertyOptional({ example: 'employees.read attendance.read' })
+  @IsOptional()
+  @IsString()
+  scope?: string;
+}

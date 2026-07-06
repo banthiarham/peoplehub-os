@@ -1,9 +1,10 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
+import { createHash } from 'crypto';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
-import { ChangePasswordDto, LoginDto } from './dto/login.dto';
+import { ChangePasswordDto, LoginDto, OAuthTokenDto } from './dto/login.dto';
 import { JwtPayload } from './jwt.strategy';
 
 @Injectable()
@@ -44,6 +45,8 @@ export class AuthService {
       isSuperAdmin: user.isSuperAdmin,
       employeeId: user.employee?.id ?? null,
       roles: user.userRoles.map((ur) => ur.role.name),
+      authType: 'jwt',
+      scopes: [],
     };
 
     return {
@@ -81,6 +84,59 @@ export class AuthService {
       employeeCode: user.employee?.employeeCode ?? null,
       roles: user.userRoles.map((ur) => ur.role.name),
       tenant: user.tenant,
+    };
+  }
+
+  async oauthToken(dto: OAuthTokenDto) {
+    if (dto.grant_type !== 'client_credentials') {
+      throw new UnauthorizedException('Unsupported grant type');
+    }
+
+    const client = await this.prisma.oAuthClient.findFirst({
+      where: {
+        clientId: dto.client_id,
+        isActive: true,
+      },
+      include: {
+        tenant: { select: { id: true, slug: true, name: true } },
+      },
+    });
+
+    if (!client || client.clientSecretHash !== createHash('sha256').update(dto.client_secret).digest('hex')) {
+      throw new UnauthorizedException('Invalid client credentials');
+    }
+
+    const requestedScopes = dto.scope
+      ? dto.scope.split(/\s+/).map((scope) => scope.trim()).filter(Boolean)
+      : client.scopes ?? [];
+    const tokenScopes = requestedScopes.filter((scope) => client.scopes.includes(scope));
+    if (requestedScopes.length && tokenScopes.length === 0) {
+      throw new UnauthorizedException('Requested scopes are not allowed');
+    }
+
+    const payload: JwtPayload = {
+      sub: `oauth-client:${client.id}`,
+      tenantId: client.tenantId,
+      email: `${client.clientId}@oauth.peoplehub.internal`,
+      name: client.name,
+      isSuperAdmin: false,
+      employeeId: null,
+      roles: [],
+      authType: 'oauth',
+      scopes: tokenScopes.length ? tokenScopes : client.scopes,
+    };
+
+    return {
+      access_token: await this.jwt.signAsync(payload),
+      token_type: 'Bearer',
+      expires_in: 24 * 60 * 60,
+      scope: (payload.scopes ?? []).join(' '),
+      tenant: client.tenant,
+      client: {
+        id: client.id,
+        clientId: client.clientId,
+        name: client.name,
+      },
     };
   }
 

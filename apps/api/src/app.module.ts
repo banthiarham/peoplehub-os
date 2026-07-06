@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { EventEmitterModule } from '@nestjs/event-emitter';
@@ -26,8 +27,10 @@ import { TaxModule } from './modules/tax/tax.module';
 import { EmailModule } from './modules/email/email.module';
 import { LocationsModule } from './modules/locations/locations.module';
 import { FilesModule } from './modules/files/files.module';
+import { DocumentsModule } from './modules/documents/documents.module';
 import { OrganizationModule } from './modules/organization/organization.module';
 import { RbacModule } from './modules/rbac/rbac.module';
+import { ApiUsageInterceptor } from './common/interceptors/api-usage.interceptor';
 
 @Module({
   imports: [
@@ -58,8 +61,15 @@ import { RbacModule } from './modules/rbac/rbac.module';
     EmailModule,
     LocationsModule,
     FilesModule,
+    DocumentsModule,
     OrganizationModule,
     RbacModule,
+  ],
+  providers: [
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: ApiUsageInterceptor,
+    },
   ],
 })
 export class AppModule {}

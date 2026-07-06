@@ -1,7 +1,9 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, SurveyStatus } from '@prisma/client';
+import { createHash } from 'crypto';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { CreateSurveyDto, UpdateSurveyDto } from './dto/engagement.dto';
 
 interface SurveyQuestion {
   id: string;
@@ -104,6 +106,36 @@ export class EngagementService {
     });
   }
 
+  async createSurvey(tenantId: string, data: CreateSurveyDto) {
+    return this.prisma.survey.create({
+      data: {
+        tenantId,
+        title: data.title,
+        type: data.type ?? 'PULSE',
+        status: this.surveyStatus(data.status) ?? 'DRAFT',
+        isAnonymous: data.isAnonymous ?? true,
+        startDate: data.startDate ? new Date(data.startDate) : data.status === 'ACTIVE' ? new Date() : undefined,
+        endDate: data.endDate ? new Date(data.endDate) : undefined,
+        questions: (data.questions?.length ? data.questions : this.defaultSurveyQuestions(data.type)) as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  async updateSurvey(tenantId: string, id: string, data: UpdateSurveyDto) {
+    const survey = await this.prisma.survey.findFirst({ where: { id, tenantId } });
+    if (!survey) throw new NotFoundException('Survey not found');
+    return this.prisma.survey.update({
+      where: { id },
+      data: {
+        ...(data.status && {
+          status: this.surveyStatus(data.status),
+          ...(data.status === 'ACTIVE' && !survey.startDate && { startDate: new Date() }),
+        }),
+        ...(data.endDate && { endDate: new Date(data.endDate) }),
+      },
+    });
+  }
+
   async respond(user: AuthUser, surveyId: string, responses: Record<string, unknown>) {
     const employeeId = this.requireEmployee(user);
     const survey = await this.prisma.survey.findFirst({
@@ -111,17 +143,55 @@ export class EngagementService {
     });
     if (!survey) throw new NotFoundException('Survey not found');
     if (survey.status !== 'ACTIVE') throw new BadRequestException('Survey is not active');
+    const respondentHash = this.respondentHash(surveyId, employeeId);
     const already = await this.prisma.surveyResponse.findFirst({
-      where: { surveyId, employeeId },
+      where: { surveyId, OR: [{ employeeId }, { respondentHash }] },
     });
     if (already) throw new BadRequestException('You have already responded to this survey');
+    const segment = await this.employeeSegment(user.tenantId, employeeId);
     return this.prisma.surveyResponse.create({
       data: {
         surveyId,
         employeeId: survey.isAnonymous ? null : employeeId,
+        respondentHash,
+        segment: segment as Prisma.InputJsonValue,
         responses: responses as Prisma.InputJsonValue,
       },
     });
+  }
+
+  async surveySegments(tenantId: string, id: string, by = 'department') {
+    const survey = await this.prisma.survey.findFirst({
+      where: { id, tenantId },
+      include: { responses: true },
+    });
+    if (!survey) throw new NotFoundException('Survey not found');
+    const key = ['department', 'location', 'tenure', 'manager'].includes(by) ? by : 'department';
+    const groups = new Map<string, Array<Record<string, unknown>>>();
+    for (const response of survey.responses) {
+      const segment = (response.segment as Record<string, unknown>) ?? {};
+      const label = String(segment[key] ?? 'Unassigned');
+      groups.set(label, [...(groups.get(label) ?? []), response.responses as Record<string, unknown>]);
+    }
+    const minResponses = 3;
+    return {
+      survey: { id: survey.id, title: survey.title, type: survey.type },
+      segmentBy: key,
+      minResponses,
+      segments: [...groups.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([segment, payloads]) => ({
+          segment,
+          responses: payloads.length,
+          suppressed: payloads.length < minResponses,
+          ...(payloads.length >= minResponses
+            ? {
+                avgScaleScore: this.avgScaleScore(payloads),
+                enps: this.enpsScore(payloads),
+              }
+            : {}),
+        })),
+    };
   }
 
   async listRecognitions(tenantId: string, page = 1, pageSize = 20) {
@@ -213,6 +283,28 @@ export class EngagementService {
           },
         ],
       },
+    });
+  }
+
+  async submitAnonymousFeedback(
+    tenantId: string,
+    data: { category?: string; message: string; sentiment?: string },
+  ) {
+    return this.prisma.anonymousFeedback.create({
+      data: {
+        tenantId,
+        category: data.category ?? 'GENERAL',
+        message: data.message,
+        sentiment: data.sentiment,
+      },
+    });
+  }
+
+  async listAnonymousFeedback(tenantId: string) {
+    return this.prisma.anonymousFeedback.findMany({
+      where: { tenantId },
+      orderBy: { submittedAt: 'desc' },
+      take: 100,
     });
   }
 
@@ -374,6 +466,49 @@ export class EngagementService {
     };
   }
 
+  async milestones(tenantId: string) {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setDate(now.getDate() - 30);
+    const employees = await this.prisma.employee.findMany({
+      where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE'] } },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        employeeCode: true,
+        dateOfBirth: true,
+        joiningDate: true,
+        department: { select: { name: true } },
+      },
+      take: 200,
+    });
+    const birthdays = employees
+      .filter((employee) => employee.dateOfBirth && this.daysUntilAnnualDate(employee.dateOfBirth, now) <= 30)
+      .map((employee) => ({
+        type: 'BIRTHDAY',
+        employee,
+        daysUntil: this.daysUntilAnnualDate(employee.dateOfBirth!, now),
+      }))
+      .sort((a, b) => a.daysUntil - b.daysUntil)
+      .slice(0, 10);
+    const anniversaries = employees
+      .filter((employee) => employee.joiningDate && this.daysUntilAnnualDate(employee.joiningDate, now) <= 30)
+      .map((employee) => ({
+        type: 'WORK_ANNIVERSARY',
+        employee,
+        years: Math.max(1, now.getFullYear() - employee.joiningDate!.getFullYear()),
+        daysUntil: this.daysUntilAnnualDate(employee.joiningDate!, now),
+      }))
+      .sort((a, b) => a.daysUntil - b.daysUntil)
+      .slice(0, 10);
+    const newJoiners = employees
+      .filter((employee) => employee.joiningDate && employee.joiningDate >= thirtyDaysAgo)
+      .map((employee) => ({ type: 'NEW_JOINER', employee, joinedAt: employee.joiningDate }))
+      .slice(0, 10);
+    return { birthdays, anniversaries, newJoiners };
+  }
+
   private enpsScore(responses: Array<Record<string, unknown>>): number | null {
     const scores = responses
       .flatMap((payload) => Object.values(payload).map(Number))
@@ -382,5 +517,69 @@ export class EngagementService {
     const promoters = scores.filter((score) => score >= 9).length;
     const detractors = scores.filter((score) => score <= 6).length;
     return Math.round(((promoters - detractors) / scores.length) * 100);
+  }
+
+  private avgScaleScore(responses: Array<Record<string, unknown>>): number | null {
+    const scores = responses
+      .flatMap((payload) => Object.values(payload).map(Number))
+      .filter((score) => !Number.isNaN(score) && score >= 0 && score <= 10);
+    return scores.length ? Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 10) / 10 : null;
+  }
+
+  private respondentHash(surveyId: string, employeeId: string) {
+    return createHash('sha256').update(`${surveyId}:${employeeId}`).digest('hex');
+  }
+
+  private async employeeSegment(tenantId: string, employeeId: string) {
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: employeeId, tenantId },
+      select: {
+        joiningDate: true,
+        department: { select: { name: true } },
+        location: { select: { name: true } },
+        manager: { select: { firstName: true, lastName: true } },
+      },
+    });
+    if (!employee) throw new NotFoundException('Employee not found');
+    return {
+      department: employee.department?.name ?? 'Unassigned',
+      location: employee.location?.name ?? 'Unassigned',
+      manager: employee.manager ? `${employee.manager.firstName} ${employee.manager.lastName}` : 'Unassigned',
+      tenure: this.tenureBucket(employee.joiningDate),
+    };
+  }
+
+  private tenureBucket(joiningDate: Date | null) {
+    if (!joiningDate) return 'Unknown';
+    const months = Math.max(0, Math.floor((Date.now() - joiningDate.getTime()) / (1000 * 60 * 60 * 24 * 30)));
+    if (months < 6) return '0-6 months';
+    if (months < 12) return '6-12 months';
+    if (months < 36) return '1-3 years';
+    if (months < 60) return '3-5 years';
+    return '5+ years';
+  }
+
+  private daysUntilAnnualDate(date: Date, now: Date) {
+    const next = new Date(now.getFullYear(), date.getMonth(), date.getDate());
+    if (next < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
+      next.setFullYear(next.getFullYear() + 1);
+    }
+    return Math.ceil((next.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  }
+
+  private surveyStatus(status?: string): SurveyStatus | undefined {
+    if (!status) return undefined;
+    if (status === 'DRAFT' || status === 'ACTIVE' || status === 'CLOSED') return status;
+    return 'DRAFT';
+  }
+
+  private defaultSurveyQuestions(type?: string) {
+    if (type === 'ENPS') {
+      return [{ id: 'enps', text: 'How likely are you to recommend this company as a workplace?', type: 'SCALE' }];
+    }
+    return [
+      { id: 'engagement', text: 'How engaged do you feel this week?', type: 'SCALE' },
+      { id: 'comment', text: 'What should we improve?', type: 'TEXT' },
+    ];
   }
 }

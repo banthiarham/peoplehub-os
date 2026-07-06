@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { LogOut, Menu, Search, X } from 'lucide-react';
-import { signOut, useSession } from 'next-auth/react';
+import { signOut } from 'next-auth/react';
 import { useState } from 'react';
 import { Avatar } from '@/components/ui/avatar';
 import { NAV_SECTIONS } from '@/config/nav';
@@ -12,20 +12,20 @@ import { NotificationsMenu } from '@/components/layout/notifications-menu';
 import { cn } from '@/lib/utils';
 
 export function Topbar() {
-  const { data: session } = useSession();
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const pathname = usePathname();
   const openPalette = useCommandPalette();
-  const name = session?.user?.name ?? 'User';
-  const role = session?.user?.roles?.[0] ?? 'Member';
+  const tenantName = 'Demo Corp India';
+  const name = 'Super Admin';
+  const role = 'Super Admin';
 
   return (
-    <header className="sticky top-0 z-20 border-b border-line bg-white/90 backdrop-blur">
+    <header className="sticky top-0 z-20 border-b border-line/80 bg-white/85 backdrop-blur-xl">
       <div className="flex h-16 items-center justify-between gap-4 px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-3">
           <button
-            className="rounded-lg border border-line bg-white p-2 text-ink-muted lg:hidden"
+            className="rounded-xl border border-line bg-white p-2.5 text-ink-muted shadow-sm lg:hidden"
             onClick={() => setMobileNavOpen((open) => !open)}
             aria-label="Toggle navigation"
           >
@@ -33,25 +33,21 @@ export function Topbar() {
           </button>
 
           <div className="hidden min-w-0 lg:block">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-ink-faint">
-              {session?.user?.tenant?.name ?? 'Demo Corp India'}
-            </p>
-            <p className="truncate text-sm font-medium text-ink">
-              People operations command center
-            </p>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-ink-faint">{tenantName}</p>
+            <p className="truncate text-sm font-semibold text-ink">People operations command center</p>
           </div>
 
           <button
             type="button"
             onClick={openPalette}
-            className="relative hidden w-[min(38vw,420px)] md:block"
+            className="relative hidden w-[min(42vw,520px)] md:block"
             aria-label="Open universal search"
           >
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-faint" />
-            <span className="flex h-10 w-full items-center rounded-lg border border-line bg-canvas pl-9 pr-12 text-sm text-ink-faint hover:border-primary-300">
+            <span className="flex h-11 w-full items-center rounded-2xl border border-line bg-white pl-9 pr-12 text-sm text-ink-faint shadow-sm transition-colors hover:border-primary-300">
               Search employees, candidates, tickets, jobs…
             </span>
-            <kbd className="absolute right-3 top-1/2 -translate-y-1/2 rounded-md border border-line bg-white px-1.5 text-[10px] text-ink-faint">
+            <kbd className="absolute right-3 top-1/2 -translate-y-1/2 rounded-md border border-line bg-canvas px-1.5 text-[10px] text-ink-faint">
               ⌘K
             </kbd>
           </button>
@@ -63,7 +59,7 @@ export function Topbar() {
           <div className="relative">
             <button
               onClick={() => setMenuOpen((o) => !o)}
-              className="flex items-center gap-2.5 rounded-lg border border-line bg-white p-1.5 pr-3 hover:bg-canvas"
+              className="flex items-center gap-2.5 rounded-2xl border border-line bg-white p-1.5 pr-3 shadow-sm hover:border-primary-200 hover:bg-canvas"
             >
               <Avatar name={name} size="sm" />
               <span className="hidden text-left sm:block">
@@ -72,11 +68,11 @@ export function Topbar() {
               </span>
             </button>
             {menuOpen && (
-              <div className="absolute right-0 top-full mt-2 w-56 rounded-lg border border-line bg-white p-1 shadow-lg">
-                <p className="px-3 py-2 text-xs text-ink-muted">{session?.user?.email}</p>
+              <div className="absolute right-0 top-full mt-2 w-56 rounded-2xl border border-line bg-white p-1 shadow-xl">
+                <p className="px-3 py-2 text-xs text-ink-muted">superadmin@peoplehub.local</p>
                 <button
                   onClick={() => signOut({ callbackUrl: '/login' })}
-                  className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-danger hover:bg-red-50"
+                  className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-danger hover:bg-red-50"
                 >
                   <LogOut className="h-4 w-4" /> Sign out
                 </button>
@@ -97,8 +93,8 @@ export function Topbar() {
                   href={item.href}
                   onClick={() => setMobileNavOpen(false)}
                   className={cn(
-                    'flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium',
-                    active ? 'bg-ink text-white' : 'bg-canvas text-ink-muted',
+                    'flex items-center gap-2 rounded-2xl px-3 py-2 text-sm font-medium',
+                    active ? 'bg-slate-950 text-white' : 'bg-canvas text-ink-muted',
                   )}
                 >
                   <item.icon className="h-4 w-4" />

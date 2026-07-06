@@ -12,6 +12,9 @@ export interface JwtPayload {
   isSuperAdmin: boolean;
   employeeId: string | null;
   roles: string[];
+  authType?: 'jwt' | 'apiKey' | 'oauth';
+  scopes?: string[];
+  apiKeyId?: string;
 }
 
 @Injectable()
@@ -33,6 +36,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       isSuperAdmin: payload.isSuperAdmin,
       employeeId: payload.employeeId,
       roles: payload.roles ?? [],
+      authType: payload.authType ?? 'jwt',
+      scopes: payload.scopes ?? [],
+      apiKeyId: payload.apiKeyId,
     };
   }
 }

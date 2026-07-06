@@ -30,4 +30,37 @@ describe('AnalyticsService', () => {
       }),
     ]);
   });
+
+  it('passes analytics filters through to scoped queries', async () => {
+    const prisma = {
+      employee: {
+        findMany: jest.fn().mockResolvedValue([]),
+      },
+      department: {
+        findMany: jest.fn().mockResolvedValue([]),
+      },
+    };
+    const service = new AnalyticsService(prisma as any);
+
+    await service.headcountTrend('tenant-1', 6, {
+      departmentId: 'dept-1',
+      locationId: 'loc-1',
+      legalEntityId: 'le-1',
+      managerId: 'mgr-1',
+      employmentType: 'FULL_TIME',
+    });
+
+    expect(prisma.employee.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          tenantId: 'tenant-1',
+          departmentId: 'dept-1',
+          locationId: 'loc-1',
+          legalEntityId: 'le-1',
+          managerId: 'mgr-1',
+          employmentType: 'FULL_TIME',
+        }),
+      }),
+    );
+  });
 });

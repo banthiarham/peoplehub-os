@@ -10,6 +10,9 @@ export const metadata: Metadata = {
   title: 'PeopleHub OS',
   description: 'The AI-first people platform for modern India',
   manifest: '/manifest.webmanifest',
+  other: {
+    'mobile-web-app-capable': 'yes',
+  },
   appleWebApp: {
     capable: true,
     title: 'PeopleHub',

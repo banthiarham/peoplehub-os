@@ -21,7 +21,7 @@ import { apiErrorMessage } from './ops-utils';
 const CATEGORIES = ['HR', 'PAYROLL', 'LEAVE', 'IT', 'FACILITIES', 'OTHER'];
 const PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as const;
 
-const initialForm = { category: 'HR', subject: '', description: '', priority: 'MEDIUM' };
+const initialForm = { category: 'HR', subject: '', description: '', priority: 'MEDIUM', attachments: '' };
 
 export function OpsNewTicketDialog() {
   const [open, setOpen] = useState(false);
@@ -30,7 +30,13 @@ export function OpsNewTicketDialog() {
   const queryClient = useQueryClient();
 
   const create = useMutation({
-    mutationFn: () => api.post('/helpdesk/tickets', form).then((r) => r.data),
+    mutationFn: () =>
+      api
+        .post('/helpdesk/tickets', {
+          ...form,
+          attachments: form.attachments.split(',').map((item) => item.trim()).filter(Boolean),
+        })
+        .then((r) => r.data),
     onSuccess: () => {
       toast('Ticket created');
       queryClient.invalidateQueries({ queryKey: ['helpdesk'] });
@@ -92,20 +98,23 @@ export function OpsNewTicketDialog() {
             </div>
             <label className="block text-sm">
               <span className="mb-1 block text-xs font-medium text-ink-muted">Subject</span>
-              <Input
-                value={form.subject}
-                onChange={(e) => setForm((f) => ({ ...f, subject: e.target.value }))}
-                placeholder="Short summary"
+                <Input value={form.subject} onChange={(e) => setForm((f) => ({ ...f, subject: e.target.value }))} placeholder="Short summary" required />
+              </label>
+              <label className="block text-sm">
+                <span className="mb-1 block text-xs font-medium text-ink-muted">Description</span>
+                <OpsTextarea
+                  value={form.description}
+                onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+                placeholder="Describe the issue or request…"
                 required
               />
             </label>
             <label className="block text-sm">
-              <span className="mb-1 block text-xs font-medium text-ink-muted">Description</span>
-              <OpsTextarea
-                value={form.description}
-                onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
-                placeholder="Describe the issue or request…"
-                required
+              <span className="mb-1 block text-xs font-medium text-ink-muted">Attachments</span>
+              <Input
+                value={form.attachments}
+                onChange={(e) => setForm((f) => ({ ...f, attachments: e.target.value }))}
+                placeholder="Comma separated file keys"
               />
             </label>
             <DialogFooter>

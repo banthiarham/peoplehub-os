@@ -74,9 +74,16 @@ export default function PayrollPage() {
   return (
     <div>
       <PageHeader
+        eyebrow="Pay"
         title="Payroll"
         description="Runs, statutory deductions and cost trends"
         actions={<PayrollNewRunDialog />}
+        meta={
+          <>
+            <Badge variant="outline">{runs?.length ?? 0} runs</Badge>
+            <Badge variant="outline">{stats?.lastRun?.status ?? 'No run'}</Badge>
+          </>
+        }
       />
       <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard

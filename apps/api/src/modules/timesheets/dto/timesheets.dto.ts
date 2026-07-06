@@ -23,6 +23,11 @@ export class CreateProjectDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  clientId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
   clientName?: string;
 
   @ApiPropertyOptional()
@@ -58,6 +63,80 @@ export class CreateProjectDto {
   endDate?: string;
 }
 
+export class CreateClientDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  code?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  industry?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  website?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  billingContact?: string;
+
+  @ApiPropertyOptional({ default: 'ACTIVE' })
+  @IsOptional()
+  @IsString()
+  status?: string;
+}
+
+export class CreateProjectTaskDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  projectId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  code?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  description?: string;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  isBillable?: boolean;
+
+  @ApiPropertyOptional({ default: 'ACTIVE' })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  rateOverride?: number;
+
+  @ApiPropertyOptional({ default: 0 })
+  @IsOptional()
+  @IsNumber()
+  sortOrder?: number;
+}
+
 export class TimesheetEntryDto {
   @ApiProperty({ example: '2026-07-01' })
   @IsDateString()
@@ -74,6 +153,11 @@ export class TimesheetEntryDto {
   @IsString()
   task?: string;
 
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  taskId?: string;
+
   @ApiPropertyOptional({ default: true })
   @IsOptional()
   @IsBoolean()
@@ -85,6 +169,11 @@ export class UpsertTimesheetDto {
   @IsOptional()
   @IsString()
   projectId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  taskId?: string;
 
   @ApiProperty({ example: '2026-06-29', description: 'Week start date (Monday)' })
   @IsDateString()

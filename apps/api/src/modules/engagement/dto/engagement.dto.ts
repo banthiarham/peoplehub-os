@@ -1,5 +1,40 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsArray, IsDateString, IsInt, IsNotEmpty, IsObject, IsOptional, IsString, Max, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import {
+  IsArray,
+  IsBoolean,
+  IsDateString,
+  IsInt,
+  IsNotEmpty,
+  IsObject,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+  ValidateNested,
+} from 'class-validator';
+
+export class SurveyQuestionDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  id!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  text!: string;
+
+  @ApiProperty({ enum: ['SCALE', 'TEXT', 'CHOICE'] })
+  @IsString()
+  type!: 'SCALE' | 'TEXT' | 'CHOICE';
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  options?: string[];
+}
 
 export class RespondSurveyDto {
   @ApiProperty({ description: 'Map of questionId -> answer' })
@@ -29,6 +64,56 @@ export class RecognizeDto {
   @Min(0)
   @Max(100)
   points?: number;
+}
+
+export class CreateSurveyDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  title!: string;
+
+  @ApiPropertyOptional({ enum: ['PULSE', 'ENPS', 'CUSTOM', 'POLL'] })
+  @IsOptional()
+  @IsString()
+  type?: string;
+
+  @ApiPropertyOptional({ enum: ['DRAFT', 'ACTIVE', 'CLOSED'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  isAnonymous?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  startDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  endDate?: string;
+
+  @ApiPropertyOptional({ type: [SurveyQuestionDto] })
+  @IsOptional()
+  @ValidateNested({ each: true })
+  @Type(() => SurveyQuestionDto)
+  questions?: SurveyQuestionDto[];
+}
+
+export class UpdateSurveyDto {
+  @ApiPropertyOptional({ enum: ['DRAFT', 'ACTIVE', 'CLOSED'] })
+  @IsOptional()
+  @IsString()
+  status?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  endDate?: string;
 }
 
 export class CreateAnnouncementDto {
@@ -78,4 +163,21 @@ export class CreatePollDto {
   @IsOptional()
   @IsDateString()
   endDate?: string;
+}
+
+export class AnonymousFeedbackDto {
+  @ApiPropertyOptional({ default: 'GENERAL' })
+  @IsOptional()
+  @IsString()
+  category?: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  message!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  sentiment?: string;
 }

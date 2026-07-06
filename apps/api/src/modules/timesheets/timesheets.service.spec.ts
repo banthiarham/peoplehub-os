@@ -64,4 +64,71 @@ describe('TimesheetsService', () => {
     });
     await expect(service.billingCsv('tenant-1')).resolves.toContain('Client Rollout,ACME,40,32,8,3000,96000,100,40');
   });
+
+  it('builds payroll sync rows for overtime and hourly workers', async () => {
+    const prisma = {
+      timesheet: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            tenantId: 'tenant-1',
+            employeeId: 'emp-1',
+            totalHours: 44,
+            billableHours: 36,
+            weekStart: new Date('2026-07-01'),
+            employee: {
+              id: 'emp-1',
+              firstName: 'Riya',
+              lastName: 'Sen',
+              employeeCode: 'EMP-1',
+              employmentType: 'CONTRACTOR',
+            },
+            project: {
+              billingRate: 3500,
+              name: 'Client Rollout',
+            },
+          },
+          {
+            tenantId: 'tenant-1',
+            employeeId: 'emp-2',
+            totalHours: 38,
+            billableHours: 38,
+            weekStart: new Date('2026-07-01'),
+            employee: {
+              id: 'emp-2',
+              firstName: 'Aman',
+              lastName: 'Verma',
+              employeeCode: 'EMP-2',
+              employmentType: 'FULL_TIME',
+            },
+            project: {
+              billingRate: 0,
+              name: 'Internal Tooling',
+            },
+          },
+        ]),
+      },
+    };
+    const service = new TimesheetsService(prisma as any);
+
+    await expect(service.payrollSync('tenant-1')).resolves.toEqual(
+      expect.objectContaining({
+        totalBillableHours: 74,
+        totalOvertimeHours: 4,
+        hourlyWorkerCount: 1,
+        employees: [
+          expect.objectContaining({
+            employeeCode: 'EMP-1',
+            employmentType: 'CONTRACTOR',
+            overtimeHours: 4,
+            hourlyValue: 126000,
+          }),
+          expect.objectContaining({
+            employeeCode: 'EMP-2',
+            overtimeHours: 0,
+            hourlyValue: 0,
+          }),
+        ],
+      }),
+    );
+  });
 });

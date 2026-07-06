@@ -79,7 +79,7 @@ export function NotificationsMenu() {
   return (
     <div className="relative" ref={ref}>
       <button
-        className="relative rounded-lg border border-line bg-white p-2 text-ink-muted hover:bg-canvas"
+        className="relative rounded-2xl border border-line bg-white p-2.5 text-ink-muted shadow-sm hover:border-primary-200 hover:bg-canvas"
         aria-label="Notifications"
         onClick={() => setOpen((o) => !o)}
       >
@@ -92,28 +92,28 @@ export function NotificationsMenu() {
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-2 w-80 overflow-hidden rounded-xl border border-line bg-white shadow-lg">
-          <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-            <p className="text-sm font-semibold">Notifications</p>
+        <div className="absolute right-0 top-full mt-2 w-96 overflow-hidden rounded-2xl border border-line bg-white shadow-2xl">
+          <div className="flex items-center justify-between border-b border-line px-4 py-3">
+            <p className="text-sm font-semibold text-ink">Notifications</p>
             {count > 0 && (
               <button
                 onClick={() => markAllRead.mutate()}
                 disabled={markAllRead.isPending}
-                className="flex items-center gap-1 text-xs font-medium text-primary-700 hover:underline"
+                className="flex items-center gap-1 text-xs font-semibold text-primary-700 hover:underline"
               >
                 <CheckCheck className="h-3.5 w-3.5" /> Mark all read
               </button>
             )}
           </div>
-          <div className="max-h-[26rem] overflow-y-auto">
+          <div className="max-h-[26rem] overflow-y-auto p-2">
             {rows.length ? (
               rows.map((n) => (
                 <button
                   key={n.id}
                   onClick={() => openNotification(n)}
                   className={cn(
-                    'flex w-full gap-3 border-b border-line/70 px-4 py-3 text-left last:border-0 hover:bg-canvas',
-                    !n.isRead && 'bg-primary-50/40',
+                    'flex w-full gap-3 rounded-2xl px-3 py-3 text-left transition-colors hover:bg-canvas last:border-0',
+                    !n.isRead && 'bg-primary-50/35',
                   )}
                 >
                   <span
@@ -124,7 +124,7 @@ export function NotificationsMenu() {
                   />
                   <span className="min-w-0">
                     <span className="block text-sm font-medium leading-snug">{n.title}</span>
-                    <span className="mt-0.5 block text-xs text-ink-muted">{n.body}</span>
+                    <span className="mt-0.5 block text-xs leading-5 text-ink-muted">{n.body}</span>
                     <span className="mt-1 block text-[11px] text-ink-faint">
                       {timeAgo(n.createdAt)}
                     </span>

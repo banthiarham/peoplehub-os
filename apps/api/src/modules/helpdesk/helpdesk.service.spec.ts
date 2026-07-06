@@ -3,6 +3,9 @@ import { HelpdeskService } from './helpdesk.service';
 describe('HelpdeskService', () => {
   it('routes new payroll tickets and assigns an SLA priority', async () => {
     const prisma = {
+      helpdeskSlaRule: {
+        findFirst: jest.fn().mockResolvedValue({ assigneeQueue: 'Payroll Admin', resolutionHours: 6, responseHours: 2 }),
+      },
       ticket: {
         create: jest.fn().mockResolvedValue({ id: 'ticket-1', assignedTo: 'Payroll Admin' }),
       },
@@ -22,5 +25,31 @@ describe('HelpdeskService', () => {
         assignedTo: 'Payroll Admin',
       }),
     });
+  });
+
+  it('answers helpdesk questions from approved knowledge-base content', async () => {
+    const prisma = {
+      knowledgeBaseArticle: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'kb-1',
+            title: 'Payroll query process',
+            summary: 'Use the portal and attach a payslip screenshot.',
+            body: 'Use the helpdesk portal and include the payslip screenshot.',
+            category: 'PAYROLL',
+            sourceType: 'POLICY',
+            tags: ['payroll'],
+          },
+        ]),
+      },
+    };
+    const service = new HelpdeskService(prisma as any);
+
+    await expect(service.aiAnswer('tenant-1', 'How do I raise a payroll query?')).resolves.toEqual(
+      expect.objectContaining({
+        answer: expect.stringContaining('Payroll query process'),
+        citations: [expect.objectContaining({ id: 'kb-1' })],
+      }),
+    );
   });
 });

@@ -13,23 +13,61 @@ export class AnalyticsController {
 
   @Get('dashboard')
   @ApiOperation({ summary: 'Full dashboard payload in one call' })
-  dashboard(@CurrentUser() user: AuthUser) {
-    return this.analytics.dashboard(user.tenantId);
+  dashboard(
+    @CurrentUser() user: AuthUser,
+    @Query('departmentId') departmentId?: string,
+    @Query('locationId') locationId?: string,
+    @Query('legalEntityId') legalEntityId?: string,
+    @Query('managerId') managerId?: string,
+    @Query('employmentType') employmentType?: string,
+  ) {
+    return this.analytics.dashboard(user.tenantId, { departmentId, locationId, legalEntityId, managerId, employmentType });
   }
 
   @Get('headcount-trend')
-  headcountTrend(@CurrentUser() user: AuthUser, @Query('months') months?: string) {
-    return this.analytics.headcountTrend(user.tenantId, months ? Number(months) : 12);
+  headcountTrend(
+    @CurrentUser() user: AuthUser,
+    @Query('months') months?: string,
+    @Query('departmentId') departmentId?: string,
+    @Query('locationId') locationId?: string,
+    @Query('legalEntityId') legalEntityId?: string,
+    @Query('managerId') managerId?: string,
+    @Query('employmentType') employmentType?: string,
+  ) {
+    return this.analytics.headcountTrend(
+      user.tenantId,
+      months ? Number(months) : 12,
+      { departmentId, locationId, legalEntityId, managerId, employmentType },
+    );
   }
 
   @Get('attrition')
-  attrition(@CurrentUser() user: AuthUser, @Query('months') months?: string) {
-    return this.analytics.attrition(user.tenantId, months ? Number(months) : 12);
+  attrition(
+    @CurrentUser() user: AuthUser,
+    @Query('months') months?: string,
+    @Query('departmentId') departmentId?: string,
+    @Query('locationId') locationId?: string,
+    @Query('legalEntityId') legalEntityId?: string,
+    @Query('managerId') managerId?: string,
+    @Query('employmentType') employmentType?: string,
+  ) {
+    return this.analytics.attrition(
+      user.tenantId,
+      months ? Number(months) : 12,
+      { departmentId, locationId, legalEntityId, managerId, employmentType },
+    );
   }
 
   @Get('demographics')
-  demographics(@CurrentUser() user: AuthUser) {
-    return this.analytics.demographics(user.tenantId);
+  demographics(
+    @CurrentUser() user: AuthUser,
+    @Query('departmentId') departmentId?: string,
+    @Query('locationId') locationId?: string,
+    @Query('legalEntityId') legalEntityId?: string,
+    @Query('managerId') managerId?: string,
+    @Query('employmentType') employmentType?: string,
+  ) {
+    return this.analytics.demographics(user.tenantId, { departmentId, locationId, legalEntityId, managerId, employmentType });
   }
 
   @Get('reports/builder')
@@ -39,20 +77,51 @@ export class AnalyticsController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('status') status?: string,
+    @Query('departmentId') departmentId?: string,
+    @Query('locationId') locationId?: string,
+    @Query('legalEntityId') legalEntityId?: string,
+    @Query('managerId') managerId?: string,
+    @Query('employmentType') employmentType?: string,
   ) {
-    return this.analytics.reportBuilder(user.tenantId, report, { from, to, status });
+    return this.analytics.reportBuilder(user.tenantId, report, {
+      from,
+      to,
+      status,
+      departmentId,
+      locationId,
+      legalEntityId,
+      managerId,
+      employmentType,
+    });
   }
 
   @Get('reports/builder/export')
   async reportBuilderExport(
     @CurrentUser() user: AuthUser,
-    @Query('report') report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets' = 'employees',
-    @Query('from') from: string | undefined,
-    @Query('to') to: string | undefined,
-    @Query('status') status: string | undefined,
+    @Query()
+    q: {
+      report?: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets';
+      from?: string;
+      to?: string;
+      status?: string;
+      departmentId?: string;
+      locationId?: string;
+      legalEntityId?: string;
+      managerId?: string;
+      employmentType?: string;
+    },
     @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const { csv, filename } = await this.analytics.reportBuilderCsv(user.tenantId, report, { from, to, status });
+    const { csv, filename } = await this.analytics.reportBuilderCsv(user.tenantId, q.report ?? 'employees', {
+      from: q.from,
+      to: q.to,
+      status: q.status,
+      departmentId: q.departmentId,
+      locationId: q.locationId,
+      legalEntityId: q.legalEntityId,
+      managerId: q.managerId,
+      employmentType: q.employmentType,
+    });
     res.header('Content-Type', 'text/csv; charset=utf-8');
     res.header('Content-Disposition', `attachment; filename="${filename}"`);
     return csv;

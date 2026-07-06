@@ -3,7 +3,13 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
-import { CreateProjectDto, ListTimesheetsDto, UpsertTimesheetDto } from './dto/timesheets.dto';
+import {
+  CreateClientDto,
+  CreateProjectDto,
+  CreateProjectTaskDto,
+  ListTimesheetsDto,
+  UpsertTimesheetDto,
+} from './dto/timesheets.dto';
 import { TimesheetsService } from './timesheets.service';
 
 @ApiTags('Timesheets')
@@ -11,6 +17,23 @@ import { TimesheetsService } from './timesheets.service';
 @Controller('timesheets')
 export class TimesheetsController {
   constructor(private readonly timesheets: TimesheetsService) {}
+
+  @Get('clients')
+  listClients(@CurrentUser() user: AuthUser) {
+    return this.timesheets.listClients(user.tenantId);
+  }
+
+  @Post('clients')
+  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  createClient(@CurrentUser() user: AuthUser, @Body() dto: CreateClientDto) {
+    return this.timesheets.createClient(user.tenantId, dto);
+  }
+
+  @Patch('clients/:id')
+  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  updateClient(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateClientDto) {
+    return this.timesheets.updateClient(user.tenantId, id, dto);
+  }
 
   @Get('projects')
   listProjects(@CurrentUser() user: AuthUser) {
@@ -29,6 +52,23 @@ export class TimesheetsController {
     return this.timesheets.updateProject(user.tenantId, id, dto);
   }
 
+  @Get('tasks')
+  listTasks(@CurrentUser() user: AuthUser, @Query('projectId') projectId?: string) {
+    return this.timesheets.listTasks(user.tenantId, projectId);
+  }
+
+  @Post('tasks')
+  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  createTask(@CurrentUser() user: AuthUser, @Body() dto: CreateProjectTaskDto) {
+    return this.timesheets.createTask(user.tenantId, dto);
+  }
+
+  @Patch('tasks/:id')
+  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  updateTask(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateProjectTaskDto) {
+    return this.timesheets.updateTask(user.tenantId, id, dto);
+  }
+
   @Get('me')
   mine(@CurrentUser() user: AuthUser) {
     return this.timesheets.mine(user);
@@ -42,6 +82,12 @@ export class TimesheetsController {
   @Get('utilization')
   utilization(@CurrentUser() user: AuthUser) {
     return this.timesheets.utilization(user.tenantId);
+  }
+
+  @Get('payroll-sync')
+  @Roles('Super Admin', 'HR Admin', 'Payroll Admin', 'Finance Admin')
+  payrollSync(@CurrentUser() user: AuthUser) {
+    return this.timesheets.payrollSync(user.tenantId);
   }
 
   @Get('billing/export')
