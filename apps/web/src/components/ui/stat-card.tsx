@@ -13,23 +13,23 @@ interface StatCardProps {
 
 export function StatCard({ label, value, delta, icon: Icon, children, className }: StatCardProps) {
   return (
-    <Card className={cn('overflow-hidden border border-line/80 bg-white/95 p-5 shadow-card', className)}>
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.12em] text-ink-muted">
-          {Icon && (
-            <span className="flex h-9 w-9 items-center justify-center rounded-2xl bg-primary-50 text-primary-700">
-              <Icon className="h-4 w-4" />
-            </span>
-          )}
+    <Card className={cn('overflow-hidden border border-line/90 bg-slate-50/65 p-4 shadow-card', className)}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 text-[11px] font-semibold uppercase text-ink-muted">
           {label}
         </div>
+        {Icon && (
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-primary-700 shadow-sm ring-1 ring-line/70">
+            <Icon className="h-4 w-4" />
+          </span>
+        )}
       </div>
-      <div className="mt-3 flex flex-wrap items-baseline gap-2">
-        <span className="text-[28px] font-semibold tracking-tight text-ink">{value}</span>
+      <div className="mt-2 flex min-w-0 flex-wrap items-baseline gap-2">
+        <span className="min-w-0 text-[26px] font-semibold leading-none text-ink">{value}</span>
         {delta && (
           <span
             className={cn(
-              'inline-flex items-center gap-0.5 rounded-full px-2 py-1 text-[11px] font-semibold',
+              'inline-flex items-center gap-0.5 rounded-md bg-white px-2 py-1 text-[11px] font-semibold shadow-sm ring-1 ring-line/70',
               delta.positive ? 'text-success' : 'text-danger',
             )}
           >
@@ -39,7 +39,7 @@ export function StatCard({ label, value, delta, icon: Icon, children, className 
           </span>
         )}
       </div>
-      {children && <div className="mt-3 text-sm">{children}</div>}
+      {children && <div className="mt-2 text-[13px] leading-5 text-ink-muted">{children}</div>}
     </Card>
   );
 }

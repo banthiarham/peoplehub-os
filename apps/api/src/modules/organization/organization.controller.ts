@@ -25,6 +25,7 @@ export class OrganizationController {
 
   @Get('organization')
   @ApiOperation({ summary: 'Current tenant organization summary' })
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   current(@CurrentUser() user: AuthUser) {
     return this.organization.currentTenant(user.tenantId);
@@ -47,6 +48,7 @@ export class OrganizationController {
   }
 
   @Get('legal-entities')
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   listLegalEntities(@CurrentUser() user: AuthUser) {
     return this.organization.legalEntities(user.tenantId);
@@ -71,6 +73,7 @@ export class OrganizationController {
   }
 
   @Get('departments')
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   departments(@CurrentUser() user: AuthUser) {
     return this.organization.listOrgUnits(user.tenantId, 'departments');
@@ -91,6 +94,7 @@ export class OrganizationController {
   }
 
   @Get('designations')
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   designations(@CurrentUser() user: AuthUser) {
     return this.organization.listOrgUnits(user.tenantId, 'designations');
@@ -111,6 +115,7 @@ export class OrganizationController {
   }
 
   @Get('cost-centers')
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   costCenters(@CurrentUser() user: AuthUser) {
     return this.organization.listOrgUnits(user.tenantId, 'cost-centers');
@@ -131,6 +136,7 @@ export class OrganizationController {
   }
 
   @Get('business-units')
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   businessUnits(@CurrentUser() user: AuthUser) {
     return this.organization.listOrgUnits(user.tenantId, 'business-units');
@@ -152,6 +158,7 @@ export class OrganizationController {
 
   @Get('org-chart')
   @ApiOperation({ summary: 'Organization chart by manager and department' })
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   orgChart(
     @CurrentUser() user: AuthUser,
@@ -162,6 +169,7 @@ export class OrganizationController {
   }
 
   @Get('organization/:kind')
+  @Roles(...ORG_ADMIN_ROLES)
   @Scopes('organization:read')
   organizationUnitAlias(@CurrentUser() user: AuthUser, @Param('kind') kind: OrgUnitKind) {
     return this.organization.listOrgUnits(user.tenantId, kind);

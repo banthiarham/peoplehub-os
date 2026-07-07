@@ -30,6 +30,7 @@ import { FilesModule } from './modules/files/files.module';
 import { DocumentsModule } from './modules/documents/documents.module';
 import { OrganizationModule } from './modules/organization/organization.module';
 import { RbacModule } from './modules/rbac/rbac.module';
+import { SetupModule } from './modules/setup/setup.module';
 import { ApiUsageInterceptor } from './common/interceptors/api-usage.interceptor';
 
 @Module({
@@ -64,6 +65,7 @@ import { ApiUsageInterceptor } from './common/interceptors/api-usage.interceptor
     DocumentsModule,
     OrganizationModule,
     RbacModule,
+    SetupModule,
   ],
   providers: [
     {

@@ -13,6 +13,7 @@ export const authOptions: NextAuthOptions = {
       credentials: {
         email: { label: 'Email', type: 'email' },
         password: { label: 'Password', type: 'password' },
+        tenantSlug: { label: 'Workspace', type: 'text' },
       },
       async authorize(credentials) {
         if (!credentials?.email || !credentials.password) return null;
@@ -20,6 +21,7 @@ export const authOptions: NextAuthOptions = {
           const { data } = await axios.post(`${API_URL}/api/v1/auth/login`, {
             email: credentials.email,
             password: credentials.password,
+            tenantSlug: credentials.tenantSlug || undefined,
           });
           return {
             id: data.user.id,

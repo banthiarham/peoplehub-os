@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { LogOut, Menu, Search, X } from 'lucide-react';
-import { signOut } from 'next-auth/react';
+import { signOut, useSession } from 'next-auth/react';
 import { useState } from 'react';
 import { Avatar } from '@/components/ui/avatar';
 import { NAV_SECTIONS } from '@/config/nav';
@@ -12,13 +12,15 @@ import { NotificationsMenu } from '@/components/layout/notifications-menu';
 import { cn } from '@/lib/utils';
 
 export function Topbar() {
+  const { data: session } = useSession();
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const pathname = usePathname();
   const openPalette = useCommandPalette();
-  const tenantName = 'Demo Corp India';
-  const name = 'Super Admin';
-  const role = 'Super Admin';
+  const tenantName = session?.user?.tenant?.name ?? 'PeopleHub OS';
+  const name = session?.user?.name || session?.user?.email || 'PeopleHub user';
+  const role = session?.user?.roles?.[0] ?? 'Workspace user';
+  const email = session?.user?.email ?? '';
 
   return (
     <header className="sticky top-0 z-20 border-b border-line/80 bg-white/85 backdrop-blur-xl">
@@ -69,9 +71,9 @@ export function Topbar() {
             </button>
             {menuOpen && (
               <div className="absolute right-0 top-full mt-2 w-56 rounded-2xl border border-line bg-white p-1 shadow-xl">
-                <p className="px-3 py-2 text-xs text-ink-muted">superadmin@peoplehub.local</p>
+                <p className="truncate px-3 py-2 text-xs text-ink-muted">{email || tenantName}</p>
                 <button
-                  onClick={() => signOut({ callbackUrl: '/login' })}
+                  onClick={() => signOut({ callbackUrl: '/' })}
                   className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-danger hover:bg-red-50"
                 >
                   <LogOut className="h-4 w-4" /> Sign out

@@ -2,60 +2,86 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useSession } from 'next-auth/react';
+import { useState } from 'react';
 import { NAV_SECTIONS } from '@/config/nav';
 import { cn } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
-import { ChevronRight, CircleDot, Sparkles } from 'lucide-react';
+import { ChevronRight, CircleDot, PanelLeftClose, PanelLeftOpen, Sparkles } from 'lucide-react';
 
-export function Sidebar() {
+export function Sidebar({
+  collapsed,
+  onToggleCollapsed,
+}: {
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+}) {
+  const { data: session } = useSession();
   const pathname = usePathname();
-  const tenantName = 'Demo Corp India';
-  const userName = 'Super Admin';
-  const userRole = 'Super Admin';
+  const [hovered, setHovered] = useState(false);
+  const compact = collapsed && !hovered;
+  const tenantName = session?.user?.tenant?.name ?? 'PeopleHub OS';
+  const userName = session?.user?.name || session?.user?.email || 'PeopleHub user';
   return (
-    <aside className="fixed inset-y-0 left-0 z-30 hidden w-72 flex-col border-r border-line bg-slate-950 text-white shadow-[8px_0_40px_-24px_rgba(15,23,42,0.85)] lg:flex">
-      <div className="flex items-center gap-3 border-b border-white/10 px-5 py-4">
-        <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-primary-500 via-primary-600 to-slate-900 text-sm font-bold text-white shadow-lg shadow-primary-950/25">
+    <aside
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onFocus={() => setHovered(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) {
+          setHovered(false);
+        }
+      }}
+      className={cn(
+        'fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-line bg-slate-950 text-white shadow-[8px_0_40px_-24px_rgba(15,23,42,0.85)] transition-[width] duration-200 ease-out lg:flex',
+        compact ? 'w-20' : 'w-60',
+      )}
+    >
+      <div className={cn('flex items-center border-b border-white/10 py-4', compact ? 'justify-center px-3' : 'gap-3 px-4')}>
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-primary-500 via-primary-600 to-slate-900 text-sm font-bold text-white shadow-lg shadow-primary-950/25">
           PH
         </div>
-        <span className="min-w-0">
+        <span className={cn('min-w-0', compact && 'sr-only')}>
           <span className="block text-[15px] font-semibold tracking-tight">PeopleHub OS</span>
           <span className="block text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
             AI-first people stack
           </span>
         </span>
       </div>
-      <div className="border-b border-white/10 px-4 py-4">
-        <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
-          <div className="flex items-center gap-3">
+      <div className="border-b border-white/10 px-3 py-4">
+        <div className={cn('rounded-2xl border border-white/10 bg-white/5 p-3', compact && 'flex justify-center p-2.5')}>
+          <div className={cn('flex items-center gap-3', compact && 'justify-center')}>
             <Avatar name={userName} size="md" className="ring-2 ring-white/10" />
-            <div className="min-w-0">
+            <div className={cn('min-w-0', compact && 'sr-only')}>
               <p className="truncate text-sm font-semibold">{userName}</p>
               <p className="truncate text-xs text-slate-400">{tenantName}</p>
             </div>
-            <ChevronRight className="ml-auto h-4 w-4 text-slate-500" />
+            <ChevronRight className={cn('ml-auto h-4 w-4 text-slate-500', compact && 'hidden')} />
           </div>
-          <div className="mt-3 flex items-center gap-2 text-xs text-slate-300">
+          <div className={cn('mt-3 flex items-center gap-2 text-xs text-slate-300', compact && 'sr-only')}>
             <CircleDot className="h-3.5 w-3.5 text-primary-300" />
             <span>Command center ready</span>
           </div>
         </div>
       </div>
-      <nav className="scrollbar-thin flex-1 space-y-6 overflow-y-auto px-3 py-4">
+      <nav className={cn('scrollbar-thin flex-1 overflow-y-auto py-4', compact ? 'space-y-4 px-2' : 'space-y-5 px-3')}>
         {NAV_SECTIONS.map((section) => (
           <div key={section.title}>
-            <p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+            <p className={cn('mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500', compact && 'sr-only')}>
               {section.title}
             </p>
-            <div className="space-y-1">
+            <div className={cn('space-y-1', compact && 'space-y-2')}>
               {section.items.map((item) => {
                 const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
                 return (
                   <Link
                     key={item.href}
                     href={item.href}
+                    title={compact ? item.label : undefined}
+                    aria-label={compact ? item.label : undefined}
                     className={cn(
-                      'group flex items-center gap-3 rounded-2xl px-3 py-[11px] text-[13px] font-medium transition-all',
+                      'group flex items-center rounded-2xl text-[13px] font-medium transition-all',
+                      compact ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-[10px]',
                       active
                         ? 'bg-white text-slate-950 shadow-lg shadow-black/10'
                         : 'text-slate-300 hover:bg-white/5 hover:text-white',
@@ -69,8 +95,8 @@ export function Sidebar() {
                     >
                       <item.icon className="h-4 w-4" />
                     </span>
-                    <span className="min-w-0 flex-1">{item.label}</span>
-                    <span className="flex h-4 w-4 items-center justify-center">
+                    <span className={cn('min-w-0 flex-1', compact && 'sr-only')}>{item.label}</span>
+                    <span className={cn('flex h-4 w-4 items-center justify-center', compact && 'hidden')}>
                       <Sparkles
                         className={cn(
                           'h-3.5 w-3.5 transition-opacity',
@@ -85,14 +111,20 @@ export function Sidebar() {
           </div>
         ))}
       </nav>
-      <div className="border-t border-white/10 p-4">
-        <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/10 to-white/5 px-4 py-3">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-300">Enterprise v1</p>
-          <p className="mt-1 text-xs leading-5 text-slate-400">
-            HR, payroll, hiring, and workflow ops in one system.
-            <span className="sr-only">{userRole}</span>
-          </p>
-        </div>
+      <div className="border-t border-white/10 p-3">
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          className={cn(
+            'flex w-full items-center rounded-2xl border border-white/10 bg-white/5 text-sm font-semibold text-slate-300 transition hover:bg-white/10 hover:text-white',
+            compact ? 'justify-center p-3' : 'justify-between px-3 py-2.5',
+          )}
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          {collapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+          <span className={cn(compact && 'sr-only')}>{collapsed ? 'Expand' : 'Collapse'}</span>
+        </button>
       </div>
     </aside>
   );

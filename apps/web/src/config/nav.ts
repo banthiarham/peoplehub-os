@@ -10,6 +10,7 @@ import {
   HeartHandshake,
   Laptop,
   LayoutDashboard,
+  ListChecks,
   LifeBuoy,
   Mail,
   Network,
@@ -85,6 +86,7 @@ export const NAV_SECTIONS: NavSection[] = [
     title: 'Admin',
     items: [
       { label: 'Documents', href: '/documents', icon: FileText },
+      { label: 'Setup', href: '/setup', icon: ListChecks },
       { label: 'Notifications', href: '/notifications', icon: Bell },
       { label: 'Communications', href: '/communications', icon: Mail },
       { label: 'Developer', href: '/developer', icon: Code2 },

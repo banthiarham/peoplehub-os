@@ -6,7 +6,7 @@ import { AuthUser } from '../../common/types/auth-user';
 import { CreateLocationDto, UpdateLocationDto } from './dto/locations.dto';
 import { LocationsService } from './locations.service';
 
-const LOCATION_ADMIN_ROLES = ['Super Admin', 'HR Admin'];
+const LOCATION_ADMIN_ROLES = ['Super Admin', 'Tenant Owner', 'HR Admin'];
 
 @ApiTags('Locations')
 @ApiBearerAuth()
