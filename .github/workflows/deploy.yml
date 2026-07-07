@@ -101,6 +101,21 @@ jobs:
 
           cp "${deploy_path}/deploy/.env.prod" "${release_path}/deploy/.env.prod"
 
+          compose_up() {
+            docker compose -p peoplehub -f docker-compose.prod.yml --env-file .env.prod up -d --build --remove-orphans
+            docker compose -p peoplehub -f docker-compose.prod.yml --env-file .env.prod restart nginx
+
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error --head http://127.0.0.1 >/dev/null; then
+                return 0
+              fi
+              echo "Waiting for PeopleHub health check (${attempt}/30)"
+              sleep 2
+            done
+
+            return 1
+          }
+
           if command -v docker >/dev/null 2>&1 && [ -f /opt/viohr/deploy/docker-compose.yml ]; then
             docker compose -f /opt/viohr/deploy/docker-compose.yml --env-file /opt/viohr/deploy/.env down --remove-orphans >/dev/null 2>&1 || true
           fi
@@ -112,17 +127,16 @@ jobs:
           mv "$release_path" "$deploy_path"
 
           cd "${deploy_path}/deploy"
-          if ! docker compose -p peoplehub -f docker-compose.prod.yml --env-file .env.prod up -d --build --remove-orphans; then
+          if ! compose_up; then
             mv "$deploy_path" "$failed_path"
             if [ -d "$previous_path" ]; then
               mv "$previous_path" "$deploy_path"
               cd "${deploy_path}/deploy"
-              docker compose -p peoplehub -f docker-compose.prod.yml --env-file .env.prod up -d --build --remove-orphans || true
+              compose_up || true
             fi
             exit 1
           fi
 
-          curl --fail --silent --show-error --head http://127.0.0.1 >/dev/null
           rm -f "$archive"
           rm -rf "$previous_path"
           REMOTE
