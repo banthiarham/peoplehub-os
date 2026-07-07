@@ -539,9 +539,12 @@ export class WorkflowsService {
     });
     if (!request?.workflow) return request;
 
-    let current: any = request;
-    while (true) {
-      const currentStep = (current.workflow?.steps2 ?? []).find((step: WorkflowStepRecord) => step.stepNumber === current.currentStep);
+    let current = request;
+    while (current) {
+      const workflow = current.workflow;
+      if (!workflow) break;
+
+      const currentStep = workflow.steps2.find((step: WorkflowStepRecord) => step.stepNumber === current.currentStep);
       if (!currentStep) break;
       if (!currentStep.autoApprove) break;
 
@@ -558,7 +561,7 @@ export class WorkflowsService {
       const next = await this.findNextStep(tx, current.workflowId!, current.currentStep);
       if (!next) {
         await this.applyTerminalApprovalSideEffects(tx, current, user, 'Auto-approved');
-        current = await tx.approvalRequest.update({
+        await tx.approvalRequest.update({
           where: { id: current.id },
           data: {
             status: 'APPROVED',
@@ -570,8 +573,8 @@ export class WorkflowsService {
         break;
       }
 
-      const nextApproverId = await this.resolveApprover(tx, current.tenantId, current.workflow, current.requesterId, next.stepNumber);
-      current = await tx.approvalRequest.update({
+      const nextApproverId = await this.resolveApprover(tx, current.tenantId, workflow, current.requesterId, next.stepNumber);
+      const updated = await tx.approvalRequest.update({
         where: { id: current.id },
         data: {
           currentStep: next.stepNumber,
@@ -581,6 +584,7 @@ export class WorkflowsService {
           comments: this.appendComment(current.comments, user, 'APPROVED', 'Auto-approved'),
         },
       });
+      current = { ...updated, workflow };
     }
 
     return tx.approvalRequest.findUniqueOrThrow({
