@@ -4,16 +4,14 @@ import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, ClipboardCheck, FileCheck2, FileText, Handshake, Plus, ShieldCheck, UserPlus, X } from 'lucide-react';
 import { api } from '@/lib/api';
-import { formatDate } from '@/lib/utils';
+import { cn, formatDate } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Input, Select } from '@/components/ui/input';
-import { PageHeader } from '@/components/ui/page-header';
 import { Progress } from '@/components/ui/progress';
-import { StatCard } from '@/components/ui/stat-card';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { OpsTextarea } from '@/components/forms/ops-textarea';
 
@@ -113,6 +111,49 @@ const initialTemplate = {
   policies: 'Code of conduct acknowledgement\nInformation security policy acknowledgement',
   welcomeSubject: 'Welcome to Demo Corp India',
 };
+
+function OnboardingMetric({
+  label,
+  value,
+  detail,
+  icon: Icon,
+  accent,
+  dark = false,
+}: {
+  label: string;
+  value: string | number;
+  detail: string;
+  icon: typeof UserPlus;
+  accent: string;
+  dark?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        'rounded-lg border p-4',
+        dark
+          ? 'border-slate-900 bg-slate-950 text-white'
+          : 'border-slate-200 bg-slate-50/70 text-slate-950',
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className={cn('text-[11px] font-semibold uppercase tracking-[0.16em]', dark ? 'text-slate-400' : 'text-slate-500')}>
+            {label}
+          </p>
+          <p className="mt-2 truncate text-2xl font-semibold tracking-tight">{value}</p>
+          <p className={cn('mt-1 truncate text-xs', dark ? 'text-slate-400' : 'text-slate-600')}>{detail}</p>
+        </div>
+        <span
+          className={cn('inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white shadow-sm', dark && 'bg-white/10')}
+          style={{ color: accent }}
+        >
+          <Icon className="h-5 w-5" />
+        </span>
+      </div>
+    </div>
+  );
+}
 
 export default function OnboardingPage() {
   const qc = useQueryClient();
@@ -237,23 +278,73 @@ export default function OnboardingPage() {
   });
 
   return (
-    <div>
-      <PageHeader title="Onboarding & Exits" description="Templates, preboarding, joining tasks and offboarding clearance" />
+    <div className="space-y-5">
+      <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-[0_14px_48px_-44px_rgba(15,23,42,0.5)]">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <h1 className="text-xl font-semibold leading-tight tracking-tight text-slate-950 sm:text-2xl">
+                Onboarding & exits command center
+              </h1>
+              <p className="text-xs leading-5 text-slate-600">
+                Templates, preboarding, joining checklists, probation tasks, offboarding approvals, and clearance.
+              </p>
+            </div>
+          </div>
+          <Badge variant="outline">{(templates ?? []).length} templates</Badge>
+        </div>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <OnboardingMetric
+            label="Active onboardings"
+            value={activeRows.length}
+            detail="Employees in joining workflows"
+            icon={UserPlus}
+            accent="#0F766E"
+          />
+          <OnboardingMetric
+            label="Joining tasks"
+            value={pendingMandatoryOnboarding}
+            detail="Mandatory tasks still open"
+            icon={ClipboardCheck}
+            accent="#2563EB"
+          />
+          <OnboardingMetric
+            label="Open exits"
+            value={exitRows.filter((row) => row.status !== 'COMPLETED').length}
+            detail="Resignations under clearance"
+            icon={Handshake}
+            accent="#F59E0B"
+          />
+          <OnboardingMetric
+            label="Exit tasks"
+            value={pendingExitTasks}
+            detail="Pending asset, KT, letters, F&F"
+            icon={ShieldCheck}
+            accent="#0F766E"
+            dark
+          />
+        </div>
+      </section>
+
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
         </div>
       )}
-      <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Active onboardings" value={activeRows.length} icon={UserPlus} />
-        <StatCard label="Pending joining tasks" value={pendingMandatoryOnboarding} icon={ClipboardCheck} />
-        <StatCard label="Open exits" value={exitRows.filter((row) => row.status !== 'COMPLETED').length} icon={Handshake} />
-        <StatCard label="Pending exit tasks" value={pendingExitTasks} icon={ShieldCheck} />
-      </div>
 
-      <div className="mb-4 flex flex-wrap gap-2">
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
         {tabs.map((tab) => (
-          <Button key={tab} type="button" variant={activeTab === tab ? 'secondary' : 'outline'} onClick={() => setActiveTab(tab)}>
+          <Button
+            key={tab}
+            type="button"
+            variant="outline"
+            className={cn(
+              'h-auto justify-start gap-2 rounded-lg border-slate-200 bg-white px-3 py-2.5 text-xs font-semibold text-slate-600 shadow-none transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800',
+              activeTab === tab && 'border-teal-200 bg-teal-50 text-teal-800 ring-1 ring-teal-100',
+            )}
+            onClick={() => setActiveTab(tab)}
+          >
             {tab}
           </Button>
         ))}
@@ -261,8 +352,11 @@ export default function OnboardingPage() {
 
       {activeTab === 'Onboarding' && (
         <div className="grid gap-4 xl:grid-cols-[0.8fr_1.5fr]">
-          <Card>
-            <CardHeader><CardTitle>Start onboarding</CardTitle></CardHeader>
+          <Card className="overflow-hidden border-slate-200 bg-white">
+            <CardHeader className="border-b border-slate-200 px-4 py-3">
+              <CardTitle>Start onboarding</CardTitle>
+              <p className="mt-1 text-xs text-slate-500">Assign a template, buddy, and joining workflow.</p>
+            </CardHeader>
             <CardContent className="grid gap-3">
               <Select value={startForm.employeeId} onChange={(e) => setStartForm((f) => ({ ...f, employeeId: e.target.value }))}>
                 <option value="">Employee</option>
@@ -282,11 +376,19 @@ export default function OnboardingPage() {
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader><CardTitle>Recent joiners and tasks</CardTitle></CardHeader>
+          <Card className="overflow-hidden border-slate-200 bg-white">
+            <CardHeader className="border-b border-slate-200 px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <CardTitle>Recent joiners and tasks</CardTitle>
+                  <p className="mt-1 text-xs text-slate-500">Track joining progress and clear open mandatory tasks.</p>
+                </div>
+                <Badge variant="outline">{activeRows.length} active</Badge>
+              </div>
+            </CardHeader>
             {activeRows.length ? (
               <Table>
-                <THead><TR><TH>Employee</TH><TH>Joined</TH><TH>Progress</TH><TH>Open tasks</TH></TR></THead>
+                <THead><TR><TH className="w-[32%]">Employee</TH><TH className="w-[16%]">Joined</TH><TH className="w-[20%]">Progress</TH><TH>Open tasks</TH></TR></THead>
                 <TBody>
                   {activeRows.map((e) => (
                     <TR key={e.id}>
@@ -311,10 +413,13 @@ export default function OnboardingPage() {
                       <TD>
                         <div className="flex flex-wrap gap-2">
                           {e.onboardingTasks.filter((task) => !task.completedAt && !task.isWaived).slice(0, 3).map((task) => (
-                            <Button key={task.id} type="button" size="sm" variant="outline" onClick={() => updateTask.mutate({ id: task.id, payload: { completed: true, acknowledged: task.category === 'POLICY' ? true : undefined } })}>
+                            <Button key={task.id} type="button" size="sm" variant="outline" className="max-w-48 justify-start truncate" onClick={() => updateTask.mutate({ id: task.id, payload: { completed: true, acknowledged: task.category === 'POLICY' ? true : undefined } })}>
                               <Check className="h-3.5 w-3.5" /> {task.title}
                             </Button>
                           ))}
+                          {e.onboardingTasks.filter((task) => !task.completedAt && !task.isWaived).length === 0 && (
+                            <Badge variant="success">Complete</Badge>
+                          )}
                         </div>
                       </TD>
                     </TR>

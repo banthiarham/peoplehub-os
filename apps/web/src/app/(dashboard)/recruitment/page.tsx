@@ -19,15 +19,13 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { formatDate } from '@/lib/utils';
+import { cn, formatDate } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input, Select } from '@/components/ui/input';
-import { PageHeader } from '@/components/ui/page-header';
 import { Skeleton } from '@/components/ui/skeleton';
-import { StatCard } from '@/components/ui/stat-card';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { OpsTextarea } from '@/components/forms/ops-textarea';
 
@@ -170,6 +168,49 @@ const initialCandidate = {
   expectedCTC: '',
   notes: '',
 };
+
+function RecruitmentMetric({
+  label,
+  value,
+  detail,
+  icon: Icon,
+  accent,
+  dark = false,
+}: {
+  label: string;
+  value: string | number;
+  detail: string;
+  icon: typeof Briefcase;
+  accent: string;
+  dark?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        'rounded-lg border p-4',
+        dark
+          ? 'border-slate-900 bg-slate-950 text-white'
+          : 'border-slate-200 bg-slate-50/70 text-slate-950',
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className={cn('text-[11px] font-semibold uppercase tracking-[0.16em]', dark ? 'text-slate-400' : 'text-slate-500')}>
+            {label}
+          </p>
+          <p className="mt-2 truncate text-2xl font-semibold tracking-tight">{value}</p>
+          <p className={cn('mt-1 truncate text-xs', dark ? 'text-slate-400' : 'text-slate-600')}>{detail}</p>
+        </div>
+        <span
+          className={cn('inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white shadow-sm', dark && 'bg-white/10')}
+          style={{ color: accent }}
+        >
+          <Icon className="h-5 w-5" />
+        </span>
+      </div>
+    </div>
+  );
+}
 
 export default function RecruitmentPage() {
   const qc = useQueryClient();
@@ -404,40 +445,78 @@ export default function RecruitmentPage() {
   });
 
   return (
-    <div>
-      <PageHeader
-        eyebrow="Talent"
-        title="Recruitment"
-        description="Requisitions, pipeline, interviews, offers and conversion"
-        meta={
-          <>
-            <Badge variant="outline">{stats?.openJobs ?? 0} open jobs</Badge>
-            <Badge variant="outline">{stats?.totalCandidates ?? 0} candidates</Badge>
-            <Badge variant="outline">{stats?.offersPending ?? 0} offers pending</Badge>
-          </>
-        }
-      />
+    <div className="space-y-5">
+      <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-[0_14px_48px_-44px_rgba(15,23,42,0.5)]">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <h1 className="text-xl font-semibold leading-tight tracking-tight text-slate-950 sm:text-2xl">
+                Recruitment command center
+              </h1>
+              <p className="text-xs leading-5 text-slate-600">
+                Requisitions, candidate pipeline, interviews, offers, and candidate-to-employee conversion.
+              </p>
+            </div>
+          </div>
+          <Button type="button" onClick={() => window.open('/careers/demo-corp', '_blank', 'noreferrer')}>
+            <ExternalLink className="h-4 w-4" /> Careers page
+          </Button>
+        </div>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <RecruitmentMetric
+            label="Open positions"
+            value={stats?.openJobs ?? '-'}
+            detail={`${openJobs.length} approved requisitions live`}
+            icon={Briefcase}
+            accent="#0F766E"
+          />
+          <RecruitmentMetric
+            label="Total candidates"
+            value={stats?.totalCandidates ?? '-'}
+            detail={`${candidates.length} records in ATS directory`}
+            icon={Users}
+            accent="#2563EB"
+          />
+          <RecruitmentMetric
+            label="Interviews this week"
+            value={stats?.interviewsThisWeek ?? '-'}
+            detail="Scheduled screening and panel rounds"
+            icon={CalendarClock}
+            accent="#F59E0B"
+          />
+          <RecruitmentMetric
+            label="Offers pending"
+            value={stats?.offersPending ?? '-'}
+            detail="Compensation and letter approvals"
+            icon={FileSignature}
+            accent="#0F766E"
+            dark
+          />
+        </div>
+      </section>
+
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
         </div>
       )}
-      <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Open positions" value={stats?.openJobs ?? '-'} icon={Briefcase} />
-        <StatCard label="Total candidates" value={stats?.totalCandidates ?? '-'} icon={Users} />
-        <StatCard label="Interviews this week" value={stats?.interviewsThisWeek ?? '-'} icon={CalendarClock} />
-        <StatCard label="Offers pending approval" value={stats?.offersPending ?? '-'} icon={FileSignature} />
-      </div>
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         {tabs.map((tab) => (
-          <Button key={tab} type="button" variant={activeTab === tab ? 'secondary' : 'outline'} onClick={() => setActiveTab(tab)}>
+          <Button
+            key={tab}
+            type="button"
+            variant="outline"
+            className={cn(
+              'h-auto justify-start gap-2 rounded-lg border-slate-200 bg-white px-3 py-2.5 text-xs font-semibold text-slate-600 shadow-none transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800',
+              activeTab === tab && 'border-teal-200 bg-teal-50 text-teal-800 ring-1 ring-teal-100',
+            )}
+            onClick={() => setActiveTab(tab)}
+          >
             {tab}
           </Button>
         ))}
-        <Button type="button" variant="outline" className="ml-auto" onClick={() => window.open('/careers/demo-corp', '_blank', 'noreferrer')}>
-          <ExternalLink className="h-4 w-4" /> Careers page
-        </Button>
       </div>
 
       {activeTab === 'Pipeline' && (
@@ -448,26 +527,28 @@ export default function RecruitmentPage() {
         ) : (
           <div className="scrollbar-thin flex gap-4 overflow-x-auto pb-2">
             {stages.map((stage, idx) => (
-              <div key={stage.stage} className="w-72 shrink-0">
-                <div className="mb-2 flex items-center justify-between px-1">
-                  <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-ink-muted">
-                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: STAGE_COLORS[idx % STAGE_COLORS.length] }} />
-                    {STAGE_LABELS[stage.stage] ?? stage.stage}
+              <section key={stage.stage} className="w-80 shrink-0 overflow-hidden rounded-lg border border-slate-200 bg-white">
+                <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-3 py-3">
+                  <span className="flex min-w-0 items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: STAGE_COLORS[idx % STAGE_COLORS.length] }} />
+                    <span className="truncate">{STAGE_LABELS[stage.stage] ?? stage.stage}</span>
                   </span>
                   <Badge variant="outline">{stage.count}</Badge>
                 </div>
-                <div className="space-y-2">
+                <div className="space-y-2 p-2.5">
                   {stage.candidates.map((c) => (
-                    <Card key={c.id} className="p-3">
+                    <Card key={c.id} className="border-slate-200 p-3 shadow-none">
                       <div className="flex items-center gap-2.5">
                         <Avatar name={`${c.firstName} ${c.lastName}`} size="sm" />
                         <div className="min-w-0">
-                          <p className="truncate text-sm font-medium">{c.firstName} {c.lastName}</p>
+                          <p className="truncate text-sm font-semibold text-slate-950">{c.firstName} {c.lastName}</p>
                           <p className="truncate text-[11px] text-ink-muted">{c.jobRequisition.title}</p>
                         </div>
                       </div>
                       <div className="mt-3 flex items-center gap-2">
                         <Select
+                          id={`candidate-stage-${c.id}`}
+                          name={`candidateStage-${c.id}`}
                           className="min-w-0 flex-1"
                           value={c.currentStage}
                           onChange={(e) => moveCandidate.mutate({ id: c.id, currentStage: e.target.value })}
@@ -487,7 +568,7 @@ export default function RecruitmentPage() {
                     <div className="rounded-lg border border-dashed border-line p-4 text-center text-xs text-ink-faint">No candidates</div>
                   )}
                 </div>
-              </div>
+              </section>
             ))}
           </div>
         )

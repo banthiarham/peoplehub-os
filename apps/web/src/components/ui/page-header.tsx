@@ -6,19 +6,20 @@ interface PageHeaderProps {
   meta?: React.ReactNode;
 }
 
-export function PageHeader({ title, description, actions, eyebrow, meta }: PageHeaderProps) {
+export function PageHeader({ title, description, actions, eyebrow }: PageHeaderProps) {
   return (
-    <div className="mb-6 rounded-2xl border border-line/70 bg-white/80 px-5 py-4 shadow-card backdrop-blur-sm">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0">
+    <div className="mb-4 rounded-lg border border-line/90 bg-white px-4 py-3 shadow-card">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0 flex-1">
           {eyebrow && (
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-ink-faint">
+            <p className="mb-0.5 text-[10px] font-semibold uppercase text-ink-faint">
               {eyebrow}
             </p>
           )}
-          <h1 className="text-[24px] font-semibold tracking-tight text-ink">{title}</h1>
-          {description && <p className="mt-1 max-w-3xl text-sm leading-6 text-ink-muted">{description}</p>}
-          {meta && <div className="mt-3 flex flex-wrap gap-2">{meta}</div>}
+          <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h1 className="text-[24px] font-semibold text-ink">{title}</h1>
+            {description && <p className="max-w-4xl text-sm leading-5 text-ink-muted">{description}</p>}
+          </div>
         </div>
         {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
       </div>

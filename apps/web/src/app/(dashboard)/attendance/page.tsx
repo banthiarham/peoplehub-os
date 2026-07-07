@@ -1,14 +1,30 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CalendarCheck, CalendarClock, Clock, Download, LogIn, LogOut, MapPin, Repeat2, Settings2, Upload, Users } from 'lucide-react';
+import {
+  AlertTriangle,
+  CalendarCheck,
+  CalendarClock,
+  CheckCircle2,
+  Clock,
+  Download,
+  Fingerprint,
+  LogIn,
+  LogOut,
+  MapPin,
+  RadioTower,
+  Repeat2,
+  Settings2,
+  Upload,
+  Users,
+} from 'lucide-react';
 import { useState } from 'react';
 import type { ChangeEvent } from 'react';
 import { api } from '@/lib/api';
 import { downloadFile } from '@/lib/download';
 import { getDeviceId, getDeviceInfo } from '@/lib/device';
 import { captureFreshFix } from '@/lib/geo';
-import { formatDate, formatTime } from '@/lib/utils';
+import { cn, formatDate, formatTime } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -22,7 +38,6 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { Input, Select } from '@/components/ui/input';
-import { PageHeader } from '@/components/ui/page-header';
 import { Skeleton } from '@/components/ui/skeleton';
 import { StatCard } from '@/components/ui/stat-card';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
@@ -158,6 +173,78 @@ const CAPTURE_MODE_HELP: Record<CaptureMode, string> = {
   API_IMPORT: 'External attendance system sync endpoint.',
 };
 
+function formatMinutes(minutes: number | null | undefined) {
+  if (!minutes) return '—';
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function CompactAttendanceMetric({
+  label,
+  value,
+  tone = 'default',
+}: {
+  label: string;
+  value: string | number;
+  tone?: 'default' | 'warning';
+}) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-2 rounded-full border px-3 py-1.5 font-semibold',
+        tone === 'warning'
+          ? 'border-amber-200 bg-amber-50 text-amber-800'
+          : 'border-slate-200 bg-slate-50 text-slate-700',
+      )}
+    >
+      <span className="font-medium text-slate-500">{label}</span>
+      <span className="text-slate-950">{value}</span>
+    </span>
+  );
+}
+
+function AttendanceMetric({
+  label,
+  value,
+  detail,
+  icon: Icon,
+  accent,
+  dark = false,
+}: {
+  label: string;
+  value: string | number;
+  detail: string;
+  icon: typeof Clock;
+  accent: string;
+  dark?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        'rounded-lg border p-4',
+        dark
+          ? 'border-slate-900 bg-slate-950 text-white'
+          : 'border-slate-200 bg-slate-50/70 text-slate-950',
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className={cn('text-[11px] font-semibold uppercase tracking-[0.16em]', dark ? 'text-slate-400' : 'text-slate-500')}>
+            {label}
+          </p>
+          <p className="mt-2 break-words text-2xl font-semibold tracking-tight">{value}</p>
+          <p className={cn('mt-1 text-xs leading-4', dark ? 'text-slate-400' : 'text-slate-600')}>{detail}</p>
+        </div>
+        <span
+          className={cn('inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white shadow-sm', dark && 'bg-white/10')}
+          style={{ color: accent }}
+        >
+          <Icon className="h-5 w-5" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function apiError(err: unknown): string {
   const e = err as { response?: { data?: { message?: string | string[] } } };
   const m = e?.response?.data?.message;
@@ -180,6 +267,13 @@ export default function AttendancePage() {
   });
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['attendance'] });
+  const rows = (data?.rows ?? []) as TodayRow[];
+  const summary = data?.summary ?? { present: 0, late: 0, onLeave: 0, absent: 0 };
+  const totalPeople = rows.length || summary.present + summary.late + summary.onLeave + summary.absent;
+  const workingRows = rows.filter((row) => row.punchIn && !row.punchOut).length;
+  const gpsVerifiedRows = rows.filter((row) => row.punchSource === 'GPS').length;
+  const exceptionRows = summary.late + summary.absent;
+  const presentShare = totalPeople ? Math.round(((summary.present + summary.late) / totalPeople) * 100) : 0;
 
   const checkIn = useMutation({
     mutationFn: async () => {
@@ -236,12 +330,20 @@ export default function AttendancePage() {
   });
 
   return (
-    <div>
-      <PageHeader
-        title="Attendance"
-        description="Live team attendance for today — check-in captures your GPS location"
-        actions={
-          <>
+    <div className="space-y-5">
+      <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-[0_14px_48px_-44px_rgba(15,23,42,0.5)]">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <h1 className="text-xl font-semibold leading-tight tracking-tight text-slate-950 sm:text-2xl">
+                Attendance command
+              </h1>
+              <p className="text-xs leading-5 text-slate-600">
+                Monitor live punches, exceptions, capture modes, rosters, and payroll-ready finalization.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
             <Button
               variant="ghost"
               size="sm"
@@ -267,23 +369,65 @@ export default function AttendancePage() {
             <Button size="sm" onClick={() => checkIn.mutate()} disabled={checkIn.isPending}>
               <LogIn className="h-3.5 w-3.5" /> {checkIn.isPending ? 'Locating…' : 'Check in'}
             </Button>
-          </>
-        }
-      />
+          </div>
+        </div>
 
-      <div className="mb-5 grid gap-2 sm:grid-cols-3 xl:grid-cols-10">
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <AttendanceMetric
+            label="People tracked"
+            value={isLoading ? '—' : totalPeople}
+            detail={`${summary.present + summary.late} currently present`}
+            icon={Users}
+            accent="#0F766E"
+          />
+          <AttendanceMetric
+            label="Presence rate"
+            value={isLoading ? '—' : `${presentShare}%`}
+            detail={`${summary.onLeave} leave · ${summary.absent} absent`}
+            icon={CheckCircle2}
+            accent="#2563EB"
+          />
+          <AttendanceMetric
+            label="Exceptions"
+            value={isLoading ? '—' : exceptionRows}
+            detail={`${summary.late} late marks today`}
+            icon={AlertTriangle}
+            accent="#F59E0B"
+          />
+          <AttendanceMetric
+            label="Live sessions"
+            value={isLoading ? '—' : workingRows}
+            detail={`${gpsVerifiedRows} GPS verified punches`}
+            icon={RadioTower}
+            accent="#7C3AED"
+          />
+          <AttendanceMetric
+            label="Payroll sync"
+            value="Finalize"
+            detail="Payable days + LOP"
+            icon={Fingerprint}
+            accent="#0F766E"
+            dark
+          />
+        </div>
+      </section>
+
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5 xl:grid-cols-10">
         {ATTENDANCE_TABS.map((item) => {
           const Icon = item.icon;
           return (
             <Button
               key={item.id}
               type="button"
-              variant={tab === item.id ? 'secondary' : 'outline'}
-              className="h-auto justify-start gap-2 px-3 py-2"
+              variant="outline"
+              className={cn(
+                'h-auto justify-start gap-2 rounded-lg border-slate-200 bg-white px-3 py-2.5 text-xs font-semibold text-slate-600 shadow-none transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800',
+                tab === item.id && 'border-teal-200 bg-teal-50 text-teal-800 ring-1 ring-teal-100',
+              )}
               onClick={() => setTab(item.id)}
             >
               <Icon className="h-4 w-4" />
-              <span>{item.label}</span>
+              <span className="whitespace-nowrap">{item.label}</span>
             </Button>
           );
         })}
@@ -291,7 +435,7 @@ export default function AttendancePage() {
 
       {tab === 'today' && (isLoading || !data ? (
         <div className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-4">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
             {[...Array(4)].map((_, i) => (
               <Skeleton key={i} className="h-24" />
             ))}
@@ -299,27 +443,42 @@ export default function AttendancePage() {
           <Skeleton className="h-96" />
         </div>
       ) : (
-        <div className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <StatCard label="Present" value={data.summary.present} icon={Clock} />
-            <StatCard label="Late" value={data.summary.late} />
-            <StatCard label="On leave" value={data.summary.onLeave} />
-            <StatCard label="Absent" value={data.summary.absent} />
-          </div>
-          <Card>
+        <div>
+          <Card className="overflow-hidden border-slate-200 bg-white">
+            <div className="border-b border-slate-200 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Live attendance ledger</p>
+                  <p className="mt-1 text-sm text-slate-600">Punch state, hours, source, and exception status.</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant={exceptionRows ? 'warning' : 'success'}>{exceptionRows ? 'Review needed' : 'Clean day'}</Badge>
+                  <Badge variant="outline">{rows.length} rows</Badge>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3 text-xs">
+                <CompactAttendanceMetric label={new Date().toISOString().slice(0, 10)} value={`${presentShare}%`} />
+                <CompactAttendanceMetric label="Present" value={summary.present} />
+                <CompactAttendanceMetric label="Late" value={summary.late} tone={summary.late ? 'warning' : 'default'} />
+                <CompactAttendanceMetric label="On leave" value={summary.onLeave} />
+                <CompactAttendanceMetric label="Absent" value={summary.absent} tone={summary.absent ? 'warning' : 'default'} />
+                <CompactAttendanceMetric label="Working" value={workingRows} />
+                <CompactAttendanceMetric label="GPS" value={gpsVerifiedRows} />
+              </div>
+            </div>
             <Table>
               <THead>
                 <TR>
-                  <TH>Employee</TH>
-                  <TH>Department</TH>
-                  <TH>Check in</TH>
-                  <TH>Check out</TH>
-                  <TH>Hours</TH>
-                  <TH>Status</TH>
+                  <TH className="w-[34%]">Employee</TH>
+                  <TH className="w-[16%]">Status</TH>
+                  <TH className="w-[16%]">Check in</TH>
+                  <TH className="w-[16%]">Check out</TH>
+                  <TH className="w-[12%]">Hours</TH>
+                  <TH className="w-[6%]">Source</TH>
                 </TR>
               </THead>
               <TBody>
-                {data.rows.map((r: TodayRow) => (
+                {rows.map((r: TodayRow) => (
                   <TR key={r.employee.id}>
                     <TD>
                       <div className="flex items-center gap-3">
@@ -329,28 +488,26 @@ export default function AttendancePage() {
                             {r.employee.firstName} {r.employee.lastName}
                           </span>
                           <span className="block text-xs text-ink-muted">
-                            {r.employee.employeeCode}
+                            {r.employee.employeeCode} · {r.employee.department?.name ?? 'No department'}
                           </span>
                         </span>
                       </div>
                     </TD>
-                    <TD className="text-ink-muted">{r.employee.department?.name ?? '—'}</TD>
-                    <TD>
-                      <span className="flex items-center gap-1.5">
-                        {formatTime(r.punchIn)}
-                        {r.punchSource === 'GPS' && (
-                          <MapPin className="h-3 w-3 text-primary-500" aria-label="GPS verified" />
-                        )}
-                      </span>
-                    </TD>
-                    <TD>{formatTime(r.punchOut)}</TD>
-                    <TD className="text-ink-muted">
-                      {r.workingMinutes
-                        ? `${Math.floor(r.workingMinutes / 60)}h ${r.workingMinutes % 60}m`
-                        : '—'}
-                    </TD>
                     <TD>
                       <Badge variant={statusVariant(r.status)}>{r.status.replace(/_/g, ' ')}</Badge>
+                    </TD>
+                    <TD>
+                      <span className="whitespace-nowrap font-medium text-slate-900">{formatTime(r.punchIn)}</span>
+                    </TD>
+                    <TD>
+                      <span className="whitespace-nowrap text-slate-600">{formatTime(r.punchOut)}</span>
+                    </TD>
+                    <TD className="whitespace-nowrap text-slate-600">{formatMinutes(r.workingMinutes)}</TD>
+                    <TD>
+                      <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+                        {r.punchSource === 'GPS' && <MapPin className="h-3.5 w-3.5 text-teal-700" aria-label="GPS verified" />}
+                        {r.punchSource ?? '—'}
+                      </span>
                     </TD>
                   </TR>
                 ))}
