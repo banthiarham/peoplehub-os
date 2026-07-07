@@ -33,6 +33,7 @@ export class AssetsService {
               employee: { select: { id: true, firstName: true, lastName: true, employeeCode: true } },
             },
           },
+          documents: true,
         },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * pageSize,
@@ -41,8 +42,35 @@ export class AssetsService {
       this.prisma.asset.count({ where }),
     ]);
     return {
-      data: data.map((a) => ({ ...a, currentHolder: a.assignments[0]?.employee ?? null })),
+      data: data.map((a) => ({
+        ...a,
+        currentHolder: a.assignments[0]?.employee ?? null,
+        assignmentCount: a.assignments.length,
+        documentCount: a.documents.length,
+      })),
       meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+    };
+  }
+
+  async get(tenantId: string, id: string) {
+    const asset = await this.prisma.asset.findFirst({
+      where: { id, tenantId },
+      include: {
+        assignments: {
+          include: {
+            employee: { select: { id: true, firstName: true, lastName: true, employeeCode: true } },
+          },
+          orderBy: { assignedAt: 'desc' },
+        },
+        documents: {
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+    });
+    if (!asset) throw new NotFoundException('Asset not found');
+    return {
+      ...asset,
+      currentHolder: asset.assignments.find((assignment) => !assignment.returnedAt)?.employee ?? null,
     };
   }
 
@@ -84,6 +112,40 @@ export class AssetsService {
       }),
     ]);
     return { success: true };
+  }
+
+  async addDocument(
+    tenantId: string,
+    assetId: string,
+    data: { fileKey: string; fileName?: string; mimeType?: string },
+  ) {
+    const asset = await this.prisma.asset.findFirst({ where: { id: assetId, tenantId } });
+    if (!asset) throw new NotFoundException('Asset not found');
+    return this.prisma.assetDocument.create({
+      data: {
+        tenantId,
+        assetId,
+        fileKey: data.fileKey,
+        fileName: data.fileName,
+        mimeType: data.mimeType,
+      },
+    });
+  }
+
+  async history(tenantId: string, assetId: string) {
+    const asset = await this.get(tenantId, assetId);
+    return {
+      asset: {
+        id: asset.id,
+        name: asset.name,
+        category: asset.category,
+        serialNumber: asset.serialNumber,
+        status: asset.status,
+        condition: asset.condition,
+      },
+      assignments: asset.assignments,
+      documents: asset.documents,
+    };
   }
 
   async stats(tenantId: string) {

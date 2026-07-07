@@ -13,11 +13,11 @@ interface StatCardProps {
 
 export function StatCard({ label, value, delta, icon: Icon, children, className }: StatCardProps) {
   return (
-    <Card className={cn('overflow-hidden p-5', className)}>
-      <div className="flex items-start justify-between">
-        <div className="flex items-center gap-2 text-[13px] font-medium text-ink-muted">
+    <Card className={cn('overflow-hidden border border-line/80 bg-white/95 p-5 shadow-card', className)}>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.12em] text-ink-muted">
           {Icon && (
-            <span className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-50 text-primary-700">
+            <span className="flex h-9 w-9 items-center justify-center rounded-2xl bg-primary-50 text-primary-700">
               <Icon className="h-4 w-4" />
             </span>
           )}
@@ -25,11 +25,11 @@ export function StatCard({ label, value, delta, icon: Icon, children, className 
         </div>
       </div>
       <div className="mt-3 flex flex-wrap items-baseline gap-2">
-        <span className="text-2xl font-semibold tracking-tight text-ink">{value}</span>
+        <span className="text-[28px] font-semibold tracking-tight text-ink">{value}</span>
         {delta && (
           <span
             className={cn(
-              'inline-flex items-center gap-0.5 rounded-full px-2 py-0.5 text-xs font-medium',
+              'inline-flex items-center gap-0.5 rounded-full px-2 py-1 text-[11px] font-semibold',
               delta.positive ? 'text-success' : 'text-danger',
             )}
           >
@@ -39,7 +39,7 @@ export function StatCard({ label, value, delta, icon: Icon, children, className 
           </span>
         )}
       </div>
-      {children && <div className="mt-3">{children}</div>}
+      {children && <div className="mt-3 text-sm">{children}</div>}
     </Card>
   );
 }

@@ -3,7 +3,7 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
-import { AssignAssetDto, CreateAssetDto, ListAssetsDto, ReturnAssetDto } from './dto/assets.dto';
+import { AssignAssetDto, CreateAssetDocumentDto, CreateAssetDto, ListAssetsDto, ReturnAssetDto } from './dto/assets.dto';
 import { AssetsService } from './assets.service';
 
 @ApiTags('Assets')
@@ -38,5 +38,21 @@ export class AssetsController {
   @Roles('Super Admin', 'HR Admin')
   returnAsset(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ReturnAssetDto) {
     return this.assets.returnAsset(user.tenantId, id, dto.condition, dto.notes);
+  }
+
+  @Post(':id/documents')
+  @Roles('Super Admin', 'HR Admin')
+  addDocument(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateAssetDocumentDto) {
+    return this.assets.addDocument(user.tenantId, id, dto);
+  }
+
+  @Get(':id/history')
+  history(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.assets.history(user.tenantId, id);
+  }
+
+  @Get(':id')
+  get(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.assets.get(user.tenantId, id);
   }
 }

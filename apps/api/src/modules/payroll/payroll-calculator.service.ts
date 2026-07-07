@@ -28,7 +28,8 @@ const PF_WAGE_CAP = 15000;
  * Demo-grade India statutory calculator aligned with the seeded
  * "Standard India Salary Structure": BASIC 40% of gross, HRA 50% of basic,
  * SA balancing figure, PF 12% of capped basic, ESI 0.75% if gross <= 21k,
- * PT flat slab, TDS from projected annual income (new regime FY 2025-26).
+ * PT flat slab, LWF demo deduction, gratuity employer accrual, TDS from
+ * projected annual income (new regime FY 2025-26).
  */
 @Injectable()
 export class PayrollCalculatorService {
@@ -80,6 +81,8 @@ export class PayrollCalculatorService {
     const pf = round2(0.12 * Math.min(basic, PF_WAGE_CAP));
     const esi = gross <= 21000 ? round2(gross * 0.0075) : 0;
     const pt = gross >= 15000 ? 200 : gross >= 10000 ? 150 : 0;
+    const lwf = gross > 0 ? 10 : 0;
+    const gratuity = round2(basic * 0.0481);
     const tds = this.monthlyTds(gross * 12);
     const emi = input.monthlyEmiDeduction ?? 0;
 
@@ -90,6 +93,9 @@ export class PayrollCalculatorService {
         : []),
       ...(pt > 0
         ? [{ code: 'PT', name: 'Professional Tax', type: 'DEDUCTION' as const, monthly: pt, annual: pt * 12 }]
+        : []),
+      ...(lwf > 0
+        ? [{ code: 'LWF', name: 'Labour Welfare Fund', type: 'DEDUCTION' as const, monthly: lwf, annual: lwf * 12 }]
         : []),
       ...(tds > 0
         ? [{ code: 'TDS', name: 'TDS', type: 'DEDUCTION' as const, monthly: tds, annual: round2(tds * 12) }]
@@ -104,7 +110,11 @@ export class PayrollCalculatorService {
       grossPay: gross,
       totalDeductions,
       netPay: round2(gross - totalDeductions),
-      components: [...earnings, ...deductions],
+      components: [
+        ...earnings,
+        { code: 'GRATUITY', name: 'Gratuity Accrual', type: 'EMPLOYER_CONTRIBUTION' as const, monthly: gratuity, annual: round2(gratuity * 12) },
+        ...deductions,
+      ],
     };
   }
 

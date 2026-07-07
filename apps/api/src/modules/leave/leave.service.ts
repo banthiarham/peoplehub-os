@@ -2,7 +2,13 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
-import { ApplyLeaveDto, DecideLeaveDto, ListLeaveDto } from './dto/leave.dto';
+import {
+  ApplyLeaveDto,
+  DecideLeaveDto,
+  ListLeaveDto,
+  UpsertLeavePolicyDto,
+  UpsertLeaveTypeDto,
+} from './dto/leave.dto';
 
 function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -21,6 +27,50 @@ export class LeaveService {
     return this.prisma.leaveType.findMany({ where: { tenantId, isActive: true } });
   }
 
+  async createType(tenantId: string, dto: UpsertLeaveTypeDto) {
+    return this.prisma.leaveType.create({
+      data: { ...dto, tenantId, code: dto.code.trim().toUpperCase() },
+    });
+  }
+
+  async updateType(tenantId: string, id: string, dto: UpsertLeaveTypeDto) {
+    const type = await this.prisma.leaveType.findFirst({ where: { id, tenantId } });
+    if (!type) throw new NotFoundException('Leave type not found');
+    return this.prisma.leaveType.update({
+      where: { id },
+      data: { ...dto, code: dto.code?.trim().toUpperCase() },
+    });
+  }
+
+  async policies(tenantId: string) {
+    return this.prisma.leavePolicy.findMany({
+      where: { tenantId },
+      include: {
+        leaveType: { select: { id: true, name: true, code: true, isPaid: true } },
+        location: { select: { id: true, name: true, city: true } },
+      },
+      orderBy: [{ isActive: 'desc' }, { updatedAt: 'desc' }],
+    });
+  }
+
+  async createPolicy(tenantId: string, dto: UpsertLeavePolicyDto) {
+    await this.ensureLeaveType(tenantId, dto.leaveTypeId);
+    return this.prisma.leavePolicy.create({ data: { ...dto, tenantId } });
+  }
+
+  async updatePolicy(tenantId: string, id: string, dto: UpsertLeavePolicyDto) {
+    const policy = await this.prisma.leavePolicy.findFirst({ where: { id, tenantId } });
+    if (!policy) throw new NotFoundException('Leave policy not found');
+    await this.ensureLeaveType(tenantId, dto.leaveTypeId);
+    return this.prisma.leavePolicy.update({ where: { id }, data: dto });
+  }
+
+  private async ensureLeaveType(tenantId: string, leaveTypeId: string) {
+    const leaveType = await this.prisma.leaveType.findFirst({ where: { id: leaveTypeId, tenantId } });
+    if (!leaveType) throw new NotFoundException('Leave type not found');
+    return leaveType;
+  }
+
   async balances(tenantId: string, employeeId: string) {
     const year = new Date().getFullYear();
     return this.prisma.leaveBalance.findMany({
@@ -29,7 +79,7 @@ export class LeaveService {
     });
   }
 
-  private async workingDays(tenantId: string, from: Date, to: Date): Promise<number> {
+  private async workingDays(tenantId: string, from: Date, to: Date, includeWeekends = false): Promise<number> {
     const holidays = await this.prisma.holiday.findMany({
       where: { holidayCalendar: { tenantId }, date: { gte: from, lte: to } },
       select: { date: true },
@@ -38,11 +88,41 @@ export class LeaveService {
     let days = 0;
     for (let d = new Date(from); d <= to; d.setUTCDate(d.getUTCDate() + 1)) {
       const dow = d.getUTCDay();
-      if (dow === 0 || dow === 6) continue;
+      if (!includeWeekends && (dow === 0 || dow === 6)) continue;
       if (holidaySet.has(d.toISOString().slice(0, 10))) continue;
       days++;
     }
     return days;
+  }
+
+  private async policyFor(
+    tenantId: string,
+    leaveTypeId: string,
+    employee: { locationId: string | null; gender: string | null; employmentType: string },
+  ) {
+    return this.prisma.leavePolicy.findFirst({
+      where: {
+        tenantId,
+        leaveTypeId,
+        isActive: true,
+        OR: [{ locationId: employee.locationId }, { locationId: null }],
+        AND: [
+          {
+            OR: [
+              { genderRestriction: null },
+              { genderRestriction: employee.gender },
+            ],
+          },
+          {
+            OR: [
+              { employmentTypes: { isEmpty: true } },
+              { employmentTypes: { has: employee.employmentType } },
+            ],
+          },
+        ],
+      },
+      orderBy: [{ locationId: 'desc' }, { updatedAt: 'desc' }],
+    });
   }
 
   async apply(user: AuthUser, dto: ApplyLeaveDto) {
@@ -51,7 +131,40 @@ export class LeaveService {
     const to = dateOnly(new Date(dto.toDate));
     if (to < from) throw new BadRequestException('toDate must be on or after fromDate');
 
-    let days = await this.workingDays(user.tenantId, from, to);
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: employeeId, tenantId: user.tenantId },
+      select: {
+        id: true,
+        status: true,
+        gender: true,
+        employmentType: true,
+        locationId: true,
+        probationEndDate: true,
+      },
+    });
+    if (!employee) throw new NotFoundException('Employee not found');
+
+    const leaveType = await this.ensureLeaveType(user.tenantId, dto.leaveTypeId);
+    if (!leaveType) throw new NotFoundException('Leave type not found');
+    const policy = await this.policyFor(user.tenantId, dto.leaveTypeId, employee);
+
+    if ((policy?.genderRestriction ?? leaveType.genderRestriction) && (policy?.genderRestriction ?? leaveType.genderRestriction) !== employee.gender) {
+      throw new BadRequestException(`${leaveType.name} is not applicable for this employee`);
+    }
+    if (policy?.employmentTypes.length && !policy.employmentTypes.includes(employee.employmentType)) {
+      throw new BadRequestException(`${leaveType.name} is not applicable for this employment type`);
+    }
+    if (employee.status === 'ON_PROBATION' && policy && !policy.probationAllowed) {
+      throw new BadRequestException(`${leaveType.name} is restricted during probation`);
+    }
+    if (employee.status === 'ON_NOTICE' && policy && !policy.noticePeriodAllowed) {
+      throw new BadRequestException(`${leaveType.name} is restricted during notice period`);
+    }
+    if ((policy?.requiresAttachment ?? leaveType.requiresAttachment) && !dto.attachmentKey) {
+      throw new BadRequestException(`${leaveType.name} requires an attachment`);
+    }
+
+    let days = await this.workingDays(user.tenantId, from, to, policy?.sandwichRule ?? false);
     if (dto.halfDay) {
       if (from.getTime() !== to.getTime()) {
         throw new BadRequestException('Half day requires fromDate == toDate');
@@ -59,11 +172,12 @@ export class LeaveService {
       days = 0.5;
     }
     if (days <= 0) throw new BadRequestException('Selected range has no working days');
-
-    const leaveType = await this.prisma.leaveType.findFirst({
-      where: { id: dto.leaveTypeId, tenantId: user.tenantId },
-    });
-    if (!leaveType) throw new NotFoundException('Leave type not found');
+    const minDuration = policy?.minDuration ?? leaveType.minDuration;
+    const maxDuration = policy?.maxDuration ?? leaveType.maxDuration;
+    if (days < minDuration) throw new BadRequestException(`Minimum leave duration is ${minDuration} day(s)`);
+    if (maxDuration != null && days > maxDuration) {
+      throw new BadRequestException(`Maximum leave duration is ${maxDuration} day(s)`);
+    }
 
     const year = from.getUTCFullYear();
     const balance = await this.prisma.leaveBalance.findUnique({
@@ -71,7 +185,7 @@ export class LeaveService {
     });
     if (
       leaveType.isPaid &&
-      !leaveType.allowNegativeBalance &&
+      !(policy?.allowNegativeBalance ?? leaveType.allowNegativeBalance) &&
       (balance?.balance ?? 0) < days
     ) {
       throw new BadRequestException(
@@ -88,6 +202,8 @@ export class LeaveService {
         toDate: to,
         days,
         reason: dto.reason,
+        attachmentKey: dto.attachmentKey,
+        policySnapshot: policy ? (policy as unknown as Prisma.InputJsonValue) : undefined,
       },
       include: { leaveType: { select: { name: true, code: true } } },
     });

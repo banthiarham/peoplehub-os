@@ -4,7 +4,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import { AuthService } from './auth.service';
-import { ChangePasswordDto, LoginDto } from './dto/login.dto';
+import { ChangePasswordDto, LoginDto, OAuthTokenDto } from './dto/login.dto';
 
 @ApiTags('Auth')
 @Controller('auth')
@@ -17,6 +17,14 @@ export class AuthController {
   @ApiOperation({ summary: 'Login with email and password' })
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto);
+  }
+
+  @Public()
+  @Post('oauth/token')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'OAuth2 client credentials token exchange' })
+  oauthToken(@Body() dto: OAuthTokenDto) {
+    return this.authService.oauthToken(dto);
   }
 
   @Get('me')

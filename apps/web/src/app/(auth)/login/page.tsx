@@ -1,6 +1,6 @@
 'use client';
 
-import { signIn } from 'next-auth/react';
+import { getSession, signIn } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -22,7 +22,10 @@ export default function LoginPage() {
     if (res?.error) {
       setError('Invalid email or password');
     } else {
-      router.push('/dashboard');
+      const session = await getSession();
+      const roles = session?.user?.roles ?? [];
+      const isAdmin = roles.some((r) => r !== 'Employee');
+      router.push(isAdmin ? '/dashboard' : '/me');
       router.refresh();
     }
   }
@@ -91,6 +94,7 @@ export default function LoginPage() {
           <div className="mt-6 rounded-xl border border-line bg-canvas p-4 text-xs text-ink-muted">
             <p className="font-medium text-ink">Demo credentials</p>
             <p className="mt-1">admin@democorp.com · hr@democorp.com · payroll@democorp.com</p>
+            <p>employee@democorp.com — self-service portal</p>
             <p>
               Password: <code className="rounded bg-white px-1 py-0.5">Demo@123</code>
             </p>

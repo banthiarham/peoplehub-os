@@ -59,18 +59,21 @@ export class EmailTemplateService {
     return tpl;
   }
 
-  async create(tenantId: string, data: {
-    templateKey: string;
-    name: string;
-    subject: string;
-    bodyHtml: string;
-    bodyText?: string;
-    variables?: string[];
-    language?: string;
-    module: string;
-    isMandatory?: boolean;
-    createdById: string;
-  }) {
+  async create(
+    tenantId: string,
+    data: {
+      templateKey: string;
+      name: string;
+      subject: string;
+      bodyHtml: string;
+      bodyText?: string;
+      variables?: string[];
+      language?: string;
+      module: string;
+      isMandatory?: boolean;
+      createdById: string;
+    },
+  ) {
     return this.prisma.emailTemplate.create({
       data: {
         tenantId,
@@ -89,7 +92,10 @@ export class EmailTemplateService {
     });
   }
 
-  async update(id: string, data: { subject?: string; bodyHtml?: string; bodyText?: string; status?: EmailTemplateStatus }) {
+  async update(
+    id: string,
+    data: { subject?: string; bodyHtml?: string; bodyText?: string; status?: EmailTemplateStatus },
+  ) {
     const current = await this.findById(id);
 
     // Archive current version before update

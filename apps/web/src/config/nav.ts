@@ -1,15 +1,21 @@
 import {
+  BarChart3,
   Briefcase,
   CalendarDays,
+  ClipboardCheck,
   Clock,
   Code2,
+  Bell,
+  FileText,
   HeartHandshake,
   Laptop,
   LayoutDashboard,
   LifeBuoy,
   Mail,
+  Network,
   ReceiptText,
   Settings,
+  Smartphone,
   Sparkles,
   Target,
   Timer,
@@ -36,6 +42,10 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { label: 'Copilot', href: '/copilot', icon: Sparkles },
+      { label: 'Approvals', href: '/approvals', icon: ClipboardCheck },
+      { label: 'Workflows', href: '/workflows', icon: Network },
+      { label: 'Reports', href: '/reports', icon: BarChart3 },
+      { label: 'My Portal', href: '/me', icon: Smartphone },
     ],
   },
   {
@@ -45,6 +55,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { label: 'Attendance', href: '/attendance', icon: Clock },
       { label: 'Leave', href: '/leave', icon: CalendarDays },
       { label: 'Onboarding', href: '/onboarding', icon: UserPlus },
+      { label: 'Org Chart', href: '/org', icon: Network },
     ],
   },
   {
@@ -73,6 +84,8 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     title: 'Admin',
     items: [
+      { label: 'Documents', href: '/documents', icon: FileText },
+      { label: 'Notifications', href: '/notifications', icon: Bell },
       { label: 'Communications', href: '/communications', icon: Mail },
       { label: 'Developer', href: '/developer', icon: Code2 },
       { label: 'Settings', href: '/settings', icon: Settings },

@@ -6,4 +6,7 @@ export interface AuthUser {
   isSuperAdmin: boolean;
   employeeId: string | null;
   roles: string[];
+  authType?: 'jwt' | 'apiKey' | 'oauth';
+  apiKeyId?: string;
+  scopes?: string[];
 }

@@ -3,7 +3,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
-import { CreateApiKeyDto, CreateWebhookDto, UpdateWebhookDto } from './dto/developer.dto';
+import { CreateApiKeyDto, CreateOAuthClientDto, CreateWebhookDto, UpdateOAuthClientDto, UpdateWebhookDto } from './dto/developer.dto';
 import { DeveloperService } from './developer.service';
 
 @ApiTags('Developer')
@@ -34,6 +34,31 @@ export class DeveloperController {
     return this.developer.keyLogs(user.tenantId, id, page ? Number(page) : 1);
   }
 
+  @Get('request-logs')
+  requestLogs(@CurrentUser() user: AuthUser, @Query('page') page?: string) {
+    return this.developer.requestLogs(user.tenantId, page ? Number(page) : 1);
+  }
+
+  @Get('oauth-apps')
+  oauthApps(@CurrentUser() user: AuthUser) {
+    return this.developer.listOAuthClients(user.tenantId);
+  }
+
+  @Post('oauth-apps')
+  createOAuthApp(@CurrentUser() user: AuthUser, @Body() dto: CreateOAuthClientDto) {
+    return this.developer.createOAuthClient(user.tenantId, user.userId, dto);
+  }
+
+  @Patch('oauth-apps/:id')
+  updateOAuthApp(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateOAuthClientDto) {
+    return this.developer.updateOAuthClient(user.tenantId, id, dto);
+  }
+
+  @Delete('oauth-apps/:id')
+  deleteOAuthApp(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.developer.revokeOAuthClient(user.tenantId, id);
+  }
+
   @Get('webhooks')
   listWebhooks(@CurrentUser() user: AuthUser) {
     return this.developer.listWebhooks(user.tenantId);
@@ -54,9 +79,24 @@ export class DeveloperController {
     return this.developer.deliveries(user.tenantId, id);
   }
 
+  @Post('webhooks/:id/test')
+  testWebhook(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: { payload?: Record<string, unknown> }) {
+    return this.developer.sendWebhookTest(user.tenantId, id, body.payload);
+  }
+
   @Get('integrations')
   integrations(@CurrentUser() user: AuthUser) {
     return this.developer.integrations(user.tenantId);
+  }
+
+  @Get('events')
+  events() {
+    return this.developer.webhookEvents();
+  }
+
+  @Get('sandbox')
+  sandbox() {
+    return this.developer.sandbox();
   }
 
   @Get('stats')

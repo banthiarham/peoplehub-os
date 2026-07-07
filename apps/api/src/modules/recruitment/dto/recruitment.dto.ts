@@ -8,10 +8,12 @@ import {
   IsInt,
   IsNotEmpty,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
   Max,
   Min,
+  ValidateNested,
 } from 'class-validator';
 import { CandidateStage } from '@prisma/client';
 
@@ -36,6 +38,11 @@ export class CreateJobDto {
   @IsString()
   designationId?: string;
 
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  hiringManagerId?: string;
+
   @ApiPropertyOptional({ default: 1 })
   @IsOptional()
   @Type(() => Number)
@@ -57,9 +64,30 @@ export class CreateJobDto {
   @IsOptional()
   @IsString()
   status?: string;
+
+  @ApiPropertyOptional({ enum: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] })
+  @IsOptional()
+  @IsString()
+  priority?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  targetStartDate?: string;
 }
 
 export class UpdateJobDto extends PartialType(CreateJobDto) {}
+
+export class DecideJobApprovalDto {
+  @ApiProperty({ enum: ['APPROVED', 'REJECTED'] })
+  @IsString()
+  status!: 'APPROVED' | 'REJECTED';
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
 
 export class CreateCandidateDto {
   @ApiProperty()
@@ -91,13 +119,36 @@ export class CreateCandidateDto {
   @IsString()
   source?: string;
 
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+
   @ApiPropertyOptional()
   @IsOptional()
+  @IsString()
+  resumeKey?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  resumeFileName?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  resumeParsed?: Record<string, unknown>;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
   @IsNumber()
   currentCTC?: number;
 
   @ApiPropertyOptional()
   @IsOptional()
+  @Type(() => Number)
   @IsNumber()
   expectedCTC?: number;
 
@@ -120,6 +171,7 @@ export class UpdateCandidateDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @Type(() => Number)
   @IsNumber()
   expectedCTC?: number;
 
@@ -127,6 +179,27 @@ export class UpdateCandidateDto {
   @IsOptional()
   @IsString()
   phone?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  resumeKey?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  resumeFileName?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  resumeParsed?: Record<string, unknown>;
 }
 
 export class ListCandidatesDto {
@@ -213,6 +286,107 @@ export class UpdateInterviewDto {
   result?: string;
 }
 
+export class ScorecardCompetencyDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiProperty({ minimum: 1, maximum: 5 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(5)
+  rating!: number;
+
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  weight?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class SubmitInterviewScorecardDto {
+  @ApiProperty({ type: [ScorecardCompetencyDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ScorecardCompetencyDto)
+  competencies!: ScorecardCompetencyDto[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  strengths?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  concerns?: string;
+
+  @ApiPropertyOptional({ enum: ['STRONG_HIRE', 'HIRE', 'NO_HIRE', 'HOLD'] })
+  @IsOptional()
+  @IsString()
+  recommendation?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  feedback?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
+}
+
+export class PublicApplicationDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  firstName!: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  lastName!: string;
+
+  @ApiProperty()
+  @IsEmail()
+  email!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  phone?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  resumeKey?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  resumeFileName?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  expectedCTC?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
 export class CreateOfferDto {
   @ApiProperty()
   @IsString()
@@ -220,9 +394,24 @@ export class CreateOfferDto {
   candidateId!: string;
 
   @ApiProperty()
+  @Type(() => Number)
   @IsNumber()
   @Min(0)
   ctc!: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  fixedPay?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  variablePay?: number;
 
   @ApiProperty()
   @IsDateString()
@@ -232,10 +421,100 @@ export class CreateOfferDto {
   @IsOptional()
   @IsString()
   designation?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  designationId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  location?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  salaryStructureId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  expiresAt?: string;
 }
 
 export class UpdateOfferDto {
-  @ApiProperty({ enum: ['DRAFT', 'SENT', 'ACCEPTED', 'DECLINED', 'EXPIRED'] })
+  @ApiProperty({ enum: ['DRAFT', 'SENT', 'ACCEPTED', 'DECLINED', 'EXPIRED', 'APPROVAL_PENDING'] })
   @IsString()
   status!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
+
+export class DecideOfferApprovalDto {
+  @ApiProperty({ enum: ['APPROVED', 'REJECTED'] })
+  @IsString()
+  status!: 'APPROVED' | 'REJECTED';
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
+
+export class CandidateCommunicationDto {
+  @ApiPropertyOptional({ enum: ['EMAIL', 'PHONE', 'WHATSAPP', 'NOTE'] })
+  @IsOptional()
+  @IsString()
+  channel?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  subject?: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  body!: string;
+}
+
+export class ConvertCandidateDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  employeeCode?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  joiningDate?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  legalEntityId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  departmentId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  designationId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  locationId?: string;
 }

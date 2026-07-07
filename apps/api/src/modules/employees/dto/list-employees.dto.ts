@@ -39,6 +39,21 @@ export class ListEmployeesDto {
   @IsString()
   locationId?: string;
 
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  legalEntityId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  managerId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  role?: string;
+
   @ApiPropertyOptional({ enum: EmployeeStatus })
   @IsOptional()
   @IsEnum(EmployeeStatus)

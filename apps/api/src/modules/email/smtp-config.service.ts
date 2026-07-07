@@ -41,32 +41,64 @@ export class SmtpConfigService {
   async getActive(tenantId: string) {
     return this.prisma.emailProviderConfig.findFirst({
       where: { tenantId, isActive: true },
-      include: { smtpConfig: { select: { id: true, host: true, port: true, encryption: true, username: true, fromEmail: true, fromName: true, replyTo: true, bounceEmail: true, testRecipient: true } } },
+      include: {
+        smtpConfig: {
+          select: {
+            id: true,
+            host: true,
+            port: true,
+            encryption: true,
+            username: true,
+            fromEmail: true,
+            fromName: true,
+            replyTo: true,
+            bounceEmail: true,
+            testRecipient: true,
+          },
+        },
+      },
     });
   }
 
   async list(tenantId: string) {
     return this.prisma.emailProviderConfig.findMany({
       where: { tenantId },
-      include: { smtpConfig: { select: { id: true, host: true, port: true, encryption: true, username: true, fromEmail: true, fromName: true, replyTo: true } } },
+      include: {
+        smtpConfig: {
+          select: {
+            id: true,
+            host: true,
+            port: true,
+            encryption: true,
+            username: true,
+            fromEmail: true,
+            fromName: true,
+            replyTo: true,
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async create(tenantId: string, createdById: string, data: {
-    name: string;
-    host: string;
-    port: number;
-    encryption: SmtpEncryption;
-    username: string;
-    password: string;
-    fromEmail: string;
-    fromName: string;
-    replyTo?: string;
-    bounceEmail?: string;
-    testRecipient?: string;
-    dailySendingLimit?: number;
-  }) {
+  async create(
+    tenantId: string,
+    createdById: string,
+    data: {
+      name: string;
+      host: string;
+      port: number;
+      encryption: SmtpEncryption;
+      username: string;
+      password: string;
+      fromEmail: string;
+      fromName: string;
+      replyTo?: string;
+      bounceEmail?: string;
+      testRecipient?: string;
+      dailySendingLimit?: number;
+    },
+  ) {
     const provider = await this.prisma.emailProviderConfig.create({
       data: {
         tenantId,
@@ -98,12 +130,32 @@ export class SmtpConfigService {
     return provider;
   }
 
-  async update(tenantId: string, providerId: string, data: { name?: string; host?: string; port?: number; encryption?: SmtpEncryption; username?: string; password?: string; fromEmail?: string; fromName?: string; replyTo?: string; dailySendingLimit?: number }) {
-    const existing = await this.prisma.emailProviderConfig.findFirst({ where: { id: providerId, tenantId } });
+  async update(
+    tenantId: string,
+    providerId: string,
+    data: {
+      name?: string;
+      host?: string;
+      port?: number;
+      encryption?: SmtpEncryption;
+      username?: string;
+      password?: string;
+      fromEmail?: string;
+      fromName?: string;
+      replyTo?: string;
+      dailySendingLimit?: number;
+    },
+  ) {
+    const existing = await this.prisma.emailProviderConfig.findFirst({
+      where: { id: providerId, tenantId },
+    });
     if (!existing) throw new NotFoundException('SMTP config not found');
 
     if (data.name || data.dailySendingLimit !== undefined) {
-      await this.prisma.emailProviderConfig.update({ where: { id: providerId }, data: { name: data.name, dailySendingLimit: data.dailySendingLimit } });
+      await this.prisma.emailProviderConfig.update({
+        where: { id: providerId },
+        data: { name: data.name, dailySendingLimit: data.dailySendingLimit },
+      });
     }
 
     const smtpUpdate: Record<string, unknown> = {};
@@ -123,7 +175,11 @@ export class SmtpConfigService {
     return this.prisma.emailProviderConfig.findUnique({ where: { id: providerId } });
   }
 
-  async sendTest(tenantId: string, providerId: string, testedById: string): Promise<{ success: boolean; error?: string }> {
+  async sendTest(
+    tenantId: string,
+    providerId: string,
+    testedById: string,
+  ): Promise<{ success: boolean; error?: string }> {
     const provider = await this.prisma.emailProviderConfig.findFirst({
       where: { id: providerId, tenantId },
       include: { smtpConfig: true },
@@ -133,33 +189,74 @@ export class SmtpConfigService {
     const smtp = provider.smtpConfig;
     const password = this.decrypt(smtp.passwordEncrypted);
 
-    const smtpProvider = new SmtpProvider({ host: smtp.host, port: smtp.port, encryption: smtp.encryption, username: smtp.username, password, fromEmail: smtp.fromEmail, fromName: smtp.fromName, replyTo: smtp.replyTo ?? undefined });
+    const smtpProvider = new SmtpProvider({
+      host: smtp.host,
+      port: smtp.port,
+      encryption: smtp.encryption,
+      username: smtp.username,
+      password,
+      fromEmail: smtp.fromEmail,
+      fromName: smtp.fromName,
+      replyTo: smtp.replyTo ?? undefined,
+    });
 
     const recipient = smtp.testRecipient ?? smtp.fromEmail;
-    const result = await smtpProvider.sendEmail({ to: [recipient], subject: 'PeopleHub OS — SMTP Test', bodyHtml: '<p>This is a test email from PeopleHub OS. Your SMTP configuration is working correctly.</p>', fromEmail: smtp.fromEmail, fromName: smtp.fromName });
+    const result = await smtpProvider.sendEmail({
+      to: [recipient],
+      subject: 'PeopleHub OS — SMTP Test',
+      bodyHtml:
+        '<p>This is a test email from PeopleHub OS. Your SMTP configuration is working correctly.</p>',
+      fromEmail: smtp.fromEmail,
+      fromName: smtp.fromName,
+    });
 
     await this.prisma.emailTestLog.create({
-      data: { tenantId, providerId, recipient, success: result.success, error: result.error, testedById },
+      data: {
+        tenantId,
+        providerId,
+        recipient,
+        success: result.success,
+        error: result.error,
+        testedById,
+      },
     });
 
     return result;
   }
 
   async activate(tenantId: string, providerId: string) {
-    const provider = await this.prisma.emailProviderConfig.findFirst({ where: { id: providerId, tenantId } });
+    const provider = await this.prisma.emailProviderConfig.findFirst({
+      where: { id: providerId, tenantId },
+    });
     if (!provider) throw new NotFoundException('Provider not found');
 
     await this.prisma.$transaction([
-      this.prisma.emailProviderConfig.updateMany({ where: { tenantId, isActive: true }, data: { isActive: false } }),
-      this.prisma.emailProviderConfig.update({ where: { id: providerId }, data: { isActive: true } }),
+      this.prisma.emailProviderConfig.updateMany({
+        where: { tenantId, isActive: true },
+        data: { isActive: false },
+      }),
+      this.prisma.emailProviderConfig.update({
+        where: { id: providerId },
+        data: { isActive: true },
+      }),
     ]);
   }
 
   async deactivate(tenantId: string, providerId: string) {
-    await this.prisma.emailProviderConfig.updateMany({ where: { id: providerId, tenantId }, data: { isActive: false } });
+    await this.prisma.emailProviderConfig.updateMany({
+      where: { id: providerId, tenantId },
+      data: { isActive: false },
+    });
   }
 
-  async buildProvider(tenantId: string): Promise<{ provider: SmtpProvider; fromEmail: string; fromName: string; replyTo?: string } | null> {
+  async buildProvider(
+    tenantId: string,
+  ): Promise<{
+    provider: SmtpProvider;
+    fromEmail: string;
+    fromName: string;
+    replyTo?: string;
+  } | null> {
     const config = await this.prisma.emailProviderConfig.findFirst({
       where: { tenantId, isActive: true, providerType: 'SMTP' },
       include: { smtpConfig: true },
@@ -169,7 +266,15 @@ export class SmtpConfigService {
     const smtp = config.smtpConfig;
     const password = this.decrypt(smtp.passwordEncrypted);
     return {
-      provider: new SmtpProvider({ host: smtp.host, port: smtp.port, encryption: smtp.encryption, username: smtp.username, password, fromEmail: smtp.fromEmail, fromName: smtp.fromName }),
+      provider: new SmtpProvider({
+        host: smtp.host,
+        port: smtp.port,
+        encryption: smtp.encryption,
+        username: smtp.username,
+        password,
+        fromEmail: smtp.fromEmail,
+        fromName: smtp.fromName,
+      }),
       fromEmail: smtp.fromEmail,
       fromName: smtp.fromName,
       replyTo: smtp.replyTo ?? undefined,

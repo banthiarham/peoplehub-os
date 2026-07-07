@@ -1,20 +1,84 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
-import { Building2, Mail, MapPin, Phone, Users } from 'lucide-react';
+import {
+  Building2,
+  Download,
+  FileText,
+  Mail,
+  MapPin,
+  Phone,
+  Send,
+  Smartphone,
+  Users,
+} from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { EmployeeSendEmailDialog } from '@/components/forms/employee-send-email-dialog';
+import { PeopleAddDocumentDialog } from '@/components/forms/people-add-document-dialog';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+import { useToast } from '@/components/ui/toaster';
+
+interface DocumentRow {
+  id: string;
+  type: string;
+  name: string;
+  fileKey: string;
+  isVerified: boolean;
+  createdAt: string;
+}
+
+interface EmailLogRow {
+  id: string;
+  subject: string;
+  to: string[];
+  status: string;
+  sentAt: string | null;
+  createdAt: string;
+}
+
+interface DeviceRow {
+  deviceName: string | null;
+  platform: string | null;
+  registeredAt: string;
+  lastSeenAt: string;
+}
 
 export default function EmployeeProfilePage() {
   const { id } = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
+  const toast = useToast();
   const { data: e, isLoading } = useQuery({
     queryKey: ['employees', id],
     queryFn: () => api.get(`/employees/${id}`).then((r) => r.data),
+  });
+  const { data: documents } = useQuery<DocumentRow[]>({
+    queryKey: ['employees', id, 'documents'],
+    queryFn: () => api.get(`/employees/${id}/documents`).then((r) => r.data),
+    enabled: !!id,
+  });
+  const { data: device } = useQuery<DeviceRow | null>({
+    queryKey: ['employees', id, 'device'],
+    queryFn: () => api.get(`/attendance/device/${id}`).then((r) => r.data ?? null),
+    enabled: !!id,
+  });
+  const { data: emailHistory } = useQuery<EmailLogRow[]>({
+    queryKey: ['employees', id, 'email-history'],
+    queryFn: () => api.get(`/email/employee/${id}/history`).then((r) => r.data),
+    enabled: !!id,
+  });
+  const resetDevice = useMutation({
+    mutationFn: () => api.delete(`/attendance/device/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['employees', id, 'device'] });
+      toast('Device binding reset — their next punch registers a new device');
+    },
+    onError: () => toast('Could not reset device binding', 'error'),
   });
 
   if (isLoading || !e) {
@@ -59,6 +123,7 @@ export default function EmployeeProfilePage() {
               </span>
             </div>
           </div>
+          <EmployeeSendEmailDialog employeeId={id} employeeName={name} workEmail={e.workEmail} />
         </div>
       </Card>
 
@@ -70,14 +135,42 @@ export default function EmployeeProfilePage() {
             </CardHeader>
             <CardContent className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
               <Field label="Joined" value={formatDate(e.joiningDate)} />
+              <Field label="Confirmation" value={formatDate(e.confirmationDate)} />
+              <Field label="Probation end" value={formatDate(e.probationEndDate)} />
               <Field label="Employment type" value={e.employmentType?.replace(/_/g, ' ')} />
               <Field label="Work mode" value={e.workMode} />
+              <Field label="Notice period" value={e.noticePeriodDays ? `${e.noticePeriodDays} days` : '—'} />
               <Field
                 label="Reporting manager"
                 value={e.manager ? `${e.manager.firstName} ${e.manager.lastName}` : '—'}
               />
+              <Field
+                label="Dotted-line manager"
+                value={e.dottedManager ? `${e.dottedManager.firstName} ${e.dottedManager.lastName}` : '—'}
+              />
+              <Field label="Legal entity" value={e.legalEntity?.name ?? '—'} />
+              <Field label="Cost center" value={e.costCenter?.name ?? '—'} />
+              <Field label="Business unit" value={e.businessUnit?.name ?? '—'} />
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Personal, statutory and tax</CardTitle>
+            </CardHeader>
+            <CardContent className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+              <Field label="Preferred name" value={e.preferredName ?? '—'} />
+              <Field label="Personal email" value={e.personalEmail ?? '—'} />
+              <Field label="Date of birth" value={formatDate(e.dateOfBirth)} />
+              <Field label="Gender" value={e.gender ?? '—'} />
+              <Field label="Marital status" value={e.maritalStatus ?? '—'} />
+              <Field label="Blood group" value={e.bloodGroup ?? '—'} />
               <Field label="PAN" value={e.pan ?? '—'} />
+              <Field label="Aadhaar" value={e.aadhaar ?? '—'} />
+              <Field label="UAN" value={e.uan ?? '—'} />
+              <Field label="ESIC" value={e.esicNumber ?? '—'} />
               <Field label="Tax regime" value={e.taxRegime} />
+              <Field label="Bank details" value={summarizeObject(e.bankDetails)} />
             </CardContent>
           </Card>
 
@@ -89,7 +182,12 @@ export default function EmployeeProfilePage() {
               {e.lifecycleEvents?.length ? (
                 <ol className="relative space-y-4 border-l border-line pl-5">
                   {e.lifecycleEvents.map(
-                    (ev: { id: string; eventType: string; effectiveDate: string; remarks: string | null }) => (
+                    (ev: {
+                      id: string;
+                      eventType: string;
+                      effectiveDate: string;
+                      remarks: string | null;
+                    }) => (
                       <li key={ev.id} className="relative">
                         <span className="absolute -left-[26px] top-1 h-2.5 w-2.5 rounded-full bg-primary-500" />
                         <p className="text-sm font-medium">{ev.eventType.replace(/_/g, ' ')}</p>
@@ -108,33 +206,156 @@ export default function EmployeeProfilePage() {
           </Card>
         </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Users className="h-4 w-4 text-primary-600" /> Direct reports (
-              {e.directReports?.length ?? 0})
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {e.directReports?.length ? (
-              e.directReports.map(
-                (r: { id: string; firstName: string; lastName: string; designation: { name: string } | null }) => (
-                  <div key={r.id} className="flex items-center gap-3">
-                    <Avatar name={`${r.firstName} ${r.lastName}`} size="sm" />
-                    <div>
-                      <p className="text-sm font-medium">
-                        {r.firstName} {r.lastName}
+        <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Users className="h-4 w-4 text-primary-600" /> Direct reports (
+                {e.directReports?.length ?? 0})
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {e.directReports?.length ? (
+                e.directReports.map(
+                  (r: {
+                    id: string;
+                    firstName: string;
+                    lastName: string;
+                    designation: { name: string } | null;
+                  }) => (
+                    <div key={r.id} className="flex items-center gap-3">
+                      <Avatar name={`${r.firstName} ${r.lastName}`} size="sm" />
+                      <div>
+                        <p className="text-sm font-medium">
+                          {r.firstName} {r.lastName}
+                        </p>
+                        <p className="text-xs text-ink-muted">{r.designation?.name ?? '—'}</p>
+                      </div>
+                    </div>
+                  ),
+                )
+              ) : (
+                <p className="text-sm text-ink-muted">No direct reports.</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="flex-row items-center justify-between">
+              <CardTitle className="flex items-center gap-2">
+                <FileText className="h-4 w-4 text-primary-600" /> Documents (
+                {documents?.length ?? 0})
+              </CardTitle>
+              <PeopleAddDocumentDialog employeeId={id} />
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {documents?.length ? (
+                documents.map((d) => (
+                  <div key={d.id} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{d.name}</p>
+                      <p className="text-xs text-ink-muted">
+                        {d.type} · {formatDate(d.createdAt)}
                       </p>
-                      <p className="text-xs text-ink-muted">{r.designation?.name ?? '—'}</p>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Badge variant={d.isVerified ? 'success' : 'outline'}>
+                        {d.isVerified ? 'Verified' : 'Unverified'}
+                      </Badge>
+                      {d.fileKey.includes('/') && (
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7"
+                          aria-label={`Download ${d.name}`}
+                          onClick={async () => {
+                            try {
+                              const { url } = await api
+                                .get('/files/download-url', { params: { key: d.fileKey } })
+                                .then((r) => r.data);
+                              window.open(url, '_blank');
+                            } catch {
+                              toast('Download failed — file not found in storage', 'error');
+                            }
+                          }}
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                     </div>
                   </div>
-                ),
-              )
-            ) : (
-              <p className="text-sm text-ink-muted">No direct reports.</p>
-            )}
-          </CardContent>
-        </Card>
+                ))
+              ) : (
+                <p className="text-sm text-ink-muted">No documents on file.</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Smartphone className="h-4 w-4 text-primary-600" /> Punch device
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {device ? (
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-sm font-medium">
+                      {device.deviceName ?? 'Registered device'}
+                    </p>
+                    <p className="text-xs text-ink-muted">
+                      Registered {formatDate(device.registeredAt)} · last punch{' '}
+                      {formatDate(device.lastSeenAt)}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-danger"
+                    disabled={resetDevice.isPending}
+                    onClick={() => resetDevice.mutate()}
+                  >
+                    {resetDevice.isPending ? 'Resetting…' : 'Reset device binding'}
+                  </Button>
+                  <p className="text-[11px] text-ink-faint">
+                    Attendance punches only work from this device. Reset if they changed phones —
+                    their next punch registers the new one.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-sm text-ink-muted">
+                  No punch device registered yet — their first check-in binds one.
+                </p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Send className="h-4 w-4 text-primary-600" /> Emails ({emailHistory?.length ?? 0})
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {emailHistory?.length ? (
+                emailHistory.map((m) => (
+                  <div key={m.id} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{m.subject || '(no subject)'}</p>
+                      <p className="text-xs text-ink-muted">
+                        {formatDate(m.sentAt ?? m.createdAt)}
+                      </p>
+                    </div>
+                    <Badge variant={statusVariant(m.status)}>{m.status}</Badge>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-ink-muted">No emails sent yet.</p>
+              )}
+            </CardContent>
+          </Card>
+        </div>
       </div>
     </div>
   );
@@ -147,4 +368,12 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
       <p className="mt-0.5 font-medium">{value}</p>
     </div>
   );
+}
+
+function summarizeObject(value: unknown) {
+  if (!value || typeof value !== 'object') return '—';
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .slice(0, 3);
+  return entries.length ? entries.map(([key, v]) => `${key}: ${String(v)}`).join(' · ') : '—';
 }

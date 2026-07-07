@@ -42,3 +42,39 @@ export class UpdateWebhookDto {
   @IsUrl({ require_tld: false })
   url?: string;
 }
+
+export class CreateOAuthClientDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @ApiProperty({ type: [String], example: ['employees.read', 'attendance.read'] })
+  @IsArray()
+  @IsString({ each: true })
+  scopes!: string[];
+
+  @ApiProperty({ type: [String], example: ['https://app.example.com/oauth/callback'] })
+  @IsArray()
+  @IsString({ each: true })
+  redirectUris!: string[];
+}
+
+export class UpdateOAuthClientDto {
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  scopes?: string[];
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  redirectUris?: string[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
