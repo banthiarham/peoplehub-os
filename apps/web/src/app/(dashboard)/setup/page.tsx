@@ -1,14 +1,19 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
+  Building2,
   CheckCircle2,
   Download,
+  ExternalLink,
   FileUp,
   ListChecks,
   Plus,
+  Save,
   ShieldAlert,
   Trash2,
   UploadCloud,
@@ -88,6 +93,75 @@ type ImportPreview = {
 };
 
 type ImportType = 'employees' | 'salary';
+type SetupStepKey = 'company' | 'people' | 'salary' | 'readiness';
+
+type OrganizationSummary = {
+  id: string;
+  name: string;
+  legalName?: string | null;
+  country?: string | null;
+  industry?: string | null;
+  companySize?: string | null;
+  timezone?: string | null;
+  currency?: string | null;
+};
+
+type LegalEntity = {
+  id: string;
+  name: string;
+  legalName?: string | null;
+  pan?: string | null;
+  tan?: string | null;
+  gstin?: string | null;
+  pfRegistrationNumber?: string | null;
+  esiRegistrationNumber?: string | null;
+  ptRegistrationNumber?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  country?: string | null;
+};
+
+type LocationRecord = {
+  id: string;
+  name: string;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  country?: string | null;
+  pincode?: string | null;
+  timezone?: string | null;
+};
+
+type OrgUnitRecord = {
+  id: string;
+  name: string;
+  code?: string | null;
+  isActive?: boolean;
+};
+
+type CompanySetupForm = {
+  companyName: string;
+  legalName: string;
+  industry: string;
+  companySize: string;
+  country: string;
+  currency: string;
+  timezone: string;
+  legalEntityName: string;
+  pan: string;
+  tan: string;
+  gstin: string;
+  pfRegistrationNumber: string;
+  esiRegistrationNumber: string;
+  ptRegistrationNumber: string;
+  address: string;
+  city: string;
+  state: string;
+  pincode: string;
+  locationName: string;
+  departmentsText: string;
+};
 
 type EmployeeRow = {
   employeeCode: string;
@@ -145,6 +219,29 @@ const emptySalaryRow: SalaryRow = {
   effectiveFrom: '',
 };
 
+const emptyCompanySetupForm: CompanySetupForm = {
+  companyName: '',
+  legalName: '',
+  industry: '',
+  companySize: '',
+  country: 'IN',
+  currency: 'INR',
+  timezone: 'Asia/Kolkata',
+  legalEntityName: '',
+  pan: '',
+  tan: '',
+  gstin: '',
+  pfRegistrationNumber: '',
+  esiRegistrationNumber: '',
+  ptRegistrationNumber: '',
+  address: '',
+  city: '',
+  state: '',
+  pincode: '',
+  locationName: '',
+  departmentsText: '',
+};
+
 const sampleEmployeeRows: EmployeeRow[] = [
   {
     employeeCode: 'PH-1001',
@@ -154,8 +251,8 @@ const sampleEmployeeRows: EmployeeRow[] = [
     joiningDate: '2026-07-01',
     department: 'Engineering',
     designation: 'Software Engineer',
-    location: 'Bangalore Office',
-    legalEntity: 'Demo Corp India Pvt Ltd',
+    location: 'Primary Office',
+    legalEntity: 'Primary Legal Entity',
     managerEmployeeCode: 'PH-1000',
     employmentType: 'FULL_TIME',
     pan: 'ABCDE1234F',
@@ -177,11 +274,11 @@ const sampleSalaryRows: SalaryRow[] = [
   },
 ];
 
-const flowSteps = [
-  { label: 'Company setup', detail: 'Legal entity, locations, departments' },
-  { label: 'People import', detail: 'Employees, managers, bank and IDs' },
-  { label: 'Salary import', detail: 'Structures, CTC, effective dates' },
-  { label: 'Payroll readiness', detail: 'Resolve blockers before dry run' },
+const setupSteps: Array<{ key: SetupStepKey; label: string; detail: string; sectionKey?: string }> = [
+  { key: 'company', label: 'Company setup', detail: 'Confirm legal entity, location, departments', sectionKey: 'company' },
+  { key: 'people', label: 'People import', detail: 'Add employees, managers, bank and IDs', sectionKey: 'hr' },
+  { key: 'salary', label: 'Salary import', detail: 'Assign structures, CTC, effective dates', sectionKey: 'payroll' },
+  { key: 'readiness', label: 'Payroll readiness', detail: 'Fix blockers or continue to dry run' },
 ];
 
 const fallbackEmployeeTemplate: TemplateResponse = {
@@ -225,6 +322,18 @@ function badgeForStatus(status: string) {
 
 function statusLabel(status: string) {
   return status === 'blocked' ? 'Blocked' : status === 'warning' ? 'Needs attention' : 'Ready';
+}
+
+function errorMessage(err: any, fallback: string) {
+  const message = err?.response?.data?.message ?? err?.message;
+  return Array.isArray(message) ? message.join(', ') : message ?? fallback;
+}
+
+function departmentNames(text: string) {
+  return text
+    .split(/\n|,/)
+    .map((name) => name.trim())
+    .filter(Boolean);
 }
 
 function toCsv(template: TemplateResponse) {
@@ -284,6 +393,18 @@ function salaryFromTemplate(row: Record<string, unknown>): SalaryRow {
   return {
     ...emptySalaryRow,
     ...Object.fromEntries(Object.entries(row).map(([key, value]) => [key, String(value ?? '')])),
+  };
+}
+
+function applyCompanyDefaults(row: EmployeeRow, form: CompanySetupForm): EmployeeRow {
+  const departments = departmentNames(form.departmentsText);
+  return {
+    ...row,
+    department: row.department === sampleEmployeeRows[0].department ? departments[0] ?? row.department : row.department,
+    location: row.location === sampleEmployeeRows[0].location ? form.locationName || row.location : row.location,
+    legalEntity: row.legalEntity === sampleEmployeeRows[0].legalEntity
+      ? form.legalEntityName || form.legalName || form.companyName || row.legalEntity
+      : row.legalEntity,
   };
 }
 
@@ -364,15 +485,39 @@ function localSalaryPreviewRow(row: SalaryRow, index: number, rows: SalaryRow[])
 
 export default function SetupPage() {
   const queryClient = useQueryClient();
+  const [activeStep, setActiveStep] = useState<SetupStepKey>('company');
   const [importType, setImportType] = useState<ImportType>('employees');
   const [employeeRows, setEmployeeRows] = useState<EmployeeRow[]>(sampleEmployeeRows);
   const [salaryRows, setSalaryRows] = useState<SalaryRow[]>(sampleSalaryRows);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [error, setError] = useState('');
+  const [companyError, setCompanyError] = useState('');
+  const [companyTouched, setCompanyTouched] = useState(false);
+  const [companyForm, setCompanyForm] = useState<CompanySetupForm>(emptyCompanySetupForm);
 
   const readinessQuery = useQuery<Readiness>({
     queryKey: ['setup', 'readiness'],
     queryFn: () => api.get('/setup/readiness').then((r) => r.data),
+    retry: 1,
+  });
+  const organizationQuery = useQuery<OrganizationSummary>({
+    queryKey: ['organization'],
+    queryFn: () => api.get('/organization').then((r) => r.data),
+    retry: 1,
+  });
+  const legalEntitiesQuery = useQuery<LegalEntity[]>({
+    queryKey: ['legal-entities'],
+    queryFn: () => api.get('/legal-entities').then((r) => r.data),
+    retry: 1,
+  });
+  const locationsQuery = useQuery<LocationRecord[]>({
+    queryKey: ['locations'],
+    queryFn: () => api.get('/locations').then((r) => r.data),
+    retry: 1,
+  });
+  const departmentsQuery = useQuery<OrgUnitRecord[]>({
+    queryKey: ['departments'],
+    queryFn: () => api.get('/departments').then((r) => r.data),
     retry: 1,
   });
   const employeeTemplate = useQuery<TemplateResponse>({
@@ -396,6 +541,129 @@ export default function SetupPage() {
     () => readiness?.sections.flatMap((section) => section.issues.map((issue) => ({ ...issue, section: section.label }))) ?? [],
     [readiness],
   );
+  const firstLegalEntity = legalEntitiesQuery.data?.[0];
+  const firstLocation = locationsQuery.data?.[0];
+  const companySection = readiness?.sections.find((section) => section.key === 'company');
+
+  useEffect(() => {
+    if (companyTouched) return;
+    const organization = organizationQuery.data;
+    const legalEntity = legalEntitiesQuery.data?.[0];
+    const location = locationsQuery.data?.[0];
+    const departments = departmentsQuery.data ?? [];
+    if (!organization && !legalEntity && !location && departments.length === 0) return;
+
+    setCompanyForm({
+      companyName: organization?.name ?? '',
+      legalName: organization?.legalName ?? legalEntity?.legalName ?? '',
+      industry: organization?.industry ?? '',
+      companySize: organization?.companySize ?? '',
+      country: organization?.country ?? legalEntity?.country ?? location?.country ?? 'IN',
+      currency: organization?.currency ?? 'INR',
+      timezone: organization?.timezone ?? location?.timezone ?? 'Asia/Kolkata',
+      legalEntityName: legalEntity?.name ?? organization?.legalName ?? organization?.name ?? '',
+      pan: legalEntity?.pan ?? '',
+      tan: legalEntity?.tan ?? '',
+      gstin: legalEntity?.gstin ?? '',
+      pfRegistrationNumber: legalEntity?.pfRegistrationNumber ?? '',
+      esiRegistrationNumber: legalEntity?.esiRegistrationNumber ?? '',
+      ptRegistrationNumber: legalEntity?.ptRegistrationNumber ?? '',
+      address: legalEntity?.address ?? location?.address ?? '',
+      city: legalEntity?.city ?? location?.city ?? '',
+      state: legalEntity?.state ?? location?.state ?? '',
+      pincode: location?.pincode ?? '',
+      locationName: location?.name ?? '',
+      departmentsText: departments.map((department) => department.name).join('\n'),
+    });
+  }, [companyTouched, departmentsQuery.data, legalEntitiesQuery.data, locationsQuery.data, organizationQuery.data]);
+
+  useEffect(() => {
+    if (!companyForm.companyName && !companyForm.legalEntityName && !companyForm.locationName) return;
+    setEmployeeRows((rows) => rows.map((row) => applyCompanyDefaults(row, companyForm)));
+  }, [
+    companyForm.companyName,
+    companyForm.departmentsText,
+    companyForm.legalEntityName,
+    companyForm.legalName,
+    companyForm.locationName,
+  ]);
+
+  const saveCompanyMutation = useMutation({
+    mutationFn: async () => {
+      const companyName = companyForm.companyName.trim();
+      if (!companyName) throw new Error('Company name is required');
+
+      const legalEntityName = companyForm.legalEntityName.trim() || companyForm.legalName.trim() || companyName;
+      const locationName = companyForm.locationName.trim() || companyForm.city.trim() || 'Primary office';
+      const country = companyForm.country.trim() || 'IN';
+      const timezone = companyForm.timezone.trim() || 'Asia/Kolkata';
+
+      await api.patch('/organization', {
+        name: companyName,
+        legalName: companyForm.legalName.trim() || undefined,
+        industry: companyForm.industry.trim() || undefined,
+        companySize: companyForm.companySize.trim() || undefined,
+        country,
+        currency: companyForm.currency.trim() || 'INR',
+        timezone,
+      });
+
+      const legalEntityBody = {
+        name: legalEntityName,
+        legalName: companyForm.legalName.trim() || legalEntityName,
+        pan: companyForm.pan.trim() || undefined,
+        tan: companyForm.tan.trim() || undefined,
+        gstin: companyForm.gstin.trim() || undefined,
+        pfRegistrationNumber: companyForm.pfRegistrationNumber.trim() || undefined,
+        esiRegistrationNumber: companyForm.esiRegistrationNumber.trim() || undefined,
+        ptRegistrationNumber: companyForm.ptRegistrationNumber.trim() || undefined,
+        address: companyForm.address.trim() || undefined,
+        city: companyForm.city.trim() || undefined,
+        state: companyForm.state.trim() || undefined,
+        country,
+      };
+      if (firstLegalEntity?.id) await api.patch(`/legal-entities/${firstLegalEntity.id}`, legalEntityBody);
+      else await api.post('/legal-entities', legalEntityBody);
+
+      const locationBody = {
+        name: locationName,
+        address: companyForm.address.trim() || undefined,
+        city: companyForm.city.trim() || undefined,
+        state: companyForm.state.trim() || undefined,
+        country,
+        pincode: companyForm.pincode.trim() || undefined,
+        timezone,
+        isActive: true,
+      };
+      if (firstLocation?.id) await api.patch(`/locations/${firstLocation.id}`, locationBody);
+      else await api.post('/locations', locationBody);
+
+      const existingDepartments = new Set(
+        (departmentsQuery.data ?? []).map((department) => department.name.trim().toLowerCase()),
+      );
+      for (const name of departmentNames(companyForm.departmentsText)) {
+        if (!existingDepartments.has(name.toLowerCase())) {
+          await api.post('/departments', { name, isActive: true });
+        }
+      }
+    },
+    onSuccess: async () => {
+      setCompanyError('');
+      setCompanyTouched(false);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['organization'] }),
+        queryClient.invalidateQueries({ queryKey: ['legal-entities'] }),
+        queryClient.invalidateQueries({ queryKey: ['locations'] }),
+        queryClient.invalidateQueries({ queryKey: ['departments'] }),
+        queryClient.invalidateQueries({ queryKey: ['setup', 'readiness'] }),
+      ]);
+      setActiveStep('people');
+      setImportType('employees');
+    },
+    onError: (err: any) => {
+      setCompanyError(errorMessage(err, 'Company setup could not be saved'));
+    },
+  });
 
   const previewMutation = useMutation({
     mutationFn: async () => {
@@ -436,7 +704,7 @@ export default function SetupPage() {
     setPreview(null);
     setError('');
     if (importType === 'employees') {
-      setEmployeeRows(currentTemplate.sampleRows.map(employeeFromTemplate));
+      setEmployeeRows(currentTemplate.sampleRows.map(employeeFromTemplate).map((row) => applyCompanyDefaults(row, companyForm)));
     } else {
       setSalaryRows(currentTemplate.sampleRows.map(salaryFromTemplate));
     }
@@ -448,28 +716,87 @@ export default function SetupPage() {
     else setSalaryRows((rows) => [...rows, { ...emptySalaryRow }]);
   }
 
+  function openStep(step: SetupStepKey) {
+    setActiveStep(step);
+    if (step === 'people') setImportType('employees');
+    if (step === 'salary') setImportType('salary');
+    setPreview(null);
+    setError('');
+  }
+
+  function updateCompanyForm(patch: Partial<CompanySetupForm>) {
+    setCompanyTouched(true);
+    setCompanyForm((current) => ({ ...current, ...patch }));
+  }
+
+  function actionForIssue(issue: ReadinessIssue & { section: string }) {
+    if (
+      [
+        'missing_legal_entities',
+        'missing_locations',
+        'missing_departments',
+        'missing_entity_tax_ids',
+      ].includes(issue.code)
+    ) {
+      return { label: 'Open company setup', onClick: () => openStep('company') };
+    }
+    if (
+      [
+        'missing_employees',
+        'duplicate_employee_codes',
+        'duplicate_work_emails',
+        'employees_missing_legal_entity',
+        'employees_missing_bank',
+        'employees_missing_pan',
+        'employees_missing_uan',
+      ].includes(issue.code)
+    ) {
+      return { label: 'Open people import', onClick: () => openStep('people') };
+    }
+    if (['missing_salary_structures', 'employees_missing_salary'].includes(issue.code)) {
+      return { label: 'Open salary import', onClick: () => openStep('salary') };
+    }
+    if (['missing_leave_types', 'missing_leave_policies'].includes(issue.code)) {
+      return { label: 'Open leave setup', onClick: () => { window.location.href = '/leave'; } };
+    }
+    if (['missing_shifts', 'missing_attendance_capture'].includes(issue.code)) {
+      return { label: 'Open attendance setup', onClick: () => { window.location.href = '/attendance'; } };
+    }
+    return { label: 'Open payroll', onClick: () => { window.location.href = '/payroll'; } };
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Implementation Center"
-        description="Guided setup, migration validation, and payroll readiness for a new tenant"
+        title="Client onboarding"
+        description="Create the tenant, confirm company records, import people and salaries, then clear payroll blockers"
       />
 
+      <div className="rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+        Signup details now prefill this flow. Confirm what is known, skip what is not ready, and return to the exact step that has a blocker.
+      </div>
+
       <div className="grid gap-3 lg:grid-cols-4">
-        {flowSteps.map((step, index) => {
-          const active = importType === 'employees' ? index <= 1 : index <= 2;
+        {setupSteps.map((step, index) => {
+          const section = step.sectionKey ? readiness?.sections.find((item) => item.key === step.sectionKey) : undefined;
+          const active = activeStep === step.key;
           return (
-            <div key={step.label} className="rounded-lg border border-line bg-white p-4 shadow-sm">
+            <button
+              key={step.key}
+              type="button"
+              onClick={() => openStep(step.key)}
+              className={`rounded-lg border p-4 text-left shadow-sm transition ${active ? 'border-primary-700 bg-white ring-2 ring-primary-100' : 'border-line bg-white hover:border-primary-200'}`}
+            >
               <div className="flex items-center gap-3">
-                <span className={`flex h-8 w-8 items-center justify-center rounded-lg text-sm font-semibold ${active ? 'bg-primary-700 text-white' : 'bg-slate-100 text-ink-muted'}`}>
-                  {index + 1}
+                <span className={`flex h-8 w-8 items-center justify-center rounded-lg text-sm font-semibold ${active ? 'bg-primary-700 text-white' : section?.status === 'ready' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-ink-muted'}`}>
+                  {section?.status === 'ready' ? <CheckCircle2 className="h-4 w-4" /> : index + 1}
                 </span>
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-ink">{step.label}</p>
                   <p className="truncate text-xs text-ink-muted">{step.detail}</p>
                 </div>
               </div>
-            </div>
+            </button>
           );
         })}
       </div>
@@ -479,85 +806,31 @@ export default function SetupPage() {
           {[...Array(4)].map((_, index) => <Skeleton key={index} className="h-28" />)}
         </div>
       ) : readiness ? (
-        <>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <StatCard label="Setup readiness" value={`${readiness.score}%`} icon={ListChecks}>
-              <div className="mt-3 space-y-2">
-                <div className="flex items-center justify-between text-xs text-ink-muted">
-                  <span>{statusLabel(readiness.status)}</span>
-                  <Badge variant={badgeForStatus(readiness.status) as any}>{readiness.status}</Badge>
-                </div>
-                <Progress value={readiness.score} />
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <StatCard label="Setup readiness" value={`${readiness.score}%`} icon={ListChecks}>
+            <div className="mt-3 space-y-2">
+              <div className="flex items-center justify-between text-xs text-ink-muted">
+                <span>{statusLabel(readiness.status)}</span>
+                <Badge variant={badgeForStatus(readiness.status) as any}>{readiness.status}</Badge>
               </div>
-            </StatCard>
-            <StatCard label="Active employees" value={readiness.totals.employees} icon={CheckCircle2}>
-              <p className="mt-2 text-xs text-ink-muted">{readiness.totals.salaryStructures} salary structures configured</p>
-            </StatCard>
-            <StatCard label="Critical blockers" value={readiness.totals.criticalIssues} icon={ShieldAlert}>
-              <p className="mt-2 text-xs text-ink-muted">Payroll lock should stay blocked until these are fixed</p>
-            </StatCard>
-            <StatCard label="Warnings" value={readiness.totals.warnings} icon={AlertTriangle}>
-              <p className="mt-2 text-xs text-ink-muted">Warnings need review but can be overridden by policy</p>
-            </StatCard>
-          </div>
-
-          <div className="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
-            <Card>
-              <CardHeader>
-                <CardTitle>Readiness checklist</CardTitle>
-                <CardDescription>Module gates that tell the admin what to fix next.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="grid gap-3 md:grid-cols-2">
-                  {readiness.sections.map((section) => (
-                    <div key={section.key} className="rounded-lg border border-line p-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-semibold text-ink">{section.label}</p>
-                          <p className="text-xs text-ink-muted">{section.completed} of {section.total} checks complete</p>
-                        </div>
-                        <Badge variant={badgeForStatus(section.status) as any}>{section.status}</Badge>
-                      </div>
-                      <div className="mt-3"><Progress value={section.score} /></div>
-                      {section.issues.length > 0 && (
-                        <p className="mt-2 text-xs text-ink-muted">{section.issues[0]?.message}</p>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Payroll blockers</CardTitle>
-                <CardDescription>Critical setup issues before the first dry run.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                {issueList.length === 0 ? (
-                  <EmptyState icon={CheckCircle2} title="No blockers" description="This tenant is ready for the next payroll dry run." />
-                ) : (
-                  <div className="space-y-3">
-                    {issueList.slice(0, 8).map((issue) => (
-                      <div key={`${issue.section}-${issue.code}`} className="rounded-lg border border-line p-3">
-                        <div className="flex items-center justify-between gap-3">
-                          <p className="text-sm font-semibold text-ink">{issue.section}</p>
-                          <Badge variant={issue.severity === 'critical' ? 'destructive' : 'warning'}>{issue.severity}</Badge>
-                        </div>
-                        <p className="mt-1 text-sm text-ink-muted">{issue.message}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-        </>
+              <Progress value={readiness.score} />
+            </div>
+          </StatCard>
+          <StatCard label="Active employees" value={readiness.totals.employees} icon={CheckCircle2}>
+            <p className="mt-2 text-xs text-ink-muted">{readiness.totals.salaryStructures} salary structures configured</p>
+          </StatCard>
+          <StatCard label="Critical blockers" value={readiness.totals.criticalIssues} icon={ShieldAlert}>
+            <p className="mt-2 text-xs text-ink-muted">Fix these before locking payroll</p>
+          </StatCard>
+          <StatCard label="Warnings" value={readiness.totals.warnings} icon={AlertTriangle}>
+            <p className="mt-2 text-xs text-ink-muted">Review before first live run</p>
+          </StatCard>
+        </div>
       ) : (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <div>
             <p className="font-semibold">Readiness needs the API and database.</p>
-            <p className="mt-1">You can still prepare rows and run browser validation below. Start the API to see real blockers and commit imports.</p>
+            <p className="mt-1">You can still prepare rows and run browser validation. Start the API to see real blockers and commit imports.</p>
           </div>
           <Button variant="outline" onClick={() => readinessQuery.refetch()} disabled={readinessQuery.isFetching}>
             Retry readiness
@@ -565,76 +838,246 @@ export default function SetupPage() {
         </div>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Import workspace</CardTitle>
-          <CardDescription>Fill the rows below, preview validation, then commit only when the file is clean.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="inline-flex rounded-lg border border-line bg-white p-1">
-              {(['employees', 'salary'] as ImportType[]).map((type) => (
-                <button
-                  key={type}
-                  type="button"
-                  onClick={() => {
-                    setImportType(type);
-                    setPreview(null);
-                    setError('');
-                  }}
-                  className={`rounded-md px-3 py-1.5 text-sm font-semibold ${importType === type ? 'bg-primary-700 text-white' : 'text-ink-muted hover:bg-canvas'}`}
-                >
-                  {type === 'employees' ? 'Employees' : 'Salary'}
-                </button>
-              ))}
+      {activeStep === 'company' && (
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <CardTitle>Company setup</CardTitle>
+                <CardDescription>These fields are created from signup and can be corrected before importing employees.</CardDescription>
+              </div>
+              {companySection && <Badge variant={badgeForStatus(companySection.status) as any}>{companySection.completed} of {companySection.total} ready</Badge>}
             </div>
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={() => downloadTemplate(currentTemplate)}>
-                <Download className="h-4 w-4" /> CSV template
-              </Button>
-              <Button variant="outline" onClick={loadSampleRows}>
-                <FileUp className="h-4 w-4" /> Load sample
-              </Button>
-              <Button variant="outline" onClick={addRow}>
-                <Plus className="h-4 w-4" /> Add row
-              </Button>
-            </div>
-          </div>
+          </CardHeader>
+          <CardContent className="space-y-5">
+            {organizationQuery.isLoading || legalEntitiesQuery.isLoading || locationsQuery.isLoading || departmentsQuery.isLoading ? (
+              <div className="grid gap-3 md:grid-cols-3">
+                {[...Array(6)].map((_, index) => <Skeleton key={index} className="h-10" />)}
+              </div>
+            ) : (
+              <>
+                <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+                  <div className="space-y-4">
+                    <div>
+                      <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-ink">
+                        <Building2 className="h-4 w-4 text-primary-700" /> Company profile
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <Input placeholder="Company name" value={companyForm.companyName} onChange={(e) => updateCompanyForm({ companyName: e.target.value })} />
+                        <Input placeholder="Legal name" value={companyForm.legalName} onChange={(e) => updateCompanyForm({ legalName: e.target.value })} />
+                        <Input placeholder="Industry" value={companyForm.industry} onChange={(e) => updateCompanyForm({ industry: e.target.value })} />
+                        <Select value={companyForm.companySize} onChange={(e) => updateCompanyForm({ companySize: e.target.value })}>
+                          <option value="">Company size</option>
+                          <option value="1-50">1-50</option>
+                          <option value="51-200">51-200</option>
+                          <option value="201-500">201-500</option>
+                          <option value="501-2000">501-2000</option>
+                          <option value="2000+">2000+</option>
+                        </Select>
+                        <Input placeholder="Country code" value={companyForm.country} onChange={(e) => updateCompanyForm({ country: e.target.value.toUpperCase() })} />
+                        <div className="grid grid-cols-2 gap-3">
+                          <Input placeholder="Currency" value={companyForm.currency} onChange={(e) => updateCompanyForm({ currency: e.target.value.toUpperCase() })} />
+                          <Input placeholder="Timezone" value={companyForm.timezone} onChange={(e) => updateCompanyForm({ timezone: e.target.value })} />
+                        </div>
+                      </div>
+                    </div>
 
-          {importType === 'employees' ? (
-            <EmployeeRows rows={employeeRows} setRows={setEmployeeRows} onEdit={() => setPreview(null)} />
-          ) : (
-            <SalaryRows rows={salaryRows} setRows={setSalaryRows} onEdit={() => setPreview(null)} />
-          )}
+                    <div>
+                      <p className="mb-3 text-sm font-semibold text-ink">Legal entity and statutory IDs</p>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <Input placeholder="Legal entity name" value={companyForm.legalEntityName} onChange={(e) => updateCompanyForm({ legalEntityName: e.target.value })} />
+                        <Input placeholder="PAN" value={companyForm.pan} onChange={(e) => updateCompanyForm({ pan: e.target.value.toUpperCase() })} />
+                        <Input placeholder="TAN" value={companyForm.tan} onChange={(e) => updateCompanyForm({ tan: e.target.value.toUpperCase() })} />
+                        <Input placeholder="GSTIN" value={companyForm.gstin} onChange={(e) => updateCompanyForm({ gstin: e.target.value.toUpperCase() })} />
+                        <Input placeholder="PF registration number" value={companyForm.pfRegistrationNumber} onChange={(e) => updateCompanyForm({ pfRegistrationNumber: e.target.value.toUpperCase() })} />
+                        <Input placeholder="ESI registration number" value={companyForm.esiRegistrationNumber} onChange={(e) => updateCompanyForm({ esiRegistrationNumber: e.target.value.toUpperCase() })} />
+                        <Input placeholder="PT registration number" value={companyForm.ptRegistrationNumber} onChange={(e) => updateCompanyForm({ ptRegistrationNumber: e.target.value.toUpperCase() })} />
+                      </div>
+                    </div>
+                  </div>
 
-          {error && (
-            <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-              {error}
-            </div>
-          )}
+                  <div className="space-y-4">
+                    <div>
+                      <p className="mb-3 text-sm font-semibold text-ink">Primary office</p>
+                      <div className="grid gap-3">
+                        <Input placeholder="Location name" value={companyForm.locationName} onChange={(e) => updateCompanyForm({ locationName: e.target.value })} />
+                        <Input placeholder="Address" value={companyForm.address} onChange={(e) => updateCompanyForm({ address: e.target.value })} />
+                        <div className="grid grid-cols-2 gap-3">
+                          <Input placeholder="City" value={companyForm.city} onChange={(e) => updateCompanyForm({ city: e.target.value })} />
+                          <Input placeholder="State" value={companyForm.state} onChange={(e) => updateCompanyForm({ state: e.target.value })} />
+                        </div>
+                        <Input placeholder="Pincode" value={companyForm.pincode} onChange={(e) => updateCompanyForm({ pincode: e.target.value })} />
+                      </div>
+                    </div>
+                    <div>
+                      <p className="mb-3 text-sm font-semibold text-ink">Departments</p>
+                      <textarea
+                        className="min-h-36 w-full rounded-2xl border border-line bg-white px-3.5 py-3 text-sm shadow-sm placeholder:text-ink-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
+                        placeholder={'Engineering\nSales\nFinance'}
+                        value={companyForm.departmentsText}
+                        onChange={(e) => updateCompanyForm({ departmentsText: e.target.value })}
+                      />
+                      <p className="mt-2 text-xs text-ink-muted">One department per line. Existing departments stay in place; new names are added.</p>
+                    </div>
+                  </div>
+                </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <Button onClick={() => previewMutation.mutate()} disabled={previewMutation.isPending || currentRows.length === 0}>
-              <UploadCloud className="h-4 w-4" /> Preview validation
-            </Button>
-            <Button
-              variant="secondary"
-              onClick={() => commitMutation.mutate()}
-              disabled={!preview?.summary.canCommit || preview.localOnly || commitMutation.isPending}
-            >
-              <CheckCircle2 className="h-4 w-4" /> Commit valid rows
-            </Button>
-            {preview && (
-              <span className="text-sm text-ink-muted">
-                {preview.summary.validRows}/{preview.summary.totalRows} valid, {preview.summary.errors} errors, {preview.summary.warnings} warnings
-                {preview.localOnly ? ' · browser check only' : ''}
-              </span>
+                {companyError && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{companyError}</div>}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+                  <Button variant="outline" onClick={() => openStep('people')}>
+                    Skip for now <ArrowRight className="h-4 w-4" />
+                  </Button>
+                  <Button onClick={() => saveCompanyMutation.mutate()} disabled={saveCompanyMutation.isPending}>
+                    <Save className="h-4 w-4" /> Save and continue
+                  </Button>
+                </div>
+              </>
             )}
-          </div>
+          </CardContent>
+        </Card>
+      )}
 
-          {preview && <PreviewTable preview={preview} />}
-        </CardContent>
-      </Card>
+      {(activeStep === 'people' || activeStep === 'salary') && (
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <CardTitle>{activeStep === 'people' ? 'People import' : 'Salary import'}</CardTitle>
+                <CardDescription>
+                  {activeStep === 'people'
+                    ? 'Add employees with payroll-critical details. Preview catches duplicates, missing IDs, bank details, and manager mapping issues.'
+                    : 'Assign salary structures and effective-dated CTC rows before payroll readiness is calculated.'}
+                </CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" onClick={() => downloadTemplate(currentTemplate)}>
+                  <Download className="h-4 w-4" /> CSV template
+                </Button>
+                <Button variant="outline" onClick={loadSampleRows}>
+                  <FileUp className="h-4 w-4" /> Load sample
+                </Button>
+                <Button variant="outline" onClick={addRow}>
+                  <Plus className="h-4 w-4" /> Add row
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {importType === 'employees' ? (
+              <EmployeeRows rows={employeeRows} setRows={setEmployeeRows} onEdit={() => setPreview(null)} />
+            ) : (
+              <SalaryRows rows={salaryRows} setRows={setSalaryRows} onEdit={() => setPreview(null)} />
+            )}
+
+            {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>}
+
+            <div className="flex flex-wrap items-center gap-3">
+              <Button onClick={() => previewMutation.mutate()} disabled={previewMutation.isPending || currentRows.length === 0}>
+                <UploadCloud className="h-4 w-4" /> Preview validation
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => commitMutation.mutate()}
+                disabled={!preview?.summary.canCommit || preview.localOnly || commitMutation.isPending}
+              >
+                <CheckCircle2 className="h-4 w-4" /> Commit valid rows
+              </Button>
+              {preview && (
+                <span className="text-sm text-ink-muted">
+                  {preview.summary.validRows}/{preview.summary.totalRows} valid, {preview.summary.errors} errors, {preview.summary.warnings} warnings
+                  {preview.localOnly ? ' · browser check only' : ''}
+                </span>
+              )}
+            </div>
+
+            {preview && <PreviewTable preview={preview} />}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+              <Button variant="outline" onClick={() => openStep(activeStep === 'people' ? 'company' : 'people')}>
+                <ArrowLeft className="h-4 w-4" /> Back
+              </Button>
+              <Button onClick={() => openStep(activeStep === 'people' ? 'salary' : 'readiness')}>
+                {activeStep === 'people' ? 'Continue to salary import' : 'Continue to payroll readiness'} <ArrowRight className="h-4 w-4" />
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {activeStep === 'readiness' && (
+        <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+          <Card>
+            <CardHeader>
+              <CardTitle>Readiness summary</CardTitle>
+              <CardDescription>Each module shows what is passing and what still blocks a payroll dry run.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {readiness ? (
+                <div className="grid gap-3 md:grid-cols-2">
+                  {readiness.sections.map((section) => (
+                    <button key={section.key} type="button" onClick={() => {
+                      if (section.key === 'company') openStep('company');
+                      else if (section.key === 'hr') openStep('people');
+                      else if (section.key === 'payroll') openStep('salary');
+                    }} className="rounded-lg border border-line p-3 text-left hover:border-primary-200">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-ink">{section.label}</p>
+                          <p className="text-xs text-ink-muted">{section.completed} of {section.total} checks passing</p>
+                        </div>
+                        <Badge variant={badgeForStatus(section.status) as any}>{section.status}</Badge>
+                      </div>
+                      <div className="mt-3"><Progress value={section.score} /></div>
+                      {section.issues.length > 0 && <p className="mt-2 text-xs text-ink-muted">{section.issues[0]?.message}</p>}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState icon={ListChecks} title="Readiness unavailable" description="Start the API and database to calculate tenant readiness." />
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Action queue</CardTitle>
+              <CardDescription>Use these actions to jump directly to the configuration that clears each blocker.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {issueList.length === 0 ? (
+                <EmptyState icon={CheckCircle2} title="Ready for dry run" description="No setup blockers were detected for this tenant." />
+              ) : (
+                <div className="space-y-3">
+                  {issueList.map((issue) => {
+                    const action = actionForIssue(issue);
+                    return (
+                      <div key={`${issue.section}-${issue.code}`} className="rounded-lg border border-line p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-sm font-semibold text-ink">{issue.section}</p>
+                          <Badge variant={issue.severity === 'critical' ? 'destructive' : 'warning'}>{issue.severity}</Badge>
+                        </div>
+                        <p className="mt-1 text-sm text-ink-muted">{issue.message}</p>
+                        <Button className="mt-3" variant="outline" size="sm" onClick={action.onClick}>
+                          {action.label} <ExternalLink className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+                <Button variant="outline" onClick={() => openStep('salary')}>
+                  <ArrowLeft className="h-4 w-4" /> Back
+                </Button>
+                <Button onClick={() => { window.location.href = '/dashboard'; }}>
+                  Finish for now
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }

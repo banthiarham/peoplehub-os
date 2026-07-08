@@ -143,38 +143,38 @@ export class SetupService {
     const sections: ReadinessSection[] = [
       this.section('company', 'Company setup', [
         { ok: Boolean(tenant.name), message: 'Company profile is configured' },
-        { ok: legalEntities.length > 0, message: 'At least one legal entity exists', code: 'missing_legal_entities' },
-        { ok: locations.length > 0, message: 'At least one active location exists', code: 'missing_locations' },
-        { ok: departments.length > 0, message: 'At least one active department exists', code: 'missing_departments', severity: 'warning' },
-        { ok: roles.length > 0, message: 'Roles are configured', code: 'missing_roles' },
+        { ok: legalEntities.length > 0, message: 'Add at least one legal entity', code: 'missing_legal_entities' },
+        { ok: locations.length > 0, message: 'Add at least one active location', code: 'missing_locations' },
+        { ok: departments.length > 0, message: 'Add at least one active department', code: 'missing_departments', severity: 'warning' },
+        { ok: roles.length > 0, message: 'Configure workspace roles', code: 'missing_roles' },
       ]),
       this.section('hr', 'HR readiness', [
-        { ok: employees.length > 0, message: 'Employee master has active employees', code: 'missing_employees' },
-        { ok: duplicateCodeCount === 0, message: 'Employee codes are unique', code: 'duplicate_employee_codes' },
-        { ok: duplicateEmailCount === 0, message: 'Work emails are unique', code: 'duplicate_work_emails' },
-        { ok: missingLegalEntity.length === 0, message: 'Employees are mapped to legal entities', code: 'employees_missing_legal_entity', count: missingLegalEntity.length },
+        { ok: employees.length > 0, message: 'Import active employees', code: 'missing_employees' },
+        { ok: duplicateCodeCount === 0, message: 'Resolve duplicate employee codes', code: 'duplicate_employee_codes' },
+        { ok: duplicateEmailCount === 0, message: 'Resolve duplicate work emails', code: 'duplicate_work_emails' },
+        { ok: missingLegalEntity.length === 0, message: 'Map employees to legal entities', code: 'employees_missing_legal_entity', count: missingLegalEntity.length },
       ]),
       this.section('payroll', 'Payroll readiness', [
-        { ok: salaryStructures.length > 0, message: 'Salary structures are configured', code: 'missing_salary_structures' },
-        { ok: missingSalary.length === 0, message: 'Active employees have salary assignments', code: 'employees_missing_salary', count: missingSalary.length },
-        { ok: missingBank.length === 0, message: 'Active employees have bank details', code: 'employees_missing_bank', count: missingBank.length },
-        { ok: statutoryTypes.has('PF'), message: 'PF component is configured', code: 'missing_pf_component', severity: 'warning' },
-        { ok: statutoryTypes.has('TDS'), message: 'TDS component is configured', code: 'missing_tds_component', severity: 'warning' },
+        { ok: salaryStructures.length > 0, message: 'Create at least one salary structure', code: 'missing_salary_structures' },
+        { ok: missingSalary.length === 0, message: 'Assign salary to active employees', code: 'employees_missing_salary', count: missingSalary.length },
+        { ok: missingBank.length === 0, message: 'Add bank details for active employees', code: 'employees_missing_bank', count: missingBank.length },
+        { ok: statutoryTypes.has('PF'), message: 'Configure PF statutory component', code: 'missing_pf_component', severity: 'warning' },
+        { ok: statutoryTypes.has('TDS'), message: 'Configure TDS statutory component', code: 'missing_tds_component', severity: 'warning' },
       ]),
       this.section('attendance', 'Attendance readiness', [
         { ok: locations.length > 0, message: 'Locations exist for attendance policy' },
-        { ok: shifts.length > 0, message: 'At least one active shift exists', code: 'missing_shifts' },
-        { ok: attendanceCaptureSettings.length > 0, message: 'At least one attendance capture mode is enabled', code: 'missing_attendance_capture' },
+        { ok: shifts.length > 0, message: 'Create at least one active shift', code: 'missing_shifts' },
+        { ok: attendanceCaptureSettings.length > 0, message: 'Enable at least one attendance capture mode', code: 'missing_attendance_capture' },
       ]),
       this.section('leave', 'Leave readiness', [
-        { ok: leaveTypes.length > 0, message: 'Leave types are configured', code: 'missing_leave_types' },
-        { ok: leavePolicies.length > 0, message: 'Leave policies are configured', code: 'missing_leave_policies' },
+        { ok: leaveTypes.length > 0, message: 'Create leave types', code: 'missing_leave_types' },
+        { ok: leavePolicies.length > 0, message: 'Create leave policies', code: 'missing_leave_policies' },
       ]),
       this.section('compliance', 'Compliance readiness', [
-        { ok: legalEntities.some((entity) => entity.pan || entity.tan), message: 'Legal entity tax identifiers are configured', code: 'missing_entity_tax_ids' },
-        { ok: missingPan.length === 0, message: 'Active employees have PAN', code: 'employees_missing_pan', count: missingPan.length, severity: 'warning' },
-        { ok: missingUan.length === 0, message: 'Active employees have UAN', code: 'employees_missing_uan', count: missingUan.length, severity: 'warning' },
-        { ok: payrollRuns.length > 0, message: 'At least one payroll run exists for dry-run/live readiness', code: 'missing_payroll_dry_run', severity: 'warning' },
+        { ok: legalEntities.some((entity) => entity.pan || entity.tan), message: 'Add legal entity tax identifiers', code: 'missing_entity_tax_ids' },
+        { ok: missingPan.length === 0, message: 'Add PAN for active employees', code: 'employees_missing_pan', count: missingPan.length, severity: 'warning' },
+        { ok: missingUan.length === 0, message: 'Add UAN for active employees', code: 'employees_missing_uan', count: missingUan.length, severity: 'warning' },
+        { ok: payrollRuns.length > 0, message: 'Create the first payroll dry run', code: 'missing_payroll_dry_run', severity: 'warning' },
       ]),
     ];
 
@@ -205,8 +205,18 @@ export class SetupService {
     };
   }
 
-  async template(type: string) {
+  async template(type: string, tenantId?: string) {
     const normalized = type.toLowerCase();
+    const [tenant, legalEntity, location, department] = tenantId
+      ? await Promise.all([
+          this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true, slug: true } }),
+          this.prisma.legalEntity.findFirst({ where: { tenantId }, orderBy: { createdAt: 'asc' } }),
+          this.prisma.location.findFirst({ where: { tenantId }, orderBy: { createdAt: 'asc' } }),
+          this.prisma.department.findFirst({ where: { tenantId }, orderBy: { createdAt: 'asc' } }),
+        ])
+      : [null, null, null, null];
+    const emailDomain = tenant?.slug ? `${tenant.slug}.example.com` : 'example.com';
+
     if (['employees', 'employee'].includes(normalized)) {
       return {
         type: 'employees',
@@ -217,13 +227,13 @@ export class SetupService {
             employeeCode: 'PH-1001',
             firstName: 'Aarav',
             lastName: 'Sharma',
-            workEmail: 'aarav.sharma@example.com',
+            workEmail: `aarav.sharma@${emailDomain}`,
             phone: '+919876543210',
             joiningDate: '2026-07-01',
-            department: 'Engineering',
+            department: department?.name ?? 'Engineering',
             designation: 'Software Engineer',
-            location: 'Bangalore Office',
-            legalEntity: 'Demo Corp India Pvt Ltd',
+            location: location?.name ?? 'Primary Office',
+            legalEntity: legalEntity?.name ?? tenant?.name ?? 'Primary Legal Entity',
             managerEmployeeCode: 'PH-1000',
             employmentType: 'FULL_TIME',
             pan: 'ABCDE1234F',

@@ -70,7 +70,7 @@ export class FilesService implements OnModuleInit {
     if (file.buffer.length > MAX_FILE_BYTES) {
       throw new BadRequestException('File exceeds the 10 MB limit');
     }
-    const safeName = file.originalname.replace(/[^\w.\-]+/g, '_').slice(-100);
+    const safeName = file.originalname.replace(/[^\w.-]+/g, '_').slice(-100);
     const key = `${tenantId}/${randomUUID()}-${safeName}`;
     await this.s3.send(
       new PutObjectCommand({

@@ -165,6 +165,12 @@ function ExecutiveDashboard({
   onRefresh: () => void;
 }) {
   const attendance = data.attendanceToday;
+  const hasOperationalData =
+    data.headcount.active > 0 ||
+    data.payroll.trend.length > 0 ||
+    data.pendingApprovals.total > 0 ||
+    data.hiring.openPositions > 0 ||
+    data.hiring.activeCandidates > 0;
   const attendanceSegments = [
     { name: 'Present', value: attendance.present, color: '#0F766E' },
     { name: 'Late', value: attendance.late, color: '#F59E0B' },
@@ -243,6 +249,7 @@ function ExecutiveDashboard({
             </div>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
+            {!hasOperationalData && <HeroAction href="/setup" icon={CheckCircle2} label="Start setup" />}
             <HeroAction href="/reports" icon={Download} label="Reports" />
             <HeroAction href="/approvals" icon={ShieldCheck} label="Approvals" />
             <HeroAction href="/payroll" icon={IndianRupee} label="Payroll" />
@@ -284,14 +291,34 @@ function ExecutiveDashboard({
           />
           <CommandMetric
             label="Operating grade"
-            value={healthScore(data)}
-            detail={`${formatSignedINR(payrollDelta)} payroll movement`}
+            value={hasOperationalData ? healthScore(data) : 'Not started'}
+            detail={hasOperationalData ? `${formatSignedINR(payrollDelta)} payroll movement` : 'Import employees to calculate'}
             icon={Gauge}
             accent="#0F766E"
             dark
           />
         </div>
       </section>
+
+      {!hasOperationalData && (
+        <section className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-amber-900">Workspace setup is not started</p>
+              <p className="mt-1 text-sm text-amber-800">
+                This dashboard will stay empty until employees, salary structures, leave policies, attendance settings, and payroll data are configured.
+              </p>
+            </div>
+            <Link
+              href="/setup"
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-amber-900 px-4 text-sm font-semibold text-white hover:bg-amber-950"
+            >
+              Open setup
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+          </div>
+        </section>
+      )}
 
       <section className="grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
         <Card className="overflow-hidden border-slate-200 bg-white">
@@ -561,16 +588,21 @@ function PayrollReadinessCard({
 }: {
   readiness: DashboardData['payrollReadiness'];
 }) {
+  const hasRun = Boolean(readiness.period);
   const hasCritical = readiness.criticalBlockers > 0;
   const hasWarnings = readiness.warnings > 0;
-  const state = hasCritical ? 'Blocked' : hasWarnings ? 'Review needed' : 'Ready';
-  const stateClass = hasCritical
+  const state = !hasRun ? 'Not started' : hasCritical ? 'Blocked' : hasWarnings ? 'Review needed' : 'Ready';
+  const stateClass = !hasRun
+    ? 'border-slate-200 bg-slate-100 text-slate-700'
+    : hasCritical
     ? 'border-rose-200 bg-rose-50 text-rose-700'
     : hasWarnings
       ? 'border-amber-200 bg-amber-50 text-amber-700'
       : 'border-emerald-200 bg-emerald-50 text-emerald-700';
-  const barClass = hasCritical ? 'bg-rose-500' : hasWarnings ? 'bg-amber-500' : 'bg-emerald-600';
-  const issues = readiness.topIssues.length
+  const barClass = !hasRun ? 'bg-slate-400' : hasCritical ? 'bg-rose-500' : hasWarnings ? 'bg-amber-500' : 'bg-emerald-600';
+  const issues = !hasRun
+    ? [{ label: 'Create a payroll dry run after employee and salary setup', count: 0, severity: 'warning' as const }]
+    : readiness.topIssues.length
     ? readiness.topIssues
     : [{ label: 'No payroll validation issues detected', count: readiness.readyEmployees, severity: 'warning' as const }];
   const hasIssue = (needle: string) => readiness.topIssues.some((issue) => issue.label.toLowerCase().includes(needle));
@@ -593,7 +625,7 @@ function PayrollReadinessCard({
     {
       label: 'Run status',
       detail: `${readiness.status.replaceAll('_', ' ').toLowerCase()} cycle`,
-      tone: readiness.status === 'DRAFT' || readiness.status === 'PROCESSING' ? 'critical' : hasWarnings ? 'warning' : 'ready',
+      tone: !hasRun || readiness.status === 'DRAFT' || readiness.status === 'PROCESSING' ? 'critical' : hasWarnings ? 'warning' : 'ready',
     },
   ];
 
@@ -659,7 +691,7 @@ function PayrollReadinessCard({
             <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Payroll gates</p>
             <p className="mt-1 text-xs text-slate-500">Controls that must be clean before lock and publish.</p>
           </div>
-          <Badge variant={hasCritical ? 'destructive' : hasWarnings ? 'warning' : 'success'}>{state}</Badge>
+          <Badge variant={!hasRun ? 'outline' : hasCritical ? 'destructive' : hasWarnings ? 'warning' : 'success'}>{state}</Badge>
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
           {gates.map((gate) => (

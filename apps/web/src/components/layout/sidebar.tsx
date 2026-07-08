@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useSession } from 'next-auth/react';
 import { useState } from 'react';
 import { NAV_SECTIONS } from '@/config/nav';
 import { cn } from '@/lib/utils';
@@ -15,11 +16,12 @@ export function Sidebar({
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }) {
+  const { data: session } = useSession();
   const pathname = usePathname();
   const [hovered, setHovered] = useState(false);
   const compact = collapsed && !hovered;
-  const tenantName = 'Demo Corp India';
-  const userName = 'Super Admin';
+  const tenantName = session?.user?.tenant?.name ?? 'PeopleHub OS';
+  const userName = session?.user?.name || session?.user?.email || 'PeopleHub user';
   return (
     <aside
       onMouseEnter={() => setHovered(true)}

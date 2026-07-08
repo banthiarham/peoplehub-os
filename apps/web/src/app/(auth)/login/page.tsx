@@ -1,6 +1,7 @@
 'use client';
 
 import { getSession, signIn } from 'next-auth/react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -91,6 +92,12 @@ export default function LoginPage() {
               {loading ? 'Signing in…' : 'Sign in'}
             </Button>
           </form>
+          <p className="mt-5 text-center text-sm text-ink-muted">
+            New client?{' '}
+            <Link href="/signup" className="font-semibold text-primary-700 hover:underline">
+              Create a workspace
+            </Link>
+          </p>
           <div className="mt-6 rounded-xl border border-line bg-canvas p-4 text-xs text-ink-muted">
             <p className="font-medium text-ink">Demo credentials</p>
             <p className="mt-1">admin@democorp.com · hr@democorp.com · payroll@democorp.com</p>

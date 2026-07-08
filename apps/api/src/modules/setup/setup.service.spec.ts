@@ -54,8 +54,8 @@ describe('SetupService', () => {
     expect(readiness.totals.criticalIssues).toBeGreaterThan(0);
     expect(readiness.payrollBlockers).toEqual(
       expect.arrayContaining([
-        'At least one legal entity exists',
-        'Salary structures are configured',
+        'Add at least one legal entity',
+        'Create at least one salary structure',
       ]),
     );
   });

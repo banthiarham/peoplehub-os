@@ -27,8 +27,8 @@ export class SetupController {
   @Roles(...SETUP_ADMIN_ROLES)
   @Scopes('employees:read')
   @ApiOperation({ summary: 'Import template metadata and sample rows' })
-  template(@Param('type') type: string) {
-    return this.setup.template(type);
+  template(@CurrentUser() user: AuthUser, @Param('type') type: string) {
+    return this.setup.template(type, user.tenantId);
   }
 
   @Post('import/employees/preview')
