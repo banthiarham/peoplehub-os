@@ -1,7 +1,7 @@
-/* Minimal service worker: makes the app installable and caches immutable
- * static assets. API and page requests always hit the network so attendance
- * punches and data are never served stale. */
-const STATIC_CACHE = 'peoplehub-static-v1';
+/* Minimal service worker: keeps the app installable without caching Next.js
+ * build assets. Older versions cached /_next/static files cache-first, which
+ * could leave a browser with an unstyled shell after a deployment. */
+const LEGACY_CACHE_PREFIX = 'peoplehub-';
 
 self.addEventListener('install', () => {
   self.skipWaiting();
@@ -12,26 +12,11 @@ self.addEventListener('activate', (event) => {
     caches
       .keys()
       .then((keys) =>
-        Promise.all(keys.filter((k) => k !== STATIC_CACHE).map((k) => caches.delete(k))),
+        Promise.all(keys.filter((key) => key.startsWith(LEGACY_CACHE_PREFIX)).map((key) => caches.delete(key))),
       )
       .then(() => self.clients.claim()),
   );
 });
 
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
-  const isStatic =
-    url.origin === self.location.origin &&
-    (url.pathname.startsWith('/_next/static/') || url.pathname.startsWith('/icons/'));
-  if (event.request.method !== 'GET' || !isStatic) return;
-
-  event.respondWith(
-    caches.open(STATIC_CACHE).then(async (cache) => {
-      const cached = await cache.match(event.request);
-      if (cached) return cached;
-      const response = await fetch(event.request);
-      if (response.ok) cache.put(event.request, response.clone());
-      return response;
-    }),
-  );
-});
+// No fetch handler: every page, script, and stylesheet is loaded from the
+// network/browser HTTP cache managed by Next.js and nginx.
