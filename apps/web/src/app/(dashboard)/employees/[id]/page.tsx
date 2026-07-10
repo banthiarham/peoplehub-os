@@ -2,9 +2,11 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
+import { useEffect, useState } from 'react';
 import {
   Building2,
   Download,
+  Edit3,
   FileText,
   Mail,
   MapPin,
@@ -21,8 +23,50 @@ import { Avatar } from '@/components/ui/avatar';
 import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { Input, Select } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToast } from '@/components/ui/toaster';
+
+type OptionItem = { id: string; name: string };
+type ManagerOption = { id: string; firstName: string; lastName: string };
+type EmployeeOptions = {
+  departments?: OptionItem[];
+  designations?: OptionItem[];
+  locations?: OptionItem[];
+  legalEntities?: OptionItem[];
+  costCenters?: OptionItem[];
+  businessUnits?: OptionItem[];
+  managers?: ManagerOption[];
+};
+
+const editInitial = {
+  firstName: '',
+  lastName: '',
+  workEmail: '',
+  phone: '',
+  joiningDate: '',
+  departmentId: '',
+  designationId: '',
+  locationId: '',
+  legalEntityId: '',
+  costCenterId: '',
+  businessUnitId: '',
+  managerId: '',
+  employmentType: '',
+  pan: '',
+  aadhaar: '',
+  uan: '',
+  esicNumber: '',
+  taxRegime: '',
+};
 
 interface DocumentRow {
   id: string;
@@ -53,9 +97,16 @@ export default function EmployeeProfilePage() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
   const toast = useToast();
+  const [editOpen, setEditOpen] = useState(false);
+  const [editForm, setEditForm] = useState(editInitial);
   const { data: e, isLoading } = useQuery({
     queryKey: ['employees', id],
     queryFn: () => api.get(`/employees/${id}`).then((r) => r.data),
+  });
+  const { data: options } = useQuery<EmployeeOptions>({
+    queryKey: ['employees', 'options'],
+    queryFn: () => api.get('/employees/meta/options').then((r) => r.data),
+    enabled: editOpen,
   });
   const { data: documents } = useQuery<DocumentRow[]>({
     queryKey: ['employees', id, 'documents'],
@@ -80,6 +131,43 @@ export default function EmployeeProfilePage() {
     },
     onError: () => toast('Could not reset device binding', 'error'),
   });
+  const updateEmployee = useMutation({
+    mutationFn: () => {
+      const payload = Object.fromEntries(Object.entries(editForm).filter(([, value]) => value !== ''));
+      return api.patch(`/employees/${id}`, payload).then((r) => r.data);
+    },
+    onSuccess: () => {
+      toast('Employee details updated');
+      setEditOpen(false);
+      queryClient.invalidateQueries({ queryKey: ['employees', id] });
+      queryClient.invalidateQueries({ queryKey: ['employees'] });
+    },
+    onError: () => toast('Could not update employee details', 'error'),
+  });
+
+  useEffect(() => {
+    if (!e) return;
+    setEditForm({
+      firstName: e.firstName ?? '',
+      lastName: e.lastName ?? '',
+      workEmail: e.workEmail ?? '',
+      phone: e.phone ?? '',
+      joiningDate: toDateInput(e.joiningDate),
+      departmentId: e.departmentId ?? e.department?.id ?? '',
+      designationId: e.designationId ?? e.designation?.id ?? '',
+      locationId: e.locationId ?? e.location?.id ?? '',
+      legalEntityId: e.legalEntityId ?? e.legalEntity?.id ?? '',
+      costCenterId: e.costCenterId ?? e.costCenter?.id ?? '',
+      businessUnitId: e.businessUnitId ?? e.businessUnit?.id ?? '',
+      managerId: e.managerId ?? e.manager?.id ?? '',
+      employmentType: e.employmentType ?? '',
+      pan: e.pan ?? '',
+      aadhaar: e.aadhaar ?? '',
+      uan: e.uan ?? '',
+      esicNumber: e.esicNumber ?? '',
+      taxRegime: e.taxRegime ?? '',
+    });
+  }, [e]);
 
   if (isLoading || !e) {
     return (
@@ -123,9 +211,84 @@ export default function EmployeeProfilePage() {
               </span>
             </div>
           </div>
-          <EmployeeSendEmailDialog employeeId={id} employeeName={name} workEmail={e.workEmail} />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" onClick={() => setEditOpen(true)}>
+              <Edit3 className="h-4 w-4" /> Edit details
+            </Button>
+            <EmployeeSendEmailDialog employeeId={id} employeeName={name} workEmail={e.workEmail} />
+          </div>
         </div>
       </Card>
+
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Edit employee details</DialogTitle>
+            <DialogDescription>Update the employee master record. Sensitive ID changes stay audited.</DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              updateEmployee.mutate();
+            }}
+            className="space-y-5"
+          >
+            <div>
+              <p className="mb-3 text-sm font-semibold text-ink">Identity</p>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <Input value={editForm.firstName} onChange={(event) => setEditFormValue('firstName', event.target.value, setEditForm)} placeholder="First name" required />
+                <Input value={editForm.lastName} onChange={(event) => setEditFormValue('lastName', event.target.value, setEditForm)} placeholder="Last name" required />
+                <Input value={editForm.workEmail} onChange={(event) => setEditFormValue('workEmail', event.target.value, setEditForm)} placeholder="Work email" type="email" />
+                <Input value={editForm.phone} onChange={(event) => setEditFormValue('phone', event.target.value, setEditForm)} placeholder="Phone" />
+                <Input value={editForm.joiningDate} onChange={(event) => setEditFormValue('joiningDate', event.target.value, setEditForm)} type="date" />
+              </div>
+            </div>
+
+            <div>
+              <p className="mb-3 text-sm font-semibold text-ink">Organization</p>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <OptionSelect value={editForm.departmentId} onChange={(value) => setEditFormValue('departmentId', value, setEditForm)} items={options?.departments} placeholder="Department" />
+                <OptionSelect value={editForm.designationId} onChange={(value) => setEditFormValue('designationId', value, setEditForm)} items={options?.designations} placeholder="Designation" />
+                <OptionSelect value={editForm.locationId} onChange={(value) => setEditFormValue('locationId', value, setEditForm)} items={options?.locations} placeholder="Location" />
+                <OptionSelect value={editForm.legalEntityId} onChange={(value) => setEditFormValue('legalEntityId', value, setEditForm)} items={options?.legalEntities} placeholder="Legal entity" />
+                <OptionSelect value={editForm.costCenterId} onChange={(value) => setEditFormValue('costCenterId', value, setEditForm)} items={options?.costCenters} placeholder="Cost center" />
+                <OptionSelect value={editForm.businessUnitId} onChange={(value) => setEditFormValue('businessUnitId', value, setEditForm)} items={options?.businessUnits} placeholder="Business unit" />
+                <ManagerSelect value={editForm.managerId} onChange={(value) => setEditFormValue('managerId', value, setEditForm)} items={options?.managers} />
+                <Select value={editForm.employmentType} onChange={(event) => setEditFormValue('employmentType', event.target.value, setEditForm)}>
+                  <option value="">Employment type</option>
+                  <option value="FULL_TIME">Full time</option>
+                  <option value="PART_TIME">Part time</option>
+                  <option value="CONTRACTOR">Contractor</option>
+                  <option value="INTERN">Intern</option>
+                  <option value="CONSULTANT">Consultant</option>
+                </Select>
+              </div>
+            </div>
+
+            <div>
+              <p className="mb-3 text-sm font-semibold text-ink">Statutory and tax</p>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <Input value={editForm.pan} onChange={(event) => setEditFormValue('pan', event.target.value.toUpperCase(), setEditForm)} placeholder="PAN" />
+                <Input value={editForm.aadhaar} onChange={(event) => setEditFormValue('aadhaar', event.target.value, setEditForm)} placeholder="Aadhaar" />
+                <Input value={editForm.uan} onChange={(event) => setEditFormValue('uan', event.target.value, setEditForm)} placeholder="UAN" />
+                <Input value={editForm.esicNumber} onChange={(event) => setEditFormValue('esicNumber', event.target.value, setEditForm)} placeholder="ESIC number" />
+                <Select value={editForm.taxRegime} onChange={(event) => setEditFormValue('taxRegime', event.target.value, setEditForm)}>
+                  <option value="">Tax regime</option>
+                  <option value="NEW">New</option>
+                  <option value="OLD">Old</option>
+                </Select>
+              </div>
+            </div>
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>Cancel</Button>
+              <Button type="submit" disabled={updateEmployee.isPending || !editForm.firstName.trim() || !editForm.lastName.trim()}>
+                {updateEmployee.isPending ? 'Saving...' : 'Save changes'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
@@ -376,4 +539,59 @@ function summarizeObject(value: unknown) {
     .filter(([, v]) => v !== null && v !== undefined && v !== '')
     .slice(0, 3);
   return entries.length ? entries.map(([key, v]) => `${key}: ${String(v)}`).join(' · ') : '—';
+}
+
+function toDateInput(value: string | null | undefined) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString().slice(0, 10);
+}
+
+function setEditFormValue(
+  key: keyof typeof editInitial,
+  value: string,
+  setEditForm: React.Dispatch<React.SetStateAction<typeof editInitial>>,
+) {
+  setEditForm((current) => ({ ...current, [key]: value }));
+}
+
+function OptionSelect({
+  value,
+  onChange,
+  items,
+  placeholder,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  items?: OptionItem[];
+  placeholder: string;
+}) {
+  return (
+    <Select value={value} onChange={(event) => onChange(event.target.value)}>
+      <option value="">{placeholder}</option>
+      {items?.map((item) => (
+        <option key={item.id} value={item.id}>{item.name}</option>
+      ))}
+    </Select>
+  );
+}
+
+function ManagerSelect({
+  value,
+  onChange,
+  items,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  items?: ManagerOption[];
+}) {
+  return (
+    <Select value={value} onChange={(event) => onChange(event.target.value)}>
+      <option value="">Reporting manager</option>
+      {items?.map((manager) => (
+        <option key={manager.id} value={manager.id}>{manager.firstName} {manager.lastName}</option>
+      ))}
+    </Select>
+  );
 }

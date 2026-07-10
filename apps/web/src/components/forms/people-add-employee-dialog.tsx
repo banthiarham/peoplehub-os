@@ -74,13 +74,16 @@ const initialForm = {
   uan: '',
   esicNumber: '',
   taxRegime: '',
+  createUser: true,
 };
 
 type FormState = typeof initialForm;
+type OnboardingCredentials = { email: string; temporaryPassword: string };
 
 export function PeopleAddEmployeeDialog() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(initialForm);
+  const [credentials, setCredentials] = useState<OnboardingCredentials | null>(null);
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -103,11 +106,13 @@ export function PeopleAddEmployeeDialog() {
       );
       return api.post('/employees', payload).then((r) => r.data);
     },
-    onSuccess: () => {
-      toast('Employee created');
+    onSuccess: (employee) => {
+      const createdCredentials = employee?.onboardingCredentials ?? null;
+      setCredentials(createdCredentials);
+      toast(createdCredentials ? 'Employee created with login credentials' : 'Employee created');
       queryClient.invalidateQueries({ queryKey: ['employees'] });
       setForm(initialForm);
-      setOpen(false);
+      if (!createdCredentials) setOpen(false);
     },
     onError: (err) => toast(apiErrorMessage(err), 'error'),
   });
@@ -117,7 +122,10 @@ export function PeopleAddEmployeeDialog() {
       <Button onClick={() => setOpen(true)}>
         <Plus className="h-4 w-4" /> Add employee
       </Button>
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (!nextOpen) setCredentials(null);
+      }}>
         <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Add employee</DialogTitle>
@@ -143,7 +151,7 @@ export function PeopleAddEmployeeDialog() {
                 <Input value={form.preferredName} onChange={set('preferredName')} />
               </Labeled>
               <Labeled label="Work email">
-                <Input type="email" value={form.workEmail} onChange={set('workEmail')} />
+                <Input type="email" value={form.workEmail} onChange={set('workEmail')} required={form.createUser} />
               </Labeled>
               <Labeled label="Personal email">
                 <Input type="email" value={form.personalEmail} onChange={set('personalEmail')} />
@@ -230,13 +238,34 @@ export function PeopleAddEmployeeDialog() {
               </Labeled>
             </div>
 
+            <SectionTitle>Login</SectionTitle>
+            <label className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm text-ink-muted">
+              <input
+                type="checkbox"
+                checked={form.createUser}
+                onChange={(e) => setForm((current) => ({ ...current, createUser: e.target.checked }))}
+              />
+              Create employee login
+            </label>
+            {form.createUser && !form.workEmail.trim() && (
+              <p className="mt-2 text-xs text-rose-700">Work email is required when creating a login.</p>
+            )}
+
+            {credentials && (
+              <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm">
+                <p className="font-semibold text-emerald-900">Share these credentials once</p>
+                <p className="mt-2 font-mono text-xs text-emerald-900">Email: {credentials.email}</p>
+                <p className="mt-1 font-mono text-xs text-emerald-900">Temporary password: {credentials.temporaryPassword}</p>
+              </div>
+            )}
+
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-                Cancel
+                {credentials ? 'Close' : 'Cancel'}
               </Button>
               <Button
                 type="submit"
-                disabled={!form.firstName.trim() || !form.lastName.trim() || create.isPending}
+                disabled={!form.firstName.trim() || !form.lastName.trim() || (form.createUser && !form.workEmail.trim()) || create.isPending}
               >
                 {create.isPending ? 'Creating…' : 'Create employee'}
               </Button>

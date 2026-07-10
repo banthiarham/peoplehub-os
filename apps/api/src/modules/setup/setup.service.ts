@@ -1,5 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { EmploymentType, Prisma } from '@prisma/client';
+import { randomBytes } from 'crypto';
+import * as bcrypt from 'bcryptjs';
+import { EmploymentType, PermissionType, Prisma, ScopeType } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { SetupEmployeeImportDto, SetupEmployeeImportRowDto, SetupSalaryImportDto, SetupSalaryImportRowDto } from './dto/setup-import.dto';
@@ -220,7 +222,7 @@ export class SetupService {
     if (['employees', 'employee'].includes(normalized)) {
       return {
         type: 'employees',
-        filename: 'peoplehub-employee-import-template.csv',
+        filename: 'viohr-employee-import-template.csv',
         columns: EMPLOYEE_TEMPLATE_COLUMNS,
         sampleRows: [
           {
@@ -252,7 +254,7 @@ export class SetupService {
     if (['salary', 'salaries'].includes(normalized)) {
       return {
         type: 'salary',
-        filename: 'peoplehub-salary-import-template.csv',
+        filename: 'viohr-salary-import-template.csv',
         columns: SALARY_TEMPLATE_COLUMNS,
         sampleRows: [
           {
@@ -294,21 +296,32 @@ export class SetupService {
     const refs = await this.referenceData(user.tenantId);
     const created = await this.prisma.$transaction(async (tx) => {
       const codeToEmployeeId = new Map(refs.employees.map((employee) => [this.key(employee.employeeCode), employee.id]));
-      const imported: Array<{ id: string; employeeCode: string; name: string }> = [];
+      const employeeRole = await this.ensureEmployeeRole(tx, user.tenantId);
+      const imported: Array<{
+        id: string;
+        employeeCode: string;
+        name: string;
+        login?: { email: string; temporaryPassword: string };
+      }> = [];
 
       for (const row of dto.rows) {
         const employeeCode = row.employeeCode?.trim() || (await this.nextEmployeeCode(tx, user.tenantId, codeToEmployeeId.size + imported.length + 1));
         let createdUserId: string | undefined;
+        let login: { email: string; temporaryPassword: string } | undefined;
         if (row.createUser && row.workEmail) {
+          const temporaryPassword = this.temporaryPassword();
           const createdUser = await tx.user.create({
             data: {
               tenantId: user.tenantId,
               email: row.workEmail.trim().toLowerCase(),
               name: `${row.firstName.trim()} ${row.lastName.trim()}`,
+              passwordHash: await bcrypt.hash(temporaryPassword, 10),
               isActive: true,
             },
           });
+          await tx.userRole.create({ data: { userId: createdUser.id, roleId: employeeRole.id } });
           createdUserId = createdUser.id;
+          login = { email: createdUser.email, temporaryPassword };
         }
         const employee = await tx.employee.create({
           data: {
@@ -334,7 +347,7 @@ export class SetupService {
           },
         });
         codeToEmployeeId.set(this.key(employeeCode), employee.id);
-        imported.push({ id: employee.id, employeeCode, name: `${employee.firstName} ${employee.lastName}` });
+        imported.push({ id: employee.id, employeeCode, name: `${employee.firstName} ${employee.lastName}`, login });
 
         if (row.salaryStructure && row.ctc) {
           const salaryStructureId = this.lookup(refs.salaryStructures, row.salaryStructure);
@@ -375,7 +388,13 @@ export class SetupService {
       return imported;
     });
 
-    return { imported: created.length, employees: created };
+    return {
+      imported: created.length,
+      employees: created,
+      loginCredentials: created
+        .filter((employee) => employee.login)
+        .map((employee) => ({ employeeCode: employee.employeeCode, name: employee.name, ...employee.login })),
+    };
   }
 
   async previewSalary(tenantId: string, dto: SetupSalaryImportDto) {
@@ -478,6 +497,9 @@ export class SetupService {
     const issues: ImportIssue[] = [];
     if (!row.firstName?.trim()) this.issue(issues, 'firstName', 'required', 'First name is required');
     if (!row.lastName?.trim()) this.issue(issues, 'lastName', 'required', 'Last name is required');
+    if (row.createUser && !row.workEmail?.trim()) {
+      this.issue(issues, 'workEmail', 'login_email_required', 'Work email is required when Create login is selected');
+    }
     if (row.workEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.workEmail)) {
       this.issue(issues, 'workEmail', 'invalid_email', 'Work email is not valid');
     }
@@ -492,7 +514,9 @@ export class SetupService {
     this.checkReference(issues, 'legalEntity', row.legalEntity, refs.legalEntities, 'Legal entity does not exist');
     this.checkReference(issues, 'salaryStructure', row.salaryStructure, refs.salaryStructures, 'Salary structure does not exist');
     if (!row.legalEntity) this.issue(issues, 'legalEntity', 'missing_legal_entity', 'Payroll entity is required before payroll can run');
-    if (!row.bankAccountNumber || !row.bankIfsc) this.issue(issues, 'bankDetails', 'missing_bank_details', 'Bank account number and IFSC are required');
+    if (!row.bankAccountNumber || !row.bankIfsc) {
+      this.issue(issues, 'bankDetails', 'missing_bank_details', 'Bank account number and IFSC are missing; payroll readiness will stay blocked', 'warning');
+    }
     if (row.salaryStructure && (!row.ctc || Number(row.ctc) <= 0)) this.issue(issues, 'ctc', 'invalid_ctc', 'CTC must be greater than zero');
     if (row.managerEmployeeCode) {
       const managerInDb = refs.employeeByCode.has(this.key(row.managerEmployeeCode));
@@ -625,6 +649,44 @@ export class SetupService {
 
   private issue(issues: ImportIssue[], field: string, code: string, message: string, severity: Severity = 'critical') {
     issues.push({ field, code, severity, message });
+  }
+
+  private temporaryPassword() {
+    return `VioHr@${randomBytes(6).toString('base64url')}`;
+  }
+
+  private async ensureEmployeeRole(tx: Prisma.TransactionClient, tenantId: string) {
+    const role = await tx.role.upsert({
+      where: { tenantId_name: { tenantId, name: 'Employee' } },
+      update: {},
+      create: {
+        tenantId,
+        name: 'Employee',
+        description: 'Employee self-service access for attendance, leave, documents, helpdesk and payslips',
+        isSystem: true,
+      },
+    });
+    await tx.permission.createMany({
+      data: [
+        { module: 'attendance', permissionType: PermissionType.VIEW },
+        { module: 'attendance', permissionType: PermissionType.CREATE },
+        { module: 'leave', permissionType: PermissionType.VIEW },
+        { module: 'leave', permissionType: PermissionType.CREATE },
+        { module: 'payroll', permissionType: PermissionType.VIEW },
+        { module: 'documents', permissionType: PermissionType.VIEW },
+        { module: 'helpdesk', permissionType: PermissionType.VIEW },
+        { module: 'helpdesk', permissionType: PermissionType.CREATE },
+        { module: 'notifications', permissionType: PermissionType.VIEW },
+        { module: 'employees', permissionType: PermissionType.VIEW },
+      ].map((permission) => ({
+        roleId: role.id,
+        module: permission.module,
+        permissionType: permission.permissionType,
+        scopeType: ScopeType.OWN_DATA,
+      })),
+      skipDuplicates: true,
+    });
+    return role;
   }
 
   private importStatus(issues: ImportIssue[]): ImportStatus {

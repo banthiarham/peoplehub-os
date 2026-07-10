@@ -1,5 +1,7 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { randomBytes } from 'crypto';
+import * as bcrypt from 'bcryptjs';
+import { PermissionType, Prisma, ScopeType } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { RbacService } from '../rbac/rbac.service';
@@ -181,9 +183,13 @@ export class EmployeesService {
   }
 
   async create(tenantId: string, dto: CreateEmployeeDto, actorUserId: string) {
+    if (dto.createUser && !dto.workEmail?.trim()) {
+      throw new BadRequestException('Work email is required when creating a login user');
+    }
     const employeeCode = dto.employeeCode ?? (await this.nextEmployeeCode(tenantId));
     const { createUser, ...rest } = dto;
     const data = this.toEmployeeData(rest);
+    let onboardingCredentials: { email: string; temporaryPassword: string } | undefined;
     const employee = await this.prisma.$transaction(async (tx) => {
       const created = await tx.employee.create({
         data: {
@@ -194,15 +200,20 @@ export class EmployeesService {
         },
       });
       if (createUser && dto.workEmail) {
+        const temporaryPassword = this.temporaryPassword();
         const user = await tx.user.create({
           data: {
             tenantId,
             email: dto.workEmail.toLowerCase(),
             name: `${dto.firstName} ${dto.lastName}`,
+            passwordHash: await bcrypt.hash(temporaryPassword, 10),
             isActive: true,
           },
         });
+        const employeeRole = await this.ensureEmployeeRole(tx, tenantId);
+        await tx.userRole.create({ data: { userId: user.id, roleId: employeeRole.id } });
         await tx.employee.update({ where: { id: created.id }, data: { userId: user.id } });
+        onboardingCredentials = { email: user.email, temporaryPassword };
       }
       await tx.employeeLifecycleEvent.create({
         data: {
@@ -225,7 +236,7 @@ export class EmployeesService {
       });
       return created;
     });
-    return employee;
+    return onboardingCredentials ? { ...employee, onboardingCredentials } : employee;
   }
 
   async update(user: AuthUser, id: string, dto: UpdateEmployeeDto) {
@@ -618,5 +629,43 @@ export class EmployeesService {
       });
       if (!exists) return code;
     }
+  }
+
+  private temporaryPassword() {
+    return `VioHr@${randomBytes(6).toString('base64url')}`;
+  }
+
+  private async ensureEmployeeRole(tx: Prisma.TransactionClient, tenantId: string) {
+    const role = await tx.role.upsert({
+      where: { tenantId_name: { tenantId, name: 'Employee' } },
+      update: {},
+      create: {
+        tenantId,
+        name: 'Employee',
+        description: 'Employee self-service access for attendance, leave, documents, helpdesk and payslips',
+        isSystem: true,
+      },
+    });
+    await tx.permission.createMany({
+      data: [
+        { module: 'attendance', permissionType: PermissionType.VIEW },
+        { module: 'attendance', permissionType: PermissionType.CREATE },
+        { module: 'leave', permissionType: PermissionType.VIEW },
+        { module: 'leave', permissionType: PermissionType.CREATE },
+        { module: 'payroll', permissionType: PermissionType.VIEW },
+        { module: 'documents', permissionType: PermissionType.VIEW },
+        { module: 'helpdesk', permissionType: PermissionType.VIEW },
+        { module: 'helpdesk', permissionType: PermissionType.CREATE },
+        { module: 'notifications', permissionType: PermissionType.VIEW },
+        { module: 'employees', permissionType: PermissionType.VIEW },
+      ].map((permission) => ({
+        roleId: role.id,
+        module: permission.module,
+        permissionType: permission.permissionType,
+        scopeType: ScopeType.OWN_DATA,
+      })),
+      skipDuplicates: true,
+    });
+    return role;
   }
 }

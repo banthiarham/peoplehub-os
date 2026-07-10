@@ -92,6 +92,13 @@ type ImportPreview = {
   }>;
 };
 
+type LoginCredential = {
+  employeeCode: string;
+  name: string;
+  email: string;
+  temporaryPassword: string;
+};
+
 type ImportType = 'employees' | 'salary';
 type SetupStepKey = 'company' | 'people' | 'salary' | 'readiness';
 
@@ -283,7 +290,7 @@ const setupSteps: Array<{ key: SetupStepKey; label: string; detail: string; sect
 
 const fallbackEmployeeTemplate: TemplateResponse = {
   type: 'employees',
-  filename: 'peoplehub-employee-import-template.csv',
+  filename: 'viohr-employee-import-template.csv',
   columns: [
     'employeeCode',
     'firstName',
@@ -309,7 +316,7 @@ const fallbackEmployeeTemplate: TemplateResponse = {
 
 const fallbackSalaryTemplate: TemplateResponse = {
   type: 'salary',
-  filename: 'peoplehub-salary-import-template.csv',
+  filename: 'viohr-salary-import-template.csv',
   columns: ['employeeCode', 'salaryStructure', 'ctc', 'effectiveFrom'],
   sampleRows: sampleSalaryRows.map((row) => ({ ...row })),
 };
@@ -360,6 +367,13 @@ function downloadTemplate(template: TemplateResponse) {
   anchor.download = template.filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+function copyCredentials(credentials: LoginCredential[]) {
+  const text = credentials
+    .map((credential) => `${credential.name} (${credential.employeeCode})\nEmail: ${credential.email}\nTemporary password: ${credential.temporaryPassword}`)
+    .join('\n\n');
+  void navigator.clipboard?.writeText(text);
 }
 
 function employeePayload(rows: EmployeeRow[]) {
@@ -431,12 +445,15 @@ function localEmployeePreviewRow(row: EmployeeRow, index: number, rows: Employee
   const issues: ImportPreview['rows'][number]['issues'] = [];
   if (!row.firstName.trim()) issues.push({ field: 'firstName', code: 'required', severity: 'critical', message: 'First name is required' });
   if (!row.lastName.trim()) issues.push({ field: 'lastName', code: 'required', severity: 'critical', message: 'Last name is required' });
+  if (row.createUser && !row.workEmail.trim()) {
+    issues.push({ field: 'workEmail', code: 'login_email_required', severity: 'critical', message: 'Work email is required when Create login is selected' });
+  }
   if (row.workEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.workEmail)) {
     issues.push({ field: 'workEmail', code: 'invalid_email', severity: 'critical', message: 'Work email is not valid' });
   }
   if (!row.legalEntity.trim()) issues.push({ field: 'legalEntity', code: 'required', severity: 'critical', message: 'Legal entity is required for payroll' });
   if (!row.bankAccountNumber.trim() || !row.bankIfsc.trim()) {
-    issues.push({ field: 'bankDetails', code: 'required', severity: 'critical', message: 'Bank account and IFSC are required' });
+    issues.push({ field: 'bankDetails', code: 'missing_bank_details', severity: 'warning', message: 'Bank details are missing; payroll readiness will stay blocked' });
   }
   if (row.salaryStructure && (!row.ctc || Number(row.ctc) <= 0)) {
     issues.push({ field: 'ctc', code: 'invalid_ctc', severity: 'critical', message: 'CTC must be greater than zero' });
@@ -490,6 +507,7 @@ export default function SetupPage() {
   const [employeeRows, setEmployeeRows] = useState<EmployeeRow[]>(sampleEmployeeRows);
   const [salaryRows, setSalaryRows] = useState<SalaryRow[]>(sampleSalaryRows);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [loginCredentials, setLoginCredentials] = useState<LoginCredential[]>([]);
   const [error, setError] = useState('');
   const [companyError, setCompanyError] = useState('');
   const [companyTouched, setCompanyTouched] = useState(false);
@@ -677,6 +695,7 @@ export default function SetupPage() {
     },
     onSuccess: (data) => {
       setPreview(data);
+      setLoginCredentials([]);
       setError(data.localOnly ? 'API is offline, so this is browser-only validation. Start the API before committing rows.' : '');
     },
     onError: (err: any) => {
@@ -690,9 +709,10 @@ export default function SetupPage() {
       const body = importType === 'employees' ? employeePayload(employeeRows) : salaryPayload(salaryRows);
       return api.post(`${endpoint}/commit`, body).then((r) => r.data);
     },
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       setError('');
       setPreview(null);
+      setLoginCredentials(data?.loginCredentials ?? []);
       await queryClient.invalidateQueries({ queryKey: ['setup', 'readiness'] });
     },
     onError: (err: any) => {
@@ -712,6 +732,7 @@ export default function SetupPage() {
 
   function addRow() {
     setPreview(null);
+    setLoginCredentials([]);
     if (importType === 'employees') setEmployeeRows((rows) => [...rows, { ...emptyEmployeeRow }]);
     else setSalaryRows((rows) => [...rows, { ...emptySalaryRow }]);
   }
@@ -721,6 +742,7 @@ export default function SetupPage() {
     if (step === 'people') setImportType('employees');
     if (step === 'salary') setImportType('salary');
     setPreview(null);
+    setLoginCredentials([]);
     setError('');
   }
 
@@ -946,7 +968,7 @@ export default function SetupPage() {
                 <CardTitle>{activeStep === 'people' ? 'People import' : 'Salary import'}</CardTitle>
                 <CardDescription>
                   {activeStep === 'people'
-                    ? 'Add employees with payroll-critical details. Preview catches duplicates, missing IDs, bank details, and manager mapping issues.'
+                    ? 'Add employees for login and attendance first. Payroll details can be completed now or left as warnings until payroll readiness.'
                     : 'Assign salary structures and effective-dated CTC rows before payroll readiness is calculated.'}
                 </CardDescription>
               </div>
@@ -965,12 +987,48 @@ export default function SetupPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             {importType === 'employees' ? (
-              <EmployeeRows rows={employeeRows} setRows={setEmployeeRows} onEdit={() => setPreview(null)} />
+              <EmployeeRows rows={employeeRows} setRows={setEmployeeRows} onEdit={() => { setPreview(null); setLoginCredentials([]); }} />
             ) : (
-              <SalaryRows rows={salaryRows} setRows={setSalaryRows} onEdit={() => setPreview(null)} />
+              <SalaryRows rows={salaryRows} setRows={setSalaryRows} onEdit={() => { setPreview(null); setLoginCredentials([]); }} />
             )}
 
             {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>}
+
+            {loginCredentials.length > 0 && (
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-emerald-900">Employee login credentials</p>
+                    <p className="mt-1 text-xs text-emerald-800">
+                      Share these once with the tester. Passwords are generated only at creation time and are not stored in plain text.
+                    </p>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => copyCredentials(loginCredentials)}>
+                    Copy all
+                  </Button>
+                </div>
+                <div className="mt-3 overflow-x-auto">
+                  <Table>
+                    <THead>
+                      <TR>
+                        <TH>Employee</TH>
+                        <TH>Email</TH>
+                        <TH>Temporary password</TH>
+                      </TR>
+                    </THead>
+                    <TBody>
+                      {loginCredentials.map((credential) => (
+                        <TR key={`${credential.employeeCode}-${credential.email}`}>
+                          <TD>{credential.name} · {credential.employeeCode}</TD>
+                          <TD className="font-mono text-xs">{credential.email}</TD>
+                          <TD className="font-mono text-xs">{credential.temporaryPassword}</TD>
+                        </TR>
+                      ))}
+                    </TBody>
+                  </Table>
+                </div>
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center gap-3">
               <Button onClick={() => previewMutation.mutate()} disabled={previewMutation.isPending || currentRows.length === 0}>
@@ -1124,7 +1182,7 @@ function EmployeeRows({
                 <Input placeholder="Employee code" value={row.employeeCode} onChange={(e) => update(index, { employeeCode: e.target.value })} />
                 <Input type="date" value={row.joiningDate} onChange={(e) => update(index, { joiningDate: e.target.value })} />
               </div>
-              <Input placeholder="Work email" value={row.workEmail} onChange={(e) => update(index, { workEmail: e.target.value })} />
+              <Input placeholder={row.createUser ? 'Work email required for login' : 'Work email'} value={row.workEmail} onChange={(e) => update(index, { workEmail: e.target.value })} />
             </TD>
             <TD className="min-w-[280px] space-y-2">
               <Input placeholder="Department" value={row.department} onChange={(e) => update(index, { department: e.target.value })} />
@@ -1160,6 +1218,9 @@ function EmployeeRows({
                 <input type="checkbox" checked={row.createUser} onChange={(e) => update(index, { createUser: e.target.checked })} />
                 Create login
               </label>
+              {row.createUser && !row.workEmail.trim() && (
+                <p className="text-xs text-rose-700">Work email is required for login.</p>
+              )}
             </TD>
             <TD>
               <Button variant="ghost" size="icon" onClick={() => remove(index)} aria-label="Remove row">

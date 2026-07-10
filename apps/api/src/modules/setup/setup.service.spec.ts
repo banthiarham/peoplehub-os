@@ -100,6 +100,77 @@ describe('SetupService', () => {
     );
   });
 
+  it('requires work email only when login creation is selected', async () => {
+    const prisma = referencePrisma();
+    const service = new SetupService(prisma as any);
+
+    const preview = await service.previewEmployees('tenant-1', {
+      rows: [
+        {
+          employeeCode: 'VH-1002',
+          firstName: 'Harsh',
+          lastName: 'Tester',
+          legalEntity: 'Demo Corp India Pvt Ltd',
+          createUser: true,
+        },
+      ],
+    });
+
+    expect(preview.summary.errors).toBe(1);
+    expect(preview.rows[0]?.issues.map((issue) => issue.code)).toContain('login_email_required');
+    expect(preview.rows[0]?.issues.find((issue) => issue.code === 'missing_bank_details')?.severity).toBe('warning');
+  });
+
+  it('returns one-time login credentials when employee import creates users', async () => {
+    const prisma = referencePrisma({
+      role: { upsert: jest.fn().mockResolvedValue({ id: 'role-employee' }) },
+      permission: { createMany: jest.fn().mockResolvedValue({ count: 10 }) },
+      userRole: { create: jest.fn().mockResolvedValue({}) },
+      user: {
+        findMany: jest.fn().mockResolvedValue([]),
+        create: jest.fn().mockResolvedValue({ id: 'user-2', email: 'harsh@example.com' }),
+      },
+      employee: {
+        findMany: jest.fn().mockResolvedValue([]),
+        create: jest.fn().mockResolvedValue({ id: 'emp-2', firstName: 'Harsh', lastName: 'Tester' }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      auditLog: { create: jest.fn().mockResolvedValue({}) },
+      $transaction: jest.fn(async (callback) => callback(prisma)),
+    });
+    const service = new SetupService(prisma as any);
+
+    const result = await service.commitEmployees(
+      { tenantId: 'tenant-1', userId: 'owner-1' } as any,
+      {
+        rows: [
+          {
+            employeeCode: 'VH-1002',
+            firstName: 'Harsh',
+            lastName: 'Tester',
+            workEmail: 'harsh@example.com',
+            legalEntity: 'Demo Corp India Pvt Ltd',
+            createUser: true,
+          },
+        ],
+      },
+    );
+
+    expect(result.loginCredentials).toHaveLength(1);
+    expect(result.loginCredentials[0]).toEqual(
+      expect.objectContaining({
+        employeeCode: 'VH-1002',
+        name: 'Harsh Tester',
+        email: 'harsh@example.com',
+        temporaryPassword: expect.stringMatching(/^VioHr@/),
+      }),
+    );
+    expect((prisma as any).user.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ passwordHash: expect.any(String) }),
+    }));
+    expect((prisma as any).userRole.create).toHaveBeenCalledWith({ data: { userId: 'user-2', roleId: 'role-employee' } });
+  });
+
   it('allows salary imports only for known employees and structures', async () => {
     const prisma = referencePrisma();
     const service = new SetupService(prisma as any);
