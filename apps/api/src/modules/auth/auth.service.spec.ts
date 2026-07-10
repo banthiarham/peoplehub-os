@@ -1,4 +1,5 @@
 import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcryptjs';
 import { createHash } from 'crypto';
 import { AuthService } from './auth.service';
 
@@ -78,11 +79,68 @@ describe('AuthService', () => {
         user: expect.objectContaining({
           email: 'owner@acme.example',
           roles: ['Tenant Owner'],
+          scopes: expect.arrayContaining(['employees:read', 'employees:write', 'payroll:write', 'workflow:approve']),
           tenant: { id: 'tenant-1', slug: 'acme-india', name: 'Acme India' },
         }),
       }),
     );
-    expect(jwt.signAsync).toHaveBeenCalledWith(expect.objectContaining({ tenantId: 'tenant-1', roles: ['Tenant Owner'] }));
+    expect(jwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: 'tenant-1',
+        roles: ['Tenant Owner'],
+        scopes: expect.arrayContaining(['employees:read', 'payroll:write', 'workflow:approve']),
+      }),
+    );
+  });
+
+  it('derives JWT scopes from assigned role permissions during login', async () => {
+    const prisma = {
+      user: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'user-1',
+          tenantId: 'tenant-1',
+          email: 'hr@example.com',
+          name: 'HR User',
+          avatarUrl: null,
+          passwordHash: bcrypt.hashSync('Password@123', 4),
+          isSuperAdmin: false,
+          tenant: { id: 'tenant-1', slug: 'acme', name: 'Acme' },
+          employee: null,
+          userRoles: [
+            {
+              role: {
+                name: 'HR Admin',
+                permissions: [
+                  { module: 'employees', permissionType: 'VIEW' },
+                  { module: 'employees', permissionType: 'CREATE' },
+                  { module: 'workflows', permissionType: 'APPROVE' },
+                ],
+              },
+            },
+          ],
+        }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const jwt = {
+      signAsync: jest.fn().mockResolvedValue('signed-login-token'),
+    } as unknown as JwtService;
+    const service = new AuthService(prisma as any, jwt);
+
+    const result = await service.login({ email: 'hr@example.com', password: 'Password@123' });
+
+    expect(result.user).toEqual(
+      expect.objectContaining({
+        roles: ['HR Admin'],
+        scopes: ['employees:read', 'employees:write', 'workflow:approve'],
+      }),
+    );
+    expect(jwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roles: ['HR Admin'],
+        scopes: ['employees:read', 'employees:write', 'workflow:approve'],
+      }),
+    );
   });
 
   it('issues an OAuth2 client credentials access token with allowed scopes only', async () => {
