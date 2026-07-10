@@ -8,6 +8,34 @@ import { AuthUser } from '../../common/types/auth-user';
 import { ChangePasswordDto, LoginDto, OAuthTokenDto, SignupDto } from './dto/login.dto';
 import { JwtPayload } from './jwt.strategy';
 
+const TENANT_OWNER_SCOPES = [
+  'attendance:approve',
+  'attendance:import',
+  'attendance:read',
+  'attendance:write',
+  'documents:read',
+  'documents:write',
+  'employees:approve',
+  'employees:read',
+  'employees:write',
+  'helpdesk:approve',
+  'helpdesk:read',
+  'helpdesk:write',
+  'leave:approve',
+  'leave:read',
+  'leave:write',
+  'notifications:read',
+  'notifications:write',
+  'organization:read',
+  'organization:write',
+  'payroll:approve',
+  'payroll:read',
+  'payroll:write',
+  'workflow:approve',
+  'workflow:read',
+  'workflow:write',
+];
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -25,7 +53,16 @@ export class AuthService {
       include: {
         tenant: { select: { id: true, slug: true, name: true } },
         employee: { select: { id: true, employeeCode: true } },
-        userRoles: { include: { role: { select: { name: true } } } },
+        userRoles: {
+          include: {
+            role: {
+              select: {
+                name: true,
+                permissions: { select: { module: true, permissionType: true } },
+              },
+            },
+          },
+        },
       },
     });
 
@@ -38,6 +75,8 @@ export class AuthService {
       data: { lastLoginAt: new Date() },
     });
 
+    const roles = user.userRoles.map((ur) => ur.role.name);
+    const scopes = this.scopesForRoles(user.userRoles);
     const payload: JwtPayload = {
       sub: user.id,
       tenantId: user.tenantId,
@@ -45,9 +84,9 @@ export class AuthService {
       name: user.name,
       isSuperAdmin: user.isSuperAdmin,
       employeeId: user.employee?.id ?? null,
-      roles: user.userRoles.map((ur) => ur.role.name),
+      roles,
       authType: 'jwt',
-      scopes: [],
+      scopes,
     };
 
     return {
@@ -60,7 +99,8 @@ export class AuthService {
         isSuperAdmin: user.isSuperAdmin,
         employeeId: user.employee?.id ?? null,
         employeeCode: user.employee?.employeeCode ?? null,
-        roles: payload.roles,
+        roles,
+        scopes,
         tenant: user.tenant,
       },
     };
@@ -176,6 +216,7 @@ export class AuthService {
     });
 
     const roles = ['Tenant Owner'];
+    const scopes = [...TENANT_OWNER_SCOPES];
     const payload: JwtPayload = {
       sub: created.owner.id,
       tenantId: created.tenant.id,
@@ -185,7 +226,7 @@ export class AuthService {
       employeeId: null,
       roles,
       authType: 'jwt',
-      scopes: [],
+      scopes,
     };
 
     return {
@@ -199,6 +240,7 @@ export class AuthService {
         employeeId: null,
         employeeCode: null,
         roles,
+        scopes,
         tenant: created.tenant,
       },
       next: '/setup',
@@ -211,9 +253,19 @@ export class AuthService {
       include: {
         tenant: { select: { id: true, slug: true, name: true } },
         employee: { select: { id: true, employeeCode: true } },
-        userRoles: { include: { role: { select: { name: true } } } },
+        userRoles: {
+          include: {
+            role: {
+              select: {
+                name: true,
+                permissions: { select: { module: true, permissionType: true } },
+              },
+            },
+          },
+        },
       },
     });
+    const roles = user.userRoles.map((ur) => ur.role.name);
     return {
       id: user.id,
       email: user.email,
@@ -222,7 +274,8 @@ export class AuthService {
       isSuperAdmin: user.isSuperAdmin,
       employeeId: user.employee?.id ?? null,
       employeeCode: user.employee?.employeeCode ?? null,
-      roles: user.userRoles.map((ur) => ur.role.name),
+      roles,
+      scopes: this.scopesForRoles(user.userRoles),
       tenant: user.tenant,
     };
   }
@@ -324,5 +377,56 @@ export class AuthService {
         scopeType: ScopeType.ENTIRE_TENANT,
       })),
     );
+  }
+
+  private scopesForRoles(
+    userRoles: Array<{
+      role: {
+        name: string;
+        permissions?: Array<{ module: string; permissionType: PermissionType }>;
+      };
+    }>,
+  ) {
+    if (userRoles.some((userRole) => userRole.role.name === 'Tenant Owner')) {
+      return [...TENANT_OWNER_SCOPES];
+    }
+    const scopes = new Set<string>();
+    for (const userRole of userRoles) {
+      for (const permission of userRole.role.permissions ?? []) {
+        const moduleName = this.scopeModule(permission.module);
+        for (const action of this.scopeActions(permission.permissionType)) {
+          scopes.add(`${moduleName}:${action}`);
+        }
+      }
+    }
+    return [...scopes].sort();
+  }
+
+  private scopeModule(moduleName: string) {
+    return moduleName === 'workflows' ? 'workflow' : moduleName;
+  }
+
+  private scopeActions(permissionType: PermissionType) {
+    switch (permissionType) {
+      case PermissionType.VIEW:
+        return ['read'];
+      case PermissionType.CREATE:
+      case PermissionType.EDIT:
+      case PermissionType.DELETE:
+      case PermissionType.CONFIGURE:
+        return ['write'];
+      case PermissionType.APPROVE:
+        return ['approve'];
+      case PermissionType.EXPORT:
+        return ['export'];
+      case PermissionType.IMPORT:
+        return ['import'];
+      case PermissionType.RUN_PAYROLL:
+      case PermissionType.LOCK_PAYROLL:
+      case PermissionType.UNLOCK_PAYROLL:
+        return ['write', 'approve'];
+      default:
+        return [];
+    }
   }
 }
