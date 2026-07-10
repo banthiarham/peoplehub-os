@@ -132,3 +132,19 @@ If Docker Compose fails during activation, the workflow moves the previous relea
 ## First User
 
 Open the public URL and use **Sign up**. Signup creates a new tenant and routes the owner into `/setup`.
+
+## Transactional Email
+
+VioHr supports tenant SMTP from the Communications screen. If no active tenant SMTP
+provider exists, the API uses the platform Resend configuration from
+`deploy/.env.prod`:
+
+```text
+RESEND_API_KEY=<resend-api-key>
+RESEND_FROM_EMAIL=noreply@your-verified-domain.com
+RESEND_FROM_NAME=VioHr
+RESEND_REPLY_TO=support@your-domain.com
+```
+
+Verify the sending domain in Resend before using it for real employee invites,
+password/reset emails, payroll notices, and approval notifications.

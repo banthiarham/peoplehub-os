@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { SmtpConfigService } from './smtp-config.service';
 import { EmailTemplateService } from './email-template.service';
 import { MockEmailProvider } from './providers/mock.provider';
+import { ResendProvider } from './providers/resend.provider';
 import { EmailStatus } from '@prisma/client';
 
 export interface QueueEmailInput {
@@ -140,7 +141,7 @@ export class EmailService {
       }
 
       let result: { success: boolean; messageId?: string; error?: string };
-      let providerType: 'SMTP' | 'MOCK' = 'SMTP';
+      let providerType = 'SMTP';
 
       // Always prefer the tenant's active SMTP provider when one is
       // configured; the mock is only a fallback for dev environments with
@@ -158,6 +159,25 @@ export class EmailService {
           fromName: smtpConfig.fromName,
           replyTo: smtpConfig.replyTo,
         });
+      } else if (this.resendApiKey) {
+        providerType = 'RESEND';
+        const resend = new ResendProvider({
+          apiKey: this.resendApiKey,
+          fromEmail: this.resendFromEmail,
+          fromName: this.resendFromName,
+          replyTo: this.config.get<string>('RESEND_REPLY_TO') || undefined,
+        });
+        result = await resend.sendEmail({
+          to: queued.to,
+          cc: queued.cc,
+          bcc: queued.bcc,
+          subject,
+          bodyHtml,
+          bodyText,
+          fromEmail: this.resendFromEmail,
+          fromName: this.resendFromName,
+          replyTo: this.config.get<string>('RESEND_REPLY_TO') || undefined,
+        });
       } else if (this.isDemoMode) {
         providerType = 'MOCK';
         const mock = new MockEmailProvider();
@@ -172,7 +192,7 @@ export class EmailService {
           fromName: 'VioHr',
         });
       } else {
-        result = { success: false, error: 'No active SMTP provider configured' };
+        result = { success: false, error: 'No active email provider configured' };
       }
 
       const newStatus = result.success ? EmailStatus.SENT : EmailStatus.FAILED;
@@ -372,5 +392,31 @@ export class EmailService {
       create: { tenantId, employeeId, ...data },
       update: data,
     });
+  }
+
+  private get resendApiKey() {
+    return this.config.get<string>('RESEND_API_KEY')?.trim();
+  }
+
+  private get resendFromEmail() {
+    return (
+      this.config.get<string>('RESEND_FROM_EMAIL')?.trim() ||
+      this.parseFrom(this.config.get<string>('EMAIL_FROM') || '').email ||
+      'noreply@viohr.local'
+    );
+  }
+
+  private get resendFromName() {
+    return (
+      this.config.get<string>('RESEND_FROM_NAME')?.trim() ||
+      this.parseFrom(this.config.get<string>('EMAIL_FROM') || '').name ||
+      'VioHr'
+    );
+  }
+
+  private parseFrom(value: string) {
+    const match = value.match(/^"?([^"<]+?)"?\s*<([^>]+)>$/);
+    if (match) return { name: match[1].trim(), email: match[2].trim() };
+    return { name: '', email: value.includes('@') ? value.trim().replace(/^"|"$/g, '') : '' };
   }
 }

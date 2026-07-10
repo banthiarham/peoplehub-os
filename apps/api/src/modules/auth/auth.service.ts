@@ -1,10 +1,12 @@
-import { BadRequestException, ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { PermissionType, Prisma, ScopeType, TenantStatus } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash } from 'crypto';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { EmailService } from '../email/email.service';
 import { ChangePasswordDto, LoginDto, OAuthTokenDto, SignupDto } from './dto/login.dto';
 import { JwtPayload } from './jwt.strategy';
 
@@ -38,9 +40,13 @@ const TENANT_OWNER_SCOPES = [
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
+    private readonly config?: ConfigService,
+    private readonly emailService?: EmailService,
   ) {}
 
   async login(dto: LoginDto) {
@@ -215,6 +221,13 @@ export class AuthService {
       return { tenant, owner };
     });
 
+    await this.sendSignupWelcome(
+      created.tenant.id,
+      created.tenant.name,
+      created.owner.email,
+      created.owner.name ?? created.owner.email,
+    );
+
     const roles = ['Tenant Owner'];
     const scopes = [...TENANT_OWNER_SCOPES];
     const payload: JwtPayload = {
@@ -377,6 +390,45 @@ export class AuthService {
         scopeType: ScopeType.ENTIRE_TENANT,
       })),
     );
+  }
+
+  private async sendSignupWelcome(
+    tenantId: string,
+    companyName: string,
+    ownerEmail: string,
+    ownerName: string,
+  ) {
+    if (!this.emailService) return;
+    try {
+      await this.emailService.sendTransactional(
+        tenantId,
+        'welcome',
+        ownerEmail,
+        {
+          company_name: companyName,
+          employee_name: ownerName,
+          login_link: `${this.appUrl}/login`,
+        },
+        {
+          module: 'auth',
+          relatedType: 'user',
+          relatedId: ownerEmail,
+          idempotencyKey: `signup-welcome:${tenantId}:${ownerEmail}`,
+        },
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Signup welcome email could not be queued: ${err instanceof Error ? err.message : 'unknown error'}`,
+      );
+    }
+  }
+
+  private get appUrl() {
+    return (
+      this.config?.get<string>('APP_URL') ||
+      this.config?.get<string>('NEXT_PUBLIC_APP_URL') ||
+      'https://viohr.triviontechnologies.com'
+    ).replace(/\/$/, '');
   }
 
   private scopesForRoles(

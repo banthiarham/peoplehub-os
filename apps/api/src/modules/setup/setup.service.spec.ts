@@ -150,6 +150,7 @@ describe('SetupService', () => {
         findMany: jest.fn().mockResolvedValue([]),
         create: jest.fn().mockResolvedValue({ id: 'user-2', email: 'harsh@example.com' }),
       },
+      tenant: { findUnique: jest.fn().mockResolvedValue({ name: 'Demo Corp India' }) },
       employee: {
         findMany: jest.fn().mockResolvedValue([]),
         create: jest.fn().mockResolvedValue({ id: 'emp-2', firstName: 'Harsh', lastName: 'Tester' }),

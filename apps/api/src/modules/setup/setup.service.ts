@@ -1,9 +1,11 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcryptjs';
 import { EmploymentType, PermissionType, Prisma, ScopeType } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { EmailService } from '../email/email.service';
 import { SetupEmployeeImportDto, SetupEmployeeImportRowDto, SetupSalaryImportDto, SetupSalaryImportRowDto } from './dto/setup-import.dto';
 
 type Severity = 'critical' | 'warning';
@@ -75,7 +77,13 @@ const SALARY_TEMPLATE_COLUMNS = ['employeeCode', 'salaryStructure', 'ctc', 'effe
 
 @Injectable()
 export class SetupService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(SetupService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config?: ConfigService,
+    private readonly emailService?: EmailService,
+  ) {}
 
   async readiness(tenantId: string) {
     const [
@@ -388,13 +396,17 @@ export class SetupService {
       return imported;
     });
 
-    return {
+    const result = {
       imported: created.length,
       employees: created,
       loginCredentials: created
         .filter((employee) => employee.login)
         .map((employee) => ({ employeeCode: employee.employeeCode, name: employee.name, ...employee.login })),
     };
+
+    await this.sendEmployeeInvites(user.tenantId, result.loginCredentials);
+
+    return result;
   }
 
   async previewSalary(tenantId: string, dto: SetupSalaryImportDto) {
@@ -619,6 +631,77 @@ export class SetupService {
 
   private employeeDisplayName(firstName?: string, lastName?: string) {
     return [firstName, lastName].map((part) => part?.trim()).filter(Boolean).join(' ');
+  }
+
+  private async sendEmployeeInvites(
+    tenantId: string,
+    credentials: Array<{
+      employeeCode: string;
+      name: string;
+      email?: string;
+      temporaryPassword?: string;
+    }>,
+  ) {
+    if (!this.emailService || !credentials.length) return;
+    const emailService = this.emailService;
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { name: true },
+    });
+    await Promise.all(
+      credentials.map(async (credential) => {
+        if (!credential.email || !credential.temporaryPassword) return;
+        try {
+          await emailService.queue({
+            tenantId,
+            to: credential.email,
+            subject: `Welcome to ${tenant?.name ?? 'VioHr'} — your login is ready`,
+            bodyHtml: `
+              <p>Hi ${this.escapeHtml(credential.name)},</p>
+              <p>Your ${this.escapeHtml(tenant?.name ?? 'VioHr')} account has been created.</p>
+              <p><strong>Login email:</strong> ${this.escapeHtml(credential.email)}</p>
+              <p><strong>Temporary password:</strong> ${this.escapeHtml(credential.temporaryPassword)}</p>
+              <p><a href="${this.appUrl}/login">Sign in to VioHr</a></p>
+              <p>Please change this password after your first login.</p>
+            `,
+            bodyText: [
+              `Hi ${credential.name},`,
+              `Your ${tenant?.name ?? 'VioHr'} account has been created.`,
+              `Login email: ${credential.email}`,
+              `Temporary password: ${credential.temporaryPassword}`,
+              `Sign in: ${this.appUrl}/login`,
+              'Please change this password after your first login.',
+            ].join('\n'),
+            isMandatory: true,
+            module: 'auth',
+            relatedType: 'employee',
+            relatedId: credential.employeeCode,
+            idempotencyKey: `employee-invite:${tenantId}:${credential.employeeCode}:${credential.email}`,
+          });
+        } catch (err) {
+          this.logger.warn(
+            `Employee invite email could not be queued for ${credential.employeeCode}: ${err instanceof Error ? err.message : 'unknown error'}`,
+          );
+        }
+      }),
+    );
+  }
+
+  private get appUrl() {
+    return (
+      this.config?.get<string>('APP_URL') ||
+      this.config?.get<string>('NEXT_PUBLIC_APP_URL') ||
+      'https://viohr.triviontechnologies.com'
+    ).replace(/\/$/, '');
+  }
+
+  private escapeHtml(value: string) {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
   }
 
   private indexReferences<T extends { id: string }>(items: T[], fields: Array<keyof T>) {
