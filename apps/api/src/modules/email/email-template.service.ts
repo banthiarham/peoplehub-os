@@ -2,22 +2,55 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../common/database/prisma.service';
 import { EmailTemplateStatus, Prisma } from '@prisma/client';
 
+const BUILT_IN_EMAIL_TEMPLATES: Record<
+  string,
+  { subject: string; bodyHtml: string; bodyText?: string }
+> = {
+  account_invitation: {
+    subject: 'Welcome to {{company_name}} - Set up your account',
+    bodyHtml:
+      '<p>Hi {{employee_name}},</p><p>You have been invited to join {{company_name}} on VioHr.</p><p><a href="{{login_link}}">Set up your account</a></p><p>This link expires in 48 hours.</p>',
+    bodyText:
+      'Hi {{employee_name}}, you have been invited to join {{company_name}} on VioHr. Set up your account: {{login_link}}',
+  },
+  password_reset: {
+    subject: 'Reset your password - {{company_name}}',
+    bodyHtml:
+      '<p>Hi {{employee_name}},</p><p>We received a request to reset your password.</p><p><a href="{{login_link}}">Reset Password</a></p><p>This link expires in 1 hour. If you did not request this, ignore this email.</p>',
+    bodyText:
+      'Hi {{employee_name}}, reset your password using this secure link: {{login_link}}. This link expires in 1 hour.',
+  },
+  welcome: {
+    subject: 'Welcome to {{company_name}}',
+    bodyHtml:
+      '<p>Hi {{employee_name}},</p><p>Welcome aboard. Your account is now active.</p><p><a href="{{login_link}}">Login here</a>.</p>',
+    bodyText: 'Hi {{employee_name}}, welcome aboard. Login here: {{login_link}}',
+  },
+};
+
 @Injectable()
 export class EmailTemplateService {
   constructor(private readonly prisma: PrismaService) {}
 
   async findByKey(tenantId: string, templateKey: string, language = 'en') {
-    // Prefer tenant-specific template, fall back to system default (tenantId null)
-    const template = await this.prisma.emailTemplate.findFirst({
+    const tenantTemplate = await this.prisma.emailTemplate.findFirst({
       where: {
         templateKey,
         language,
         status: 'ACTIVE',
-        OR: [{ tenantId }, { tenantId: null }],
+        tenantId,
       },
-      orderBy: { tenantId: 'desc' }, // tenant-specific rows sort after null
     });
-    return template;
+    if (tenantTemplate) return tenantTemplate;
+
+    return this.prisma.emailTemplate.findFirst({
+      where: {
+        templateKey,
+        language,
+        status: 'ACTIVE',
+        tenantId: null,
+      },
+    });
   }
 
   resolveVariables(template: string, vars: Record<string, string>): string {
@@ -31,12 +64,13 @@ export class EmailTemplateService {
     language = 'en',
   ): Promise<{ subject: string; bodyHtml: string; bodyText: string }> {
     const tpl = await this.findByKey(tenantId, templateKey, language);
-    if (!tpl) throw new NotFoundException(`Email template '${templateKey}' not found`);
+    const source = tpl ?? BUILT_IN_EMAIL_TEMPLATES[templateKey];
+    if (!source) throw new NotFoundException(`Email template '${templateKey}' not found`);
 
     return {
-      subject: this.resolveVariables(tpl.subject, vars),
-      bodyHtml: this.resolveVariables(tpl.bodyHtml, vars),
-      bodyText: tpl.bodyText ? this.resolveVariables(tpl.bodyText, vars) : '',
+      subject: this.resolveVariables(source.subject, vars),
+      bodyHtml: this.resolveVariables(source.bodyHtml, vars),
+      bodyText: source.bodyText ? this.resolveVariables(source.bodyText, vars) : '',
     };
   }
 
