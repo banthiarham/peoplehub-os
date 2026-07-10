@@ -7,6 +7,7 @@ import { Briefcase, CheckCircle2, Send } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { BRAND } from '@/config/brand';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { OpsTextarea } from '@/components/forms/ops-textarea';
@@ -73,7 +74,7 @@ export default function CareersPage() {
             Careers
           </div>
           <h1 className="text-3xl font-semibold tracking-normal sm:text-4xl">
-            {data?.tenant.name ?? 'PeopleHub OS'} open roles
+            {data?.tenant.name ?? BRAND.name} open roles
           </h1>
         </div>
       </section>

@@ -509,7 +509,7 @@ export class RecruitmentService {
 
   private async nextEmployeeCode(tenantId: string) {
     const count = await this.prisma.employee.count({ where: { tenantId } });
-    return `PH-${String(count + 1).padStart(4, '0')}`;
+    return `VH-${String(count + 1).padStart(4, '0')}`;
   }
 
   async convertCandidate(tenantId: string, candidateId: string, dto: ConvertCandidateDto, actorUserId: string) {

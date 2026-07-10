@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { PageHeader } from '@/components/ui/page-header';
+import { BRAND } from '@/config/brand';
 import { useSession } from 'next-auth/react';
 
 interface ChatMessage {
@@ -56,7 +57,7 @@ export default function CopilotPage() {
   return (
     <div className="flex h-[calc(100vh-8rem)] flex-col">
       <PageHeader
-        title="PeopleHub Copilot"
+        title={`${BRAND.name} Copilot`}
         description="Ask about your org — headcount, attendance, leave, payroll compliance and more"
       />
       <Card className="flex flex-1 flex-col overflow-hidden">

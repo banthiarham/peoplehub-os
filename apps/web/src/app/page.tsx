@@ -2,6 +2,7 @@ import { getServerSession } from 'next-auth';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { ArrowRight, Building2, CheckCircle2, LogIn, ShieldCheck, UserPlus } from 'lucide-react';
+import { BRAND } from '@/config/brand';
 import { authOptions } from '@/lib/auth';
 
 const steps = [
@@ -23,11 +24,9 @@ export default async function Home() {
         <section className="flex flex-col bg-primary-950 px-6 py-8 text-white sm:px-10 lg:px-12">
           <div className="flex items-center gap-2.5">
             <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-white text-base font-bold text-primary-800">
-              PH
+              {BRAND.initials}
             </span>
-            <span className="text-lg font-semibold">
-              PeopleHub <span className="font-normal text-primary-300">OS</span>
-            </span>
+            <span className="text-lg font-semibold">{BRAND.name}</span>
           </div>
 
           <div className="my-auto max-w-xl py-16">
@@ -82,7 +81,7 @@ export default async function Home() {
                   </div>
                   <h3 className="mt-4 text-lg font-semibold">Sign in</h3>
                   <p className="mt-2 text-sm leading-6 text-ink-muted">
-                    Use your existing PeopleHub workspace account.
+                    Use your existing {BRAND.name} workspace account.
                   </p>
                   <div className="mt-5 inline-flex items-center gap-2 text-sm font-semibold text-primary-700">
                     Continue <ArrowRight className="h-4 w-4 transition group-hover:translate-x-0.5" />

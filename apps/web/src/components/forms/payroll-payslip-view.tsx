@@ -54,7 +54,7 @@ function ComponentTable({ label, rows }: { label: string; rows: PayslipComponent
 
 /** Presentational payslip document: header, earnings, deductions and highlighted net pay. */
 export function PayrollPayslipView({
-  title = 'PeopleHub OS · Demo Corp',
+  title = 'VioHr · Demo Corp',
   employeeName,
   meta,
   grossPay,

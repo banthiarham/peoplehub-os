@@ -128,7 +128,7 @@ describe('RecruitmentService', () => {
       },
       $transaction: jest.fn(async (fn) => fn({
         employee: {
-          create: jest.fn().mockResolvedValue({ id: 'emp-1', employeeCode: 'PH-0042', joiningDate: new Date('2026-08-01') }),
+          create: jest.fn().mockResolvedValue({ id: 'emp-1', employeeCode: 'VH-0042', joiningDate: new Date('2026-08-01') }),
         },
         candidate: { update: jest.fn().mockResolvedValue({}) },
         employeeLifecycleEvent: { create: jest.fn().mockResolvedValue({}) },
@@ -137,7 +137,7 @@ describe('RecruitmentService', () => {
     const service = new RecruitmentService(prisma as any);
 
     await expect(service.convertCandidate('tenant-1', 'cand-1', {}, 'user-1')).resolves.toEqual(
-      expect.objectContaining({ id: 'emp-1', employeeCode: 'PH-0042' }),
+      expect.objectContaining({ id: 'emp-1', employeeCode: 'VH-0042' }),
     );
     expect(prisma.employee.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({

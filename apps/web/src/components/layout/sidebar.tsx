@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import { useState } from 'react';
 import { NAV_SECTIONS } from '@/config/nav';
+import { BRAND } from '@/config/brand';
 import { cn } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { ChevronRight, CircleDot, PanelLeftClose, PanelLeftOpen, Sparkles } from 'lucide-react';
@@ -20,8 +21,8 @@ export function Sidebar({
   const pathname = usePathname();
   const [hovered, setHovered] = useState(false);
   const compact = collapsed && !hovered;
-  const tenantName = session?.user?.tenant?.name ?? 'PeopleHub OS';
-  const userName = session?.user?.name || session?.user?.email || 'PeopleHub user';
+  const tenantName = session?.user?.tenant?.name ?? BRAND.name;
+  const userName = session?.user?.name || session?.user?.email || `${BRAND.name} user`;
   return (
     <aside
       onMouseEnter={() => setHovered(true)}
@@ -39,12 +40,12 @@ export function Sidebar({
     >
       <div className={cn('flex items-center border-b border-white/10 py-4', compact ? 'justify-center px-3' : 'gap-3 px-4')}>
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-primary-500 via-primary-600 to-slate-900 text-sm font-bold text-white shadow-lg shadow-primary-950/25">
-          PH
+          {BRAND.initials}
         </div>
         <span className={cn('min-w-0', compact && 'sr-only')}>
-          <span className="block text-[15px] font-semibold tracking-tight">PeopleHub OS</span>
+          <span className="block text-[15px] font-semibold tracking-tight">{BRAND.name}</span>
           <span className="block text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
-            AI-first people stack
+            {BRAND.tagline}
           </span>
         </span>
       </div>

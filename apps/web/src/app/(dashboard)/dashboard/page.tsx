@@ -39,6 +39,7 @@ import { cn, formatDate, formatINR } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { BRAND } from '@/config/brand';
 import { Skeleton } from '@/components/ui/skeleton';
 
 type DashboardData = {
@@ -121,7 +122,7 @@ export default function DashboardPage() {
         <CardContent className="flex min-h-80 flex-col items-center justify-center text-center">
           <p className="text-lg font-semibold text-ink">Sign in required</p>
           <p className="mt-2 max-w-md text-sm text-ink-muted">
-            Your local browser does not have an active PeopleHub session.
+            Your local browser does not have an active {BRAND.name} session.
           </p>
           <Button className="mt-5" onClick={() => signIn(undefined, { callbackUrl: '/dashboard' })}>
             Go to sign in

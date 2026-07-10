@@ -25,7 +25,7 @@ async function bootstrap() {
   );
 
   const config = new DocumentBuilder()
-    .setTitle('PeopleHub OS API')
+    .setTitle('VioHr API')
     .setDescription('AI-first HRMS Platform API')
     .setVersion('1.0')
     .addBearerAuth()

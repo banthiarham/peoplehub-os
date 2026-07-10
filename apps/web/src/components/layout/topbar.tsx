@@ -7,6 +7,7 @@ import { signOut, useSession } from 'next-auth/react';
 import { useState } from 'react';
 import { Avatar } from '@/components/ui/avatar';
 import { NAV_SECTIONS } from '@/config/nav';
+import { BRAND } from '@/config/brand';
 import { useCommandPalette } from '@/components/command-palette';
 import { NotificationsMenu } from '@/components/layout/notifications-menu';
 import { cn } from '@/lib/utils';
@@ -17,8 +18,8 @@ export function Topbar() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const pathname = usePathname();
   const openPalette = useCommandPalette();
-  const tenantName = session?.user?.tenant?.name ?? 'PeopleHub OS';
-  const name = session?.user?.name || session?.user?.email || 'PeopleHub user';
+  const tenantName = session?.user?.tenant?.name ?? BRAND.name;
+  const name = session?.user?.name || session?.user?.email || `${BRAND.name} user`;
   const role = session?.user?.roles?.[0] ?? 'Workspace user';
   const email = session?.user?.email ?? '';
 

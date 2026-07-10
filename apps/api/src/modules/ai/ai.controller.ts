@@ -12,7 +12,7 @@ export class AiController {
   constructor(private readonly ai: AiService) {}
 
   @Post('chat')
-  @ApiOperation({ summary: 'Chat with PeopleHub Copilot' })
+  @ApiOperation({ summary: 'Chat with VioHr Copilot' })
   chat(@CurrentUser() user: AuthUser, @Body() dto: ChatDto) {
     return this.ai.chat(user, dto.message, dto.conversationId);
   }

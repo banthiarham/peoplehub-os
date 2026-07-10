@@ -1,14 +1,15 @@
 import type { Metadata, Viewport } from 'next';
 import { Inter } from 'next/font/google';
 import { PwaRegister } from '@/components/pwa-register';
+import { BRAND } from '@/config/brand';
 import { Providers } from './providers';
 import './globals.css';
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
 
 export const metadata: Metadata = {
-  title: 'PeopleHub OS',
-  description: 'The AI-first people platform for modern India',
+  title: BRAND.name,
+  description: BRAND.description,
   manifest: '/manifest.webmanifest',
   icons: {
     icon: '/icons/icon-192.png',
@@ -19,7 +20,7 @@ export const metadata: Metadata = {
   },
   appleWebApp: {
     capable: true,
-    title: 'PeopleHub',
+    title: BRAND.name,
     statusBarStyle: 'default',
   },
 };

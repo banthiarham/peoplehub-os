@@ -1,14 +1,14 @@
-# PeopleHub OS Product Journey Plan
+# VioHr Product Journey Plan
 
 ## Summary
 
-PeopleHub OS already has broad module coverage across HR, payroll, attendance, leave, hiring, performance, helpdesk, assets, workflows, documents, notifications, analytics, and developer APIs. The gap versus Keka, greytHR, Darwinbox, Zoho People, factoHR, Pocket HRMS, Zimyo, and HROne is not missing pages; it is enterprise-operational depth.
+VioHr already has broad module coverage across HR, payroll, attendance, leave, hiring, performance, helpdesk, assets, workflows, documents, notifications, analytics, and developer APIs. The gap versus Keka, greytHR, Darwinbox, Zoho People, factoHR, Pocket HRMS, Zimyo, and HROne is not missing pages; it is enterprise-operational depth.
 
 Primary target: India SMB-midmarket.
 
 First outcome: production-ready core.
 
-This journey makes PeopleHub OS sellable as a serious India-first HRMS/payroll platform by prioritizing:
+This journey makes VioHr sellable as a serious India-first HRMS/payroll platform by prioritizing:
 
 - Payroll and compliance operations, not only payroll calculation.
 - Mobile-first employee and manager self-service.
@@ -29,7 +29,7 @@ Competitor references for product direction:
 
 ## Product North Star
 
-PeopleHub OS should become:
+VioHr should become:
 
 > The India-first people operations system that lets a 100-2,000 employee company run HR, payroll, attendance, compliance, employee service, approvals, and reporting without spreadsheets.
 
@@ -160,7 +160,7 @@ A module is enterprise-runnable only when all answers are yes:
    - BFSI compliance-heavy.
 
 3. Developer ecosystem moat
-   - PeopleHub as the identity, employee, workflow, payroll-status, and notification backbone for other products.
+   - VioHr as the identity, employee, workflow, payroll-status, and notification backbone for other products.
    - Stable scoped APIs, webhooks, sandbox, event replay, and SDK examples.
 
 ## Journey Roadmap
@@ -184,7 +184,7 @@ Acceptance:
 
 ### Phase 1: Implementation And Migration Center
 
-Goal: Let a new company configure PeopleHub OS without engineering support.
+Goal: Let a new company configure VioHr without engineering support.
 
 Key changes:
 
@@ -324,7 +324,7 @@ Acceptance:
 
 ### Phase 6: Trust Center, Security And Enterprise Controls
 
-Goal: Make PeopleHub credible for serious companies.
+Goal: Make VioHr credible for serious companies.
 
 Key changes:
 
@@ -429,7 +429,7 @@ Acceptance:
 
 ### Phase 10: Integration Marketplace And Developer Platform
 
-Goal: Make PeopleHub OS the people-data backbone.
+Goal: Make VioHr the people-data backbone.
 
 Key changes:
 

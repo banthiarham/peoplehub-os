@@ -244,7 +244,7 @@ const emptyCompanySetupForm: CompanySetupForm = {
 
 const sampleEmployeeRows: EmployeeRow[] = [
   {
-    employeeCode: 'PH-1001',
+    employeeCode: 'VH-1001',
     firstName: 'Aarav',
     lastName: 'Sharma',
     workEmail: 'aarav.sharma@example.com',
@@ -253,7 +253,7 @@ const sampleEmployeeRows: EmployeeRow[] = [
     designation: 'Software Engineer',
     location: 'Primary Office',
     legalEntity: 'Primary Legal Entity',
-    managerEmployeeCode: 'PH-1000',
+    managerEmployeeCode: 'VH-1000',
     employmentType: 'FULL_TIME',
     pan: 'ABCDE1234F',
     uan: '100200300400',
@@ -267,7 +267,7 @@ const sampleEmployeeRows: EmployeeRow[] = [
 
 const sampleSalaryRows: SalaryRow[] = [
   {
-    employeeCode: 'PH-1001',
+    employeeCode: 'VH-1001',
     salaryStructure: 'India Standard CTC',
     ctc: '1200000',
     effectiveFrom: '2026-07-01',
@@ -1206,7 +1206,7 @@ function SalaryRows({
       <TBody>
         {rows.map((row, index) => (
           <TR key={index}>
-            <TD><Input value={row.employeeCode} onChange={(e) => update(index, { employeeCode: e.target.value })} placeholder="PH-1001" /></TD>
+            <TD><Input value={row.employeeCode} onChange={(e) => update(index, { employeeCode: e.target.value })} placeholder="VH-1001" /></TD>
             <TD><Input value={row.salaryStructure} onChange={(e) => update(index, { salaryStructure: e.target.value })} placeholder="India Standard CTC" /></TD>
             <TD><Input value={row.ctc} onChange={(e) => update(index, { ctc: e.target.value })} inputMode="numeric" placeholder="1200000" /></TD>
             <TD><Input type="date" value={row.effectiveFrom} onChange={(e) => update(index, { effectiveFrom: e.target.value })} /></TD>

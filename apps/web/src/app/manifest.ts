@@ -1,9 +1,10 @@
 import type { MetadataRoute } from 'next';
+import { BRAND } from '@/config/brand';
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: 'PeopleHub OS',
-    short_name: 'PeopleHub',
+    name: BRAND.name,
+    short_name: BRAND.name,
     description: 'Employee self-service — attendance, leave and payslips',
     start_url: '/me',
     scope: '/',

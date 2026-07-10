@@ -224,7 +224,7 @@ export class SetupService {
         columns: EMPLOYEE_TEMPLATE_COLUMNS,
         sampleRows: [
           {
-            employeeCode: 'PH-1001',
+            employeeCode: 'VH-1001',
             firstName: 'Aarav',
             lastName: 'Sharma',
             workEmail: `aarav.sharma@${emailDomain}`,
@@ -234,7 +234,7 @@ export class SetupService {
             designation: 'Software Engineer',
             location: location?.name ?? 'Primary Office',
             legalEntity: legalEntity?.name ?? tenant?.name ?? 'Primary Legal Entity',
-            managerEmployeeCode: 'PH-1000',
+            managerEmployeeCode: 'VH-1000',
             employmentType: 'FULL_TIME',
             pan: 'ABCDE1234F',
             aadhaar: '',
@@ -256,7 +256,7 @@ export class SetupService {
         columns: SALARY_TEMPLATE_COLUMNS,
         sampleRows: [
           {
-            employeeCode: 'PH-1001',
+            employeeCode: 'VH-1001',
             salaryStructure: 'India Standard CTC',
             ctc: 1200000,
             effectiveFrom: '2026-07-01',
@@ -498,7 +498,7 @@ export class SetupService {
       const managerInDb = refs.employeeByCode.has(this.key(row.managerEmployeeCode));
       const managerInFile = fileCodes.has(this.key(row.managerEmployeeCode));
       if (!managerInDb && !managerInFile) {
-        this.issue(issues, 'managerEmployeeCode', 'manager_unverified', 'Manager code must exist in PeopleHub or in the same import file', 'warning');
+        this.issue(issues, 'managerEmployeeCode', 'manager_unverified', 'Manager code must exist in VioHr or in the same import file', 'warning');
       }
       if (row.employeeCode && this.key(row.managerEmployeeCode) === this.key(row.employeeCode)) {
         this.issue(issues, 'managerEmployeeCode', 'self_manager', 'Employee cannot be their own manager');

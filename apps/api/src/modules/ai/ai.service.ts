@@ -21,7 +21,7 @@ export class AiService {
     if (!apiKey) {
       return {
         reply:
-          'The AI copilot is not configured yet. Set ANTHROPIC_API_KEY in the API environment to enable PeopleHub Copilot — it can answer questions about headcount, attendance, leave balances, payroll compliance (PF/ESI/PT/TDS) and more.',
+          'The AI copilot is not configured yet. Set ANTHROPIC_API_KEY in the API environment to enable VioHr Copilot — it can answer questions about headcount, attendance, leave balances, payroll compliance (PF/ESI/PT/TDS) and more.',
         conversationId: convId,
         configured: false,
       };
@@ -50,7 +50,7 @@ export class AiService {
       {
         model: MODEL,
         max_tokens: 1024,
-        system: `You are PeopleHub Copilot, an HR assistant for an Indian workplace on the PeopleHub OS platform. You are aware of Indian statutory compliance (PF, ESI, Professional Tax, TDS, gratuity, leave rules). Be concise and practical. Live org snapshot: ${JSON.stringify(context)}`,
+        system: `You are VioHr Copilot, an HR assistant for an Indian workplace on the VioHr platform. You are aware of Indian statutory compliance (PF, ESI, Professional Tax, TDS, gratuity, leave rules). Be concise and practical. Live org snapshot: ${JSON.stringify(context)}`,
         messages,
       },
       {

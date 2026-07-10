@@ -203,9 +203,9 @@ export class SmtpConfigService {
     const recipient = smtp.testRecipient ?? smtp.fromEmail;
     const result = await smtpProvider.sendEmail({
       to: [recipient],
-      subject: 'PeopleHub OS — SMTP Test',
+      subject: 'VioHr — SMTP Test',
       bodyHtml:
-        '<p>This is a test email from PeopleHub OS. Your SMTP configuration is working correctly.</p>',
+        '<p>This is a test email from VioHr. Your SMTP configuration is working correctly.</p>',
       fromEmail: smtp.fromEmail,
       fromName: smtp.fromName,
     });

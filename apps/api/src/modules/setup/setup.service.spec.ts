@@ -7,7 +7,7 @@ function referencePrisma(overrides: Record<string, any> = {}) {
     location: { findMany: jest.fn().mockResolvedValue([{ id: 'loc-1', name: 'Bangalore Office' }]) },
     legalEntity: { findMany: jest.fn().mockResolvedValue([{ id: 'entity-1', name: 'Demo Corp India Pvt Ltd', legalName: 'Demo Corp India Pvt Ltd' }]) },
     salaryStructure: { findMany: jest.fn().mockResolvedValue([{ id: 'salary-1', name: 'India Standard CTC' }]) },
-    employee: { findMany: jest.fn().mockResolvedValue([{ id: 'emp-1', employeeCode: 'PH-1000', workEmail: 'manager@example.com', firstName: 'Mira', lastName: 'Rao' }]) },
+    employee: { findMany: jest.fn().mockResolvedValue([{ id: 'emp-1', employeeCode: 'VH-1000', workEmail: 'manager@example.com', firstName: 'Mira', lastName: 'Rao' }]) },
     user: { findMany: jest.fn().mockResolvedValue([{ id: 'user-1', email: 'manager@example.com' }]) },
     ...overrides,
   };
@@ -25,7 +25,7 @@ describe('SetupService', () => {
         findMany: jest.fn().mockResolvedValue([
           {
             id: 'emp-1',
-            employeeCode: 'PH-1',
+            employeeCode: 'VH-1',
             workEmail: 'one@example.com',
             firstName: 'One',
             lastName: 'User',
@@ -67,7 +67,7 @@ describe('SetupService', () => {
     const preview = await service.previewEmployees('tenant-1', {
       rows: [
         {
-          employeeCode: 'PH-1001',
+          employeeCode: 'VH-1001',
           firstName: 'Aarav',
           lastName: 'Sharma',
           workEmail: 'aarav@example.com',
@@ -75,14 +75,14 @@ describe('SetupService', () => {
           designation: 'Software Engineer',
           location: 'Bangalore Office',
           legalEntity: 'Demo Corp India Pvt Ltd',
-          managerEmployeeCode: 'PH-1000',
+          managerEmployeeCode: 'VH-1000',
           salaryStructure: 'India Standard CTC',
           ctc: 1200000,
           bankAccountNumber: '1234567890',
           bankIfsc: 'HDFC0001234',
         },
         {
-          employeeCode: 'PH-1001',
+          employeeCode: 'VH-1001',
           firstName: '',
           lastName: 'Duplicate',
           workEmail: 'bad-email',
@@ -106,7 +106,7 @@ describe('SetupService', () => {
 
     const preview = await service.previewSalary('tenant-1', {
       rows: [
-        { employeeCode: 'PH-1000', salaryStructure: 'India Standard CTC', ctc: 1800000, effectiveFrom: '2026-07-01' },
+        { employeeCode: 'VH-1000', salaryStructure: 'India Standard CTC', ctc: 1800000, effectiveFrom: '2026-07-01' },
         { employeeCode: 'MISSING', salaryStructure: 'Unknown Structure', ctc: 0, effectiveFrom: 'bad-date' },
       ],
     });

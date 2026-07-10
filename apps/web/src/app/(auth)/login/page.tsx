@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { BRAND } from '@/config/brand';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -44,11 +45,9 @@ export default function LoginPage() {
         />
         <div className="flex items-center gap-2.5">
           <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-white text-base font-bold text-primary-800">
-            P
+            {BRAND.initials}
           </span>
-          <span className="text-lg font-semibold text-white">
-            PeopleHub <span className="font-normal text-primary-300">OS</span>
-          </span>
+          <span className="text-lg font-semibold text-white">{BRAND.name}</span>
         </div>
         <div>
           <h1 className="max-w-md text-4xl font-semibold leading-tight text-white">
@@ -59,7 +58,7 @@ export default function LoginPage() {
             company runs on.
           </p>
         </div>
-        <p className="text-sm text-primary-400">© 2026 PeopleHub OS</p>
+        <p className="text-sm text-primary-400">{BRAND.copyright}</p>
       </div>
       <div className="flex w-full items-center justify-center p-8 lg:w-1/2">
         <div className="w-full max-w-sm">

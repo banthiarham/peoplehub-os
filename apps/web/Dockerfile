@@ -3,7 +3,9 @@ FROM node:20-alpine AS runtime
 WORKDIR /app
 
 ARG NEXT_PUBLIC_API_URL=/api/v1
+ARG NEXT_PUBLIC_APP_URL=http://localhost:3000
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 
 COPY package.json package-lock.json turbo.json tsconfig.base.json ./
 COPY apps/web/package.json apps/web/package.json

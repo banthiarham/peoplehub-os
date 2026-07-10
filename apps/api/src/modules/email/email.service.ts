@@ -168,8 +168,8 @@ export class EmailService {
           subject,
           bodyHtml,
           bodyText,
-          fromEmail: 'noreply@peoplehub.local',
-          fromName: 'PeopleHub OS',
+          fromEmail: 'noreply@viohr.local',
+          fromName: 'VioHr',
         });
       } else {
         result = { success: false, error: 'No active SMTP provider configured' };

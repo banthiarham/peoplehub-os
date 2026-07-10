@@ -37,6 +37,7 @@ jobs:
           NEXTAUTH_SECRET: build-time-secret-placeholder-value
           NEXTAUTH_URL: http://localhost:3000
           NEXT_PUBLIC_API_URL: /api/v1
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
 
   deploy:
     name: Deploy to production server
@@ -100,6 +101,10 @@ jobs:
           fi
 
           cp "${deploy_path}/deploy/.env.prod" "${release_path}/deploy/.env.prod"
+          if [ -d "${deploy_path}/deploy/certbot" ]; then
+            mkdir -p "${release_path}/deploy"
+            cp -a "${deploy_path}/deploy/certbot" "${release_path}/deploy/certbot"
+          fi
 
           compose_up() {
             docker compose -p peoplehub -f docker-compose.prod.yml --env-file .env.prod up -d --build --remove-orphans
@@ -109,7 +114,7 @@ jobs:
               if curl --fail --silent --show-error --head http://127.0.0.1 >/dev/null; then
                 return 0
               fi
-              echo "Waiting for PeopleHub health check (${attempt}/30)"
+              echo "Waiting for VioHr health check (${attempt}/30)"
               sleep 2
             done
 

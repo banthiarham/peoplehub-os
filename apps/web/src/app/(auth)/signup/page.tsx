@@ -8,6 +8,7 @@ import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input, Select } from '@/components/ui/input';
+import { BRAND } from '@/config/brand';
 import { invalidateTokenCache } from '@/lib/api';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001/api/v1';
@@ -17,7 +18,7 @@ const goals = [
   { value: 'attendance', label: 'Track attendance' },
   { value: 'hr', label: 'Centralize HR data' },
   { value: 'hiring', label: 'Manage hiring' },
-  { value: 'explore', label: 'Explore PeopleHub' },
+  { value: 'explore', label: `Explore ${BRAND.name}` },
 ];
 
 const companySizes = ['1-50', '51-200', '201-500', '501-1000', '1001-2000', '2000+'];
@@ -126,11 +127,9 @@ export default function SignupPage() {
         <aside className="hidden bg-primary-950 px-12 py-10 text-white lg:flex lg:flex-col">
           <div className="flex items-center gap-2.5">
             <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-white text-base font-bold text-primary-800">
-              PH
+              {BRAND.initials}
             </span>
-            <span className="text-lg font-semibold">
-              PeopleHub <span className="font-normal text-primary-300">OS</span>
-            </span>
+            <span className="text-lg font-semibold">{BRAND.name}</span>
           </div>
 
           <div className="mt-16 max-w-md">
@@ -169,8 +168,8 @@ export default function SignupPage() {
             <div className="mb-8 flex items-center justify-between gap-4">
               <div className="lg:hidden">
                 <div className="flex items-center gap-2">
-                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-800 text-sm font-bold text-white">PH</span>
-                  <span className="font-semibold">PeopleHub OS</span>
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-800 text-sm font-bold text-white">{BRAND.initials}</span>
+                  <span className="font-semibold">{BRAND.name}</span>
                 </div>
               </div>
               <Link className="ml-auto text-sm font-semibold text-primary-700 hover:underline" href="/login">
@@ -211,7 +210,7 @@ export default function SignupPage() {
                         required
                         placeholder="acme-india"
                       />
-                      <span className="block text-xs text-ink-muted">peoplehub.local/{tenantSlug || 'workspace'}</span>
+                      <span className="block text-xs text-ink-muted">{BRAND.workspaceBaseUrl.replace(/^https?:\/\//, '')}/{tenantSlug || 'workspace'}</span>
                     </label>
                     <label className="space-y-1.5">
                       <span className="text-sm font-medium">Legal name</span>

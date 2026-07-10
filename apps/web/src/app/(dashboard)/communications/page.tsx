@@ -175,7 +175,7 @@ export default function CommunicationsPage() {
                 <div className="mt-4 grid gap-2 text-sm">
                   <Row
                     label="From"
-                    value={provider.smtpConfig?.fromEmail ?? 'noreply@peoplehub.local'}
+                    value={provider.smtpConfig?.fromEmail ?? 'noreply@viohr.local'}
                   />
                   <Row
                     label="Daily limit"
