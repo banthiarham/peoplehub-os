@@ -3,11 +3,11 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { PermissionType, Prisma, ScopeType, TenantStatus } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { EmailService } from '../email/email.service';
-import { ChangePasswordDto, LoginDto, OAuthTokenDto, SignupDto } from './dto/login.dto';
+import { ChangePasswordDto, ForgotPasswordDto, LoginDto, OAuthTokenDto, ResetPasswordDto, SignupDto } from './dto/login.dto';
 import { JwtPayload } from './jwt.strategy';
 
 const TENANT_OWNER_SCOPES = [
@@ -37,6 +37,8 @@ const TENANT_OWNER_SCOPES = [
   'workflow:read',
   'workflow:write',
 ];
+
+const PASSWORD_RESET_EXPIRES_MS = 60 * 60 * 1000;
 
 @Injectable()
 export class AuthService {
@@ -260,6 +262,52 @@ export class AuthService {
     };
   }
 
+  async forgotPassword(dto: ForgotPasswordDto) {
+    const email = dto.email.trim().toLowerCase();
+    const user = await this.prisma.user.findFirst({
+      where: { email, isActive: true },
+      include: { tenant: { select: { name: true } } },
+    });
+
+    if (user) {
+      const token = randomBytes(32).toString('base64url');
+      await this.prisma.passwordResetToken.create({
+        data: {
+          tenantId: user.tenantId,
+          userId: user.id,
+          tokenHash: this.hashResetToken(token),
+          expiresAt: new Date(Date.now() + PASSWORD_RESET_EXPIRES_MS),
+        },
+      });
+      await this.sendPasswordResetEmail(user.tenantId, user.tenant.name, user.email, user.name ?? user.email, token);
+    }
+
+    return { message: 'If an active account exists for this email, a password reset link has been sent.' };
+  }
+
+  async resetPassword(dto: ResetPasswordDto) {
+    const tokenHash = this.hashResetToken(dto.token);
+    const reset = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+    });
+    if (!reset || reset.usedAt || reset.expiresAt.getTime() < Date.now()) {
+      throw new BadRequestException('This password reset link is invalid or expired');
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: reset.userId },
+        data: { passwordHash: await bcrypt.hash(dto.newPassword, 10) },
+      }),
+      this.prisma.passwordResetToken.update({
+        where: { id: reset.id },
+        data: { usedAt: new Date() },
+      }),
+    ]);
+
+    return { success: true };
+  }
+
   async me(auth: AuthUser) {
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: auth.userId },
@@ -421,6 +469,41 @@ export class AuthService {
         `Signup welcome email could not be queued: ${err instanceof Error ? err.message : 'unknown error'}`,
       );
     }
+  }
+
+  private async sendPasswordResetEmail(
+    tenantId: string,
+    companyName: string,
+    email: string,
+    name: string,
+    token: string,
+  ) {
+    if (!this.emailService) return;
+    try {
+      await this.emailService.sendTransactional(
+        tenantId,
+        'password_reset',
+        email,
+        {
+          company_name: companyName,
+          employee_name: name,
+          login_link: `${this.appUrl}/reset-password?token=${encodeURIComponent(token)}`,
+        },
+        {
+          module: 'auth',
+          relatedType: 'user',
+          relatedId: email,
+        },
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Password reset email could not be queued: ${err instanceof Error ? err.message : 'unknown error'}`,
+      );
+    }
+  }
+
+  private hashResetToken(token: string) {
+    return createHash('sha256').update(token).digest('hex');
   }
 
   private get appUrl() {

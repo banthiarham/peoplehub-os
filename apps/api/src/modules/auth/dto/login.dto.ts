@@ -29,6 +29,24 @@ export class ChangePasswordDto {
   newPassword!: string;
 }
 
+export class ForgotPasswordDto {
+  @ApiProperty({ example: 'employee@company.com' })
+  @IsEmail()
+  email!: string;
+}
+
+export class ResetPasswordDto {
+  @ApiProperty({ example: 'reset-token-from-email' })
+  @IsString()
+  @IsNotEmpty()
+  token!: string;
+
+  @ApiProperty({ example: 'NewPassword@123' })
+  @IsString()
+  @MinLength(8)
+  newPassword!: string;
+}
+
 export class SignupDto {
   @ApiProperty({ example: 'Acme India Pvt Ltd' })
   @IsString()

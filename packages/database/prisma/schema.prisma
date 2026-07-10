@@ -517,6 +517,20 @@ model Session {
   @@map("sessions")
 }
 
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tenantId  String
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([tenantId, userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
 model Role {
   id          String   @id @default(cuid())
   tenantId    String

@@ -93,6 +93,101 @@ describe('AuthService', () => {
     );
   });
 
+  it('queues a password reset email without revealing account existence', async () => {
+    const prisma = {
+      user: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'user-1',
+          tenantId: 'tenant-1',
+          email: 'owner@acme.example',
+          name: 'Owner User',
+          tenant: { name: 'Acme India' },
+        }),
+      },
+      passwordResetToken: {
+        create: jest.fn().mockResolvedValue({ id: 'reset-1' }),
+      },
+    };
+    const jwt = { signAsync: jest.fn() } as unknown as JwtService;
+    const emailService = {
+      sendTransactional: jest.fn().mockResolvedValue('queue-1'),
+    };
+    const config = {
+      get: jest.fn((key: string) => (key === 'APP_URL' ? 'https://viohr.example' : undefined)),
+    };
+    const service = new AuthService(prisma as any, jwt, config as any, emailService as any);
+
+    const result = await service.forgotPassword({ email: 'OWNER@ACME.EXAMPLE' });
+
+    expect(result.message).toContain('If an active account exists');
+    expect(prisma.passwordResetToken.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        tenantId: 'tenant-1',
+        userId: 'user-1',
+        tokenHash: expect.any(String),
+        expiresAt: expect.any(Date),
+      }),
+    });
+    expect(emailService.sendTransactional).toHaveBeenCalledWith(
+      'tenant-1',
+      'password_reset',
+      'owner@acme.example',
+      expect.objectContaining({
+        login_link: expect.stringContaining('/reset-password?token='),
+      }),
+      expect.objectContaining({ module: 'auth' }),
+    );
+  });
+
+  it('does not create reset tokens for unknown emails', async () => {
+    const prisma = {
+      user: { findFirst: jest.fn().mockResolvedValue(null) },
+      passwordResetToken: { create: jest.fn() },
+    };
+    const jwt = { signAsync: jest.fn() } as unknown as JwtService;
+    const service = new AuthService(prisma as any, jwt);
+
+    await expect(service.forgotPassword({ email: 'missing@example.com' })).resolves.toEqual(
+      expect.objectContaining({ message: expect.stringContaining('If an active account exists') }),
+    );
+    expect(prisma.passwordResetToken.create).not.toHaveBeenCalled();
+  });
+
+  it('resets password with a valid unused token', async () => {
+    const prisma = {
+      passwordResetToken: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'reset-1',
+          userId: 'user-1',
+          usedAt: null,
+          expiresAt: new Date(Date.now() + 60_000),
+        }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      user: {
+        update: jest.fn().mockResolvedValue({}),
+      },
+      $transaction: jest.fn().mockResolvedValue([]),
+    };
+    const jwt = { signAsync: jest.fn() } as unknown as JwtService;
+    const service = new AuthService(prisma as any, jwt);
+
+    await expect(service.resetPassword({ token: 'valid-token', newPassword: 'NewPass@123' })).resolves.toEqual({ success: true });
+
+    expect(prisma.passwordResetToken.findUnique).toHaveBeenCalledWith({
+      where: { tokenHash: expect.any(String) },
+    });
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { passwordHash: expect.any(String) },
+    });
+    expect(prisma.passwordResetToken.update).toHaveBeenCalledWith({
+      where: { id: 'reset-1' },
+      data: { usedAt: expect.any(Date) },
+    });
+    expect(prisma.$transaction).toHaveBeenCalled();
+  });
+
   it('derives JWT scopes from assigned role permissions during login', async () => {
     const prisma = {
       user: {

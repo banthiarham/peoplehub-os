@@ -4,7 +4,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import { AuthService } from './auth.service';
-import { ChangePasswordDto, LoginDto, OAuthTokenDto, SignupDto } from './dto/login.dto';
+import { ChangePasswordDto, ForgotPasswordDto, LoginDto, OAuthTokenDto, ResetPasswordDto, SignupDto } from './dto/login.dto';
 
 @ApiTags('Auth')
 @Controller('auth')
@@ -25,6 +25,22 @@ export class AuthController {
   @ApiOperation({ summary: 'Create a trial workspace and tenant owner account' })
   signup(@Body() dto: SignupDto) {
     return this.authService.signup(dto);
+  }
+
+  @Public()
+  @Post('forgot-password')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Request a password reset email' })
+  forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.forgotPassword(dto);
+  }
+
+  @Public()
+  @Post('reset-password')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Reset password using an emailed token' })
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto);
   }
 
   @Public()
