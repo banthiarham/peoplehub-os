@@ -294,6 +294,28 @@ export class ImportAttendanceRowsDto extends ImportBiometricPunchesDto {
   source?: 'MANUAL' | 'API';
 }
 
+export class UpdateAttendanceRecordDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  date?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  punchIn?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsDateString()
+  punchOut?: string;
+
+  @ApiPropertyOptional({ enum: AttendanceStatus })
+  @IsOptional()
+  @IsEnum(AttendanceStatus)
+  status?: AttendanceStatus;
+}
+
 export class UpsertAttendanceRuleDto {
   @ApiProperty()
   @IsString()

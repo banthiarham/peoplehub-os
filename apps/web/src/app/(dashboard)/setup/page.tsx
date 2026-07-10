@@ -444,7 +444,6 @@ function localPreview(importType: ImportType, employeeRows: EmployeeRow[], salar
 function localEmployeePreviewRow(row: EmployeeRow, index: number, rows: EmployeeRow[]): ImportPreview['rows'][number] {
   const issues: ImportPreview['rows'][number]['issues'] = [];
   if (!row.firstName.trim()) issues.push({ field: 'firstName', code: 'required', severity: 'critical', message: 'First name is required' });
-  if (!row.lastName.trim()) issues.push({ field: 'lastName', code: 'required', severity: 'critical', message: 'Last name is required' });
   if (row.createUser && !row.workEmail.trim()) {
     issues.push({ field: 'workEmail', code: 'login_email_required', severity: 'critical', message: 'Work email is required when Create login is selected' });
   }

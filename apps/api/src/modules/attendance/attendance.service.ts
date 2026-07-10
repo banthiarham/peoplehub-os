@@ -22,6 +22,7 @@ import {
   ListAttendanceDto,
   QrPunchDto,
   RegularizeDto,
+  UpdateAttendanceRecordDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
   UpsertHolidayDto,
@@ -531,6 +532,8 @@ export class AttendanceService {
         punchOut: rec?.punchOut ?? null,
         workingMinutes: rec?.workingMinutes ?? null,
         punchSource: rec?.punchSource ?? null,
+        id: rec?.id ?? null,
+        date: rec?.date ?? today,
       };
     });
     return {
@@ -690,6 +693,64 @@ export class AttendanceService {
       skipped: dto.rows.length - imported,
       unknownEmployeeCodes: [...unknownEmployeeCodes],
     };
+  }
+
+  async updateRecord(tenantId: string, id: string, dto: UpdateAttendanceRecordDto) {
+    const record = await this.prisma.attendanceRecord.findFirst({
+      where: { id, tenantId },
+      include: { employee: { select: { id: true, locationId: true } } },
+    });
+    if (!record) throw new NotFoundException('Attendance record not found');
+    if (record.isFinalized) {
+      throw new BadRequestException('Finalized attendance cannot be edited');
+    }
+
+    const date = dto.date ? dateOnly(new Date(dto.date)) : record.date;
+    const punchIn = dto.punchIn !== undefined ? new Date(dto.punchIn) : record.punchIn;
+    const punchOut = dto.punchOut !== undefined ? new Date(dto.punchOut) : record.punchOut;
+    const workingMinutes =
+      punchIn && punchOut
+        ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000))
+        : undefined;
+    const shift = await this.currentShiftAt(tenantId, record.employeeId, date);
+    const shouldReclassify = !dto.status && (dto.date !== undefined || dto.punchIn !== undefined || dto.punchOut !== undefined);
+    const status = dto.status ?? (shouldReclassify
+      ? this.classifyAttendanceStatus({
+          workingMinutes,
+          shift,
+          tenantId,
+          locationId: record.employee.locationId,
+          date,
+        })
+      : record.status);
+
+    return this.prisma.attendanceRecord.update({
+      where: { id },
+      data: {
+        date,
+        shiftId: shift?.id,
+        punchIn,
+        punchOut,
+        workingMinutes,
+        overtimeMinutes: this.overtimeMinutes(workingMinutes, shift),
+        status,
+        punchSource: record.punchSource ?? 'MANUAL',
+        remarks: record.remarks ?? 'Manual attendance correction',
+      },
+    });
+  }
+
+  async deleteRecord(tenantId: string, id: string) {
+    const record = await this.prisma.attendanceRecord.findFirst({
+      where: { id, tenantId },
+      select: { id: true, isFinalized: true },
+    });
+    if (!record) throw new NotFoundException('Attendance record not found');
+    if (record.isFinalized) {
+      throw new BadRequestException('Finalized attendance cannot be deleted');
+    }
+    await this.prisma.attendanceRecord.delete({ where: { id } });
+    return { deleted: true };
   }
 
   private classifyAttendanceStatus(input: {

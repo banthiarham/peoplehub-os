@@ -22,6 +22,7 @@ import {
   MonthQueryDto,
   QrPunchDto,
   RegularizeDto,
+  UpdateAttendanceRecordDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
   UpsertHolidayDto,
@@ -271,5 +272,21 @@ export class AttendanceController {
   @Scopes('attendance:read')
   list(@CurrentUser() user: AuthUser, @Query() q: ListAttendanceDto) {
     return this.attendance.list(user.tenantId, q);
+  }
+
+  @Patch('records/:id')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Edit an unfinalized manual attendance record' })
+  updateRecord(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateAttendanceRecordDto) {
+    return this.attendance.updateRecord(user.tenantId, id, dto);
+  }
+
+  @Delete('records/:id')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Delete an unfinalized manual attendance record' })
+  deleteRecord(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.attendance.deleteRecord(user.tenantId, id);
   }
 }

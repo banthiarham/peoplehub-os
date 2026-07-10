@@ -121,6 +121,26 @@ describe('SetupService', () => {
     expect(preview.rows[0]?.issues.find((issue) => issue.code === 'missing_bank_details')?.severity).toBe('warning');
   });
 
+  it('allows single-name employee imports without last name', async () => {
+    const prisma = referencePrisma();
+    const service = new SetupService(prisma as any);
+
+    const preview = await service.previewEmployees('tenant-1', {
+      rows: [
+        {
+          employeeCode: 'VH-1003',
+          firstName: 'Ram',
+          workEmail: 'ram@example.com',
+          legalEntity: 'Demo Corp India Pvt Ltd',
+          createUser: true,
+        },
+      ],
+    });
+
+    expect(preview.summary.errors).toBe(0);
+    expect(preview.rows[0]?.normalized.name).toBe('Ram');
+  });
+
   it('returns one-time login credentials when employee import creates users', async () => {
     const prisma = referencePrisma({
       role: { upsert: jest.fn().mockResolvedValue({ id: 'role-employee' }) },

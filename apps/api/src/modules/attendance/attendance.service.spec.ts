@@ -118,4 +118,84 @@ describe('AttendanceService', () => {
     ).rejects.toThrow('BIOMETRIC attendance capture is disabled by HR');
     expect(prisma.attendanceRecord.upsert).not.toHaveBeenCalled();
   });
+
+  it('edits unfinalized manual attendance records', async () => {
+    const prisma = {
+      attendanceRecord: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'record-1',
+          tenantId: 'tenant-1',
+          employeeId: 'emp-1',
+          date: new Date('2026-07-05T00:00:00.000Z'),
+          status: 'PRESENT',
+          punchIn: new Date('2026-07-05T09:00:00.000Z'),
+          punchOut: new Date('2026-07-05T18:00:00.000Z'),
+          punchSource: 'MANUAL',
+          remarks: 'MANUAL import',
+          isFinalized: false,
+          employee: { id: 'emp-1', locationId: null },
+        }),
+        update: jest.fn().mockResolvedValue({ id: 'record-1' }),
+      },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'shift-1',
+          overtimeAfterMinutes: 480,
+          halfDayAfterMinutes: 240,
+          minWorkingMinutes: 480,
+        }),
+      },
+    };
+    const service = new AttendanceService(prisma as any);
+
+    await service.updateRecord('tenant-1', 'record-1', {
+      punchIn: '2026-07-05T09:30:00.000Z',
+      punchOut: '2026-07-05T18:30:00.000Z',
+    });
+
+    expect(prisma.attendanceRecord.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'record-1' },
+      data: expect.objectContaining({
+        punchIn: new Date('2026-07-05T09:30:00.000Z'),
+        punchOut: new Date('2026-07-05T18:30:00.000Z'),
+        workingMinutes: 540,
+        overtimeMinutes: 60,
+        status: 'PRESENT',
+      }),
+    }));
+  });
+
+  it('blocks editing finalized attendance records', async () => {
+    const prisma = {
+      attendanceRecord: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'record-1',
+          tenantId: 'tenant-1',
+          isFinalized: true,
+          employee: { id: 'emp-1', locationId: null },
+        }),
+        update: jest.fn(),
+      },
+    };
+    const service = new AttendanceService(prisma as any);
+
+    await expect(
+      service.updateRecord('tenant-1', 'record-1', { status: 'ABSENT' }),
+    ).rejects.toThrow('Finalized attendance cannot be edited');
+    expect(prisma.attendanceRecord.update).not.toHaveBeenCalled();
+  });
+
+  it('deletes unfinalized attendance records', async () => {
+    const prisma = {
+      attendanceRecord: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'record-1', isFinalized: false }),
+        delete: jest.fn().mockResolvedValue({ id: 'record-1' }),
+      },
+    };
+    const service = new AttendanceService(prisma as any);
+
+    await expect(service.deleteRecord('tenant-1', 'record-1')).resolves.toEqual({ deleted: true });
+    expect(prisma.attendanceRecord.delete).toHaveBeenCalledWith({ where: { id: 'record-1' } });
+  });
 });

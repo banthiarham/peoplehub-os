@@ -314,7 +314,7 @@ export class SetupService {
             data: {
               tenantId: user.tenantId,
               email: row.workEmail.trim().toLowerCase(),
-              name: `${row.firstName.trim()} ${row.lastName.trim()}`,
+              name: this.employeeDisplayName(row.firstName, row.lastName),
               passwordHash: await bcrypt.hash(temporaryPassword, 10),
               isActive: true,
             },
@@ -329,7 +329,7 @@ export class SetupService {
             userId: createdUserId,
             employeeCode,
             firstName: row.firstName.trim(),
-            lastName: row.lastName.trim(),
+            lastName: row.lastName?.trim() ?? '',
             workEmail: this.trimLower(row.workEmail),
             phone: this.trim(row.phone),
             joiningDate: row.joiningDate ? new Date(row.joiningDate) : undefined,
@@ -347,7 +347,7 @@ export class SetupService {
           },
         });
         codeToEmployeeId.set(this.key(employeeCode), employee.id);
-        imported.push({ id: employee.id, employeeCode, name: `${employee.firstName} ${employee.lastName}`, login });
+        imported.push({ id: employee.id, employeeCode, name: this.employeeDisplayName(employee.firstName, employee.lastName), login });
 
         if (row.salaryStructure && row.ctc) {
           const salaryStructureId = this.lookup(refs.salaryStructures, row.salaryStructure);
@@ -496,7 +496,6 @@ export class SetupService {
   ) {
     const issues: ImportIssue[] = [];
     if (!row.firstName?.trim()) this.issue(issues, 'firstName', 'required', 'First name is required');
-    if (!row.lastName?.trim()) this.issue(issues, 'lastName', 'required', 'Last name is required');
     if (row.createUser && !row.workEmail?.trim()) {
       this.issue(issues, 'workEmail', 'login_email_required', 'Work email is required when Create login is selected');
     }
@@ -606,7 +605,7 @@ export class SetupService {
   private toEmployeePreview(row: SetupEmployeeImportRowDto, refs: EmployeeReferenceData) {
     return {
       employeeCode: row.employeeCode || 'Auto-generated',
-      name: `${row.firstName ?? ''} ${row.lastName ?? ''}`.trim(),
+      name: this.employeeDisplayName(row.firstName, row.lastName),
       workEmail: row.workEmail ?? null,
       departmentId: this.lookup(refs.departments, row.department),
       designationId: this.lookup(refs.designations, row.designation),
@@ -616,6 +615,10 @@ export class SetupService {
       managerEmployeeCode: row.managerEmployeeCode ?? null,
       ctc: row.ctc ?? null,
     };
+  }
+
+  private employeeDisplayName(firstName?: string, lastName?: string) {
+    return [firstName, lastName].map((part) => part?.trim()).filter(Boolean).join(' ');
   }
 
   private indexReferences<T extends { id: string }>(items: T[], fields: Array<keyof T>) {

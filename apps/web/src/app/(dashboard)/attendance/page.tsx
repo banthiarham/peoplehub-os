@@ -8,13 +8,17 @@ import {
   CheckCircle2,
   Clock,
   Download,
+  FileUp,
   Fingerprint,
   LogIn,
   LogOut,
   MapPin,
+  Pencil,
+  Plus,
   RadioTower,
   Repeat2,
   Settings2,
+  Trash2,
   Upload,
   Users,
 } from 'lucide-react';
@@ -44,6 +48,8 @@ import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toaster';
 
 interface TodayRow {
+  id: string | null;
+  date: string;
   employee: {
     id: string;
     firstName: string;
@@ -137,6 +143,15 @@ interface HolidayRow {
   isOptional: boolean;
 }
 
+interface AttendanceImportRow {
+  id: string;
+  employeeCode: string;
+  date: string;
+  punchIn: string;
+  punchOut: string;
+  status: string;
+}
+
 type CaptureMode = 'WEB' | 'MOBILE' | 'GPS' | 'QR' | 'BIOMETRIC' | 'MANUAL' | 'API_IMPORT';
 type AttendanceTab = 'today' | 'capture' | 'rules' | 'shifts' | 'rosters' | 'imports' | 'finalize' | 'swaps' | 'compoff' | 'holidays';
 
@@ -173,9 +188,85 @@ const CAPTURE_MODE_HELP: Record<CaptureMode, string> = {
   API_IMPORT: 'External attendance system sync endpoint.',
 };
 
+const ATTENDANCE_STATUS_OPTIONS = [
+  'PRESENT',
+  'LATE',
+  'HALF_DAY',
+  'ABSENT',
+  'MISSING_PUNCH',
+  'ON_LEAVE',
+];
+
+const ATTENDANCE_IMPORT_TEMPLATE = 'employeeCode,date,punchIn,punchOut,status\nVH-1001,2026-07-15,09:00,18:30,PRESENT\n';
+
 function formatMinutes(minutes: number | null | undefined) {
   if (!minutes) return '—';
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function formatDateInput(value: string | null | undefined) {
+  if (!value) return new Date().toISOString().slice(0, 10);
+  return value.slice(0, 10);
+}
+
+function formatTimeInput(value: string | null | undefined) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value.slice(0, 5);
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function combineDateTime(date: string, time: string) {
+  if (!date || !time) return undefined;
+  return new Date(`${date}T${time}:00`).toISOString();
+}
+
+function normalizeImportDateTime(date: string, value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.includes('T')) return new Date(trimmed).toISOString();
+  return combineDateTime(date, trimmed);
+}
+
+function downloadTextFile(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'text/csv;charset=utf-8' });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  window.URL.revokeObjectURL(url);
+}
+
+function parseAttendanceCsv(text: string): AttendanceImportRow[] {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const header = lines[0]?.toLowerCase();
+  const dataLines = header?.includes('employeecode') ? lines.slice(1) : lines;
+  return dataLines.map((line, index) => {
+    const [employeeCode = '', date = '', punchIn = '', punchOut = '', status = 'PRESENT'] = line
+      .split(',')
+      .map((cell) => cell.trim());
+    return {
+      id: `${Date.now()}-${index}`,
+      employeeCode,
+      date,
+      punchIn,
+      punchOut,
+      status: status || 'PRESENT',
+    };
+  });
+}
+
+function newAttendanceImportRow(): AttendanceImportRow {
+  const date = new Date().toISOString().slice(0, 10);
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    employeeCode: '',
+    date,
+    punchIn: '09:00',
+    punchOut: '18:00',
+    status: 'PRESENT',
+  };
 }
 
 function CompactAttendanceMetric({
@@ -260,6 +351,13 @@ export default function AttendancePage() {
   const [regIn, setRegIn] = useState('09:00');
   const [regOut, setRegOut] = useState('18:00');
   const [regReason, setRegReason] = useState('');
+  const [editingRecord, setEditingRecord] = useState<TodayRow | null>(null);
+  const [editForm, setEditForm] = useState({
+    date: new Date().toISOString().slice(0, 10),
+    punchIn: '',
+    punchOut: '',
+    status: 'PRESENT',
+  });
 
   const { data, isLoading } = useQuery({
     queryKey: ['attendance', 'today'],
@@ -324,6 +422,43 @@ export default function AttendancePage() {
       toast('Attendance regularization submitted for approval');
       setRegularizeOpen(false);
       setRegReason('');
+      refresh();
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  const openEditRecord = (row: TodayRow) => {
+    setEditingRecord(row);
+    setEditForm({
+      date: formatDateInput(row.date),
+      punchIn: formatTimeInput(row.punchIn),
+      punchOut: formatTimeInput(row.punchOut),
+      status: row.status,
+    });
+  };
+
+  const updateRecord = useMutation({
+    mutationFn: () => {
+      if (!editingRecord?.id) throw new Error('No attendance record selected');
+      return api.patch(`/attendance/records/${editingRecord.id}`, {
+        date: editForm.date,
+        punchIn: combineDateTime(editForm.date, editForm.punchIn),
+        punchOut: combineDateTime(editForm.date, editForm.punchOut),
+        status: editForm.status,
+      });
+    },
+    onSuccess: () => {
+      toast('Attendance record updated');
+      setEditingRecord(null);
+      refresh();
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  const deleteRecord = useMutation({
+    mutationFn: (id: string) => api.delete(`/attendance/records/${id}`),
+    onSuccess: () => {
+      toast('Attendance record deleted');
       refresh();
     },
     onError: (err) => toast(apiError(err), 'error'),
@@ -475,6 +610,7 @@ export default function AttendancePage() {
                   <TH className="w-[16%]">Check out</TH>
                   <TH className="w-[12%]">Hours</TH>
                   <TH className="w-[6%]">Source</TH>
+                  <TH className="w-[8%]"></TH>
                 </TR>
               </THead>
               <TBody>
@@ -508,6 +644,26 @@ export default function AttendancePage() {
                         {r.punchSource === 'GPS' && <MapPin className="h-3.5 w-3.5 text-teal-700" aria-label="GPS verified" />}
                         {r.punchSource ?? '—'}
                       </span>
+                    </TD>
+                    <TD>
+                      {r.id ? (
+                        <div className="flex justify-end gap-1">
+                          <Button size="sm" variant="ghost" aria-label="Edit attendance record" onClick={() => openEditRecord(r)}>
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            aria-label="Delete attendance record"
+                            onClick={() => {
+                              if (window.confirm('Delete this attendance record?')) deleteRecord.mutate(r.id!);
+                            }}
+                            disabled={deleteRecord.isPending}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      ) : null}
                     </TD>
                   </TR>
                 ))}
@@ -569,6 +725,67 @@ export default function AttendancePage() {
               disabled={!regReason || regularize.isPending}
             >
               Submit
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(editingRecord)} onOpenChange={(open) => !open && setEditingRecord(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit attendance record</DialogTitle>
+            <DialogDescription>
+              Update unfinalized attendance before monthly finalization sends it to payroll.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="mb-1 block text-sm font-medium">Date</label>
+              <Input
+                type="date"
+                value={editForm.date}
+                onChange={(e) => setEditForm((form) => ({ ...form, date: e.target.value }))}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-sm font-medium">Check in</label>
+                <Input
+                  type="time"
+                  value={editForm.punchIn}
+                  onChange={(e) => setEditForm((form) => ({ ...form, punchIn: e.target.value }))}
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-sm font-medium">Check out</label>
+                <Input
+                  type="time"
+                  value={editForm.punchOut}
+                  onChange={(e) => setEditForm((form) => ({ ...form, punchOut: e.target.value }))}
+                />
+              </div>
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium">Status</label>
+              <Select
+                value={editForm.status}
+                onChange={(e) => setEditForm((form) => ({ ...form, status: e.target.value }))}
+              >
+                {ATTENDANCE_STATUS_OPTIONS.map((status) => (
+                  <option key={status} value={status}>{status.replace(/_/g, ' ')}</option>
+                ))}
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingRecord(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => updateRecord.mutate()}
+              disabled={!editForm.date || updateRecord.isPending}
+            >
+              Save changes
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -831,14 +1048,141 @@ function RostersTab() {
 }
 
 function AttendanceImportsTab() {
+  const queryClient = useQueryClient();
   const toast = useToast();
-  const [rows, setRows] = useState('EMP-0001,2026-07-15,2026-07-15T09:00:00.000Z,2026-07-15T18:30:00.000Z,PRESENT');
+  const [rows, setRows] = useState<AttendanceImportRow[]>([newAttendanceImportRow()]);
   const upload = useMutation({
-    mutationFn: () => api.post('/attendance/import/manual', { rows: rows.split('\n').filter(Boolean).map((line) => { const [employeeCode, date, punchIn, punchOut, status] = line.split(',').map((x) => x.trim()); return { employeeCode, date, punchIn, punchOut, status }; }) }),
-    onSuccess: (r) => toast(`Imported ${r.data.imported}, skipped ${r.data.skipped}`),
+    mutationFn: () => api.post('/attendance/import/manual', {
+      rows: rows
+        .filter((row) => row.employeeCode.trim() && row.date)
+        .map((row) => ({
+          employeeCode: row.employeeCode.trim(),
+          date: row.date,
+          punchIn: normalizeImportDateTime(row.date, row.punchIn),
+          punchOut: normalizeImportDateTime(row.date, row.punchOut),
+          status: row.status,
+        })),
+    }),
+    onSuccess: (r) => {
+      toast(`Imported ${r.data.imported}, skipped ${r.data.skipped}`);
+      queryClient.invalidateQueries({ queryKey: ['attendance'] });
+    },
     onError: (err) => toast(apiError(err), 'error'),
   });
-  return <Card className="p-4"><h2 className="text-sm font-semibold">Manual/API attendance upload</h2><textarea className="mt-3 min-h-40 w-full rounded-md border border-line p-3 text-sm" value={rows} onChange={(e) => setRows(e.target.value)} /><Button className="mt-3" onClick={() => upload.mutate()} disabled={upload.isPending}>Import attendance</Button></Card>;
+
+  const updateRow = (id: string, patch: Partial<AttendanceImportRow>) => {
+    setRows((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+  };
+
+  const handleFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const parsed = parseAttendanceCsv(await file.text());
+    setRows(parsed.length ? parsed : [newAttendanceImportRow()]);
+    event.target.value = '';
+  };
+
+  const validRows = rows.filter((row) => row.employeeCode.trim() && row.date).length;
+
+  return (
+    <Card className="overflow-hidden border-slate-200 bg-white">
+      <div className="border-b border-slate-200 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Manual attendance import</p>
+            <p className="mt-1 text-sm text-slate-600">
+              Upload a CSV or add rows below, review every value, then import clean attendance corrections.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => downloadTextFile('attendance-import-template.csv', ATTENDANCE_IMPORT_TEMPLATE)}>
+              <Download className="h-3.5 w-3.5" /> Template
+            </Button>
+            <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-semibold text-ink shadow-sm hover:bg-slate-50">
+              <FileUp className="h-3.5 w-3.5" />
+              Upload CSV
+              <input className="sr-only" type="file" accept=".csv,text/csv" onChange={handleFile} />
+            </label>
+            <Button variant="outline" size="sm" onClick={() => setRows((current) => [...current, newAttendanceImportRow()])}>
+              <Plus className="h-3.5 w-3.5" /> Add row
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="overflow-x-auto">
+        <Table>
+          <THead>
+            <TR>
+              <TH>Employee code</TH>
+              <TH>Date</TH>
+              <TH>Check in</TH>
+              <TH>Check out</TH>
+              <TH>Status</TH>
+              <TH></TH>
+            </TR>
+          </THead>
+          <TBody>
+            {rows.map((row) => (
+              <TR key={row.id}>
+                <TD>
+                  <Input
+                    placeholder="VH-1001"
+                    value={row.employeeCode}
+                    onChange={(e) => updateRow(row.id, { employeeCode: e.target.value })}
+                  />
+                </TD>
+                <TD>
+                  <Input type="date" value={row.date} onChange={(e) => updateRow(row.id, { date: e.target.value })} />
+                </TD>
+                <TD>
+                  <Input
+                    type="time"
+                    value={row.punchIn.includes('T') ? formatTimeInput(row.punchIn) : row.punchIn}
+                    onChange={(e) => updateRow(row.id, { punchIn: e.target.value })}
+                  />
+                </TD>
+                <TD>
+                  <Input
+                    type="time"
+                    value={row.punchOut.includes('T') ? formatTimeInput(row.punchOut) : row.punchOut}
+                    onChange={(e) => updateRow(row.id, { punchOut: e.target.value })}
+                  />
+                </TD>
+                <TD>
+                  <Select value={row.status} onChange={(e) => updateRow(row.id, { status: e.target.value })}>
+                    {ATTENDANCE_STATUS_OPTIONS.map((status) => (
+                      <option key={status} value={status}>{status.replace(/_/g, ' ')}</option>
+                    ))}
+                  </Select>
+                </TD>
+                <TD>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Remove import row"
+                    onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))}
+                    disabled={rows.length === 1}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </TD>
+              </TR>
+            ))}
+          </TBody>
+        </Table>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 p-4">
+        <p className="text-sm text-slate-600">
+          {validRows}/{rows.length} rows ready. Required columns: employee code and date.
+        </p>
+        <Button onClick={() => upload.mutate()} disabled={upload.isPending || validRows === 0}>
+          <Upload className="h-3.5 w-3.5" /> Import attendance
+        </Button>
+      </div>
+    </Card>
+  );
 }
 
 function AttendanceFinalizeTab() {
