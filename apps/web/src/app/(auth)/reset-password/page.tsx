@@ -2,6 +2,7 @@
 
 import axios from 'axios';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,6 +16,7 @@ function apiMessage(error: unknown) {
 }
 
 export default function ResetPasswordPage() {
+  const router = useRouter();
   const [token, setToken] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -35,8 +37,11 @@ export default function ResetPasswordPage() {
     }
     setLoading(true);
     try {
-      await axios.post(`${API_URL}/auth/reset-password`, { token, newPassword: password });
+      await axios.post(`${API_URL}/auth/reset-password`, { token, newPassword: password }, { timeout: 15000 });
       setDone(true);
+      window.setTimeout(() => {
+        router.replace('/login?reset=success');
+      }, 1200);
     } catch (err) {
       setError(apiMessage(err));
     } finally {
@@ -58,7 +63,7 @@ export default function ResetPasswordPage() {
 
         {done ? (
           <div className="mt-8 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-            Your password has been changed. You can sign in with the new password.
+            Your password has been changed. Taking you back to sign in...
           </div>
         ) : (
           <form onSubmit={onSubmit} className="mt-8 space-y-4">
@@ -89,6 +94,11 @@ export default function ResetPasswordPage() {
                 autoComplete="new-password"
               />
             </div>
+            {loading && (
+              <div className="rounded-xl border border-primary-100 bg-primary-50 p-3 text-sm text-primary-900">
+                Saving your new password...
+              </div>
+            )}
             {error && <p className="text-sm text-danger">{error}</p>}
             <Button type="submit" className="w-full" disabled={loading || !token || password.length < 8}>
               {loading ? 'Saving…' : 'Save new password'}

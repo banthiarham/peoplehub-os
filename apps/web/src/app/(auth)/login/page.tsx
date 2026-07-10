@@ -3,7 +3,7 @@
 import { getSession, signIn } from 'next-auth/react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { BRAND } from '@/config/brand';
@@ -13,7 +13,16 @@ export default function LoginPage() {
   const [email, setEmail] = useState('admin@democorp.com');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const resetStatus = new URLSearchParams(window.location.search).get('reset');
+    if (resetStatus === 'success') {
+      setNotice('Password changed. Sign in with your new password.');
+      window.history.replaceState(null, '', '/login');
+    }
+  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -64,6 +73,11 @@ export default function LoginPage() {
         <div className="w-full max-w-sm">
           <h2 className="text-2xl font-semibold tracking-tight">Welcome back</h2>
           <p className="mt-1 text-sm text-ink-muted">Sign in to your workspace</p>
+          {notice && (
+            <div className="mt-5 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+              {notice}
+            </div>
+          )}
           <form onSubmit={onSubmit} className="mt-8 space-y-4">
             <div>
               <label className="mb-1.5 block text-sm font-medium">Work email</label>

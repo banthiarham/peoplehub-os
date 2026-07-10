@@ -23,9 +23,10 @@ export default function ForgotPasswordPage() {
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
     setLoading(true);
+    setSent(false);
     setError('');
     try {
-      await axios.post(`${API_URL}/auth/forgot-password`, { email });
+      await axios.post(`${API_URL}/auth/forgot-password`, { email }, { timeout: 15000 });
       setSent(true);
     } catch (err) {
       setError(apiMessage(err));
@@ -49,8 +50,20 @@ export default function ForgotPasswordPage() {
         </p>
 
         {sent ? (
-          <div className="mt-8 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-            If an active account exists for this email, a reset link has been sent. Check your inbox.
+          <div className="mt-8 space-y-4 rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-sm text-emerald-950">
+            <div>
+              <p className="font-semibold">Check your inbox</p>
+              <p className="mt-1">
+                If an active account exists for <span className="font-semibold">{email}</span>, a secure
+                reset link has been sent. The link expires in 1 hour.
+              </p>
+            </div>
+            <Link
+              href="/login"
+              className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-primary-700 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-primary-900/10 hover:bg-primary-800"
+            >
+              Back to sign in
+            </Link>
           </div>
         ) : (
           <form onSubmit={onSubmit} className="mt-8 space-y-4">
@@ -64,6 +77,11 @@ export default function ForgotPasswordPage() {
                 autoComplete="email"
               />
             </div>
+            {loading && (
+              <div className="rounded-xl border border-primary-100 bg-primary-50 p-3 text-sm text-primary-900">
+                Sending reset instructions to {email || 'this email'}...
+              </div>
+            )}
             {error && <p className="text-sm text-danger">{error}</p>}
             <Button type="submit" className="w-full" disabled={loading}>
               {loading ? 'Sending…' : 'Send reset link'}
