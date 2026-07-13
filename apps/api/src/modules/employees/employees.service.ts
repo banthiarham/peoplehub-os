@@ -245,14 +245,21 @@ export class EmployeesService {
     const entries = Object.entries(rest).filter(([, value]) => value !== undefined);
     const sensitive = entries.filter(([key]) => sensitiveFields.has(key));
     const normal = Object.fromEntries(entries.filter(([key]) => !sensitiveFields.has(key))) as UpdateEmployeeDto;
+    const canUpdateLegalEntity = user.roles.includes('Tenant Owner');
+    const pendingSensitive = user.isSuperAdmin
+      ? []
+      : sensitive.filter(([key]) => key !== 'legalEntityId' || !canUpdateLegalEntity);
+    const directSensitive = user.isSuperAdmin
+      ? sensitive
+      : sensitive.filter(([key]) => key === 'legalEntityId' && canUpdateLegalEntity);
 
-    if (sensitive.length && !user.isSuperAdmin) {
-      await this.createPendingSensitiveChanges(user, existing, sensitive);
+    if (pendingSensitive.length) {
+      await this.createPendingSensitiveChanges(user, existing, pendingSensitive);
     }
 
-    const directSensitive = user.isSuperAdmin ? Object.fromEntries(sensitive) : {};
-    const payload = this.toEmployeeData({ ...normal, ...directSensitive });
-    const changedEntries = Object.entries({ ...normal, ...directSensitive }).filter(([key, value]) =>
+    const directUpdates = Object.fromEntries(directSensitive);
+    const payload = this.toEmployeeData({ ...normal, ...directUpdates });
+    const changedEntries = Object.entries({ ...normal, ...directUpdates }).filter(([key, value]) =>
       this.changed(existing as Record<string, unknown>, key, value),
     );
 
@@ -267,7 +274,7 @@ export class EmployeesService {
 
     return {
       employee: updated,
-      pendingSensitiveChanges: sensitive.length && !user.isSuperAdmin ? sensitive.length : 0,
+      pendingSensitiveChanges: pendingSensitive.length,
     };
   }
 

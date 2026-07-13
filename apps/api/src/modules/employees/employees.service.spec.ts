@@ -91,4 +91,46 @@ describe('EmployeesService', () => {
       data: { pan: 'NEWPAN1234' },
     });
   });
+
+  it('lets tenant owners update legal entity directly while preserving approval for other sensitive fields', async () => {
+    const existing = {
+      id: 'emp-1',
+      tenantId: 'tenant-1',
+      legalEntityId: 'entity-1',
+      pan: 'OLDPAN1234',
+      status: 'ACTIVE',
+    };
+    const prisma = {
+      employee: {
+        findFirst: jest
+          .fn()
+          .mockResolvedValueOnce(existing)
+          .mockResolvedValueOnce({ id: 'requester-employee' })
+          .mockResolvedValueOnce({ id: 'approver-employee' }),
+        update: jest.fn().mockResolvedValue({ ...existing, legalEntityId: 'entity-2' }),
+      },
+      employeeProfileChange: { createMany: jest.fn() },
+      approvalRequest: { create: jest.fn() },
+      auditLog: { create: jest.fn() },
+    };
+    const service = new EmployeesService(prisma as any, {} as any);
+
+    const result = await service.update(
+      { ...user, roles: ['Tenant Owner'] },
+      'emp-1',
+      { legalEntityId: 'entity-2', pan: 'NEWPAN1234' },
+    );
+
+    expect(result.pendingSensitiveChanges).toBe(1);
+    expect(prisma.employee.update).toHaveBeenCalledWith({
+      where: { id: 'emp-1' },
+      data: { legalEntityId: 'entity-2' },
+    });
+    expect(prisma.approvalRequest.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ requestData: { fields: ['pan'] } }),
+    });
+    expect(prisma.employeeProfileChange.createMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({ fieldName: 'pan', approvedAt: null })],
+    });
+  });
 });
