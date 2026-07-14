@@ -1,6 +1,60 @@
 import { AttendanceService } from './attendance.service';
 
 describe('AttendanceService', () => {
+  it('builds the complete attendance ledger for a selected date', async () => {
+    const date = new Date('2026-07-05T00:00:00.000Z');
+    const prisma = {
+      employee: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'emp-1', firstName: 'A', lastName: 'One', employeeCode: 'PH001', department: null },
+          { id: 'emp-2', firstName: 'B', lastName: 'Two', employeeCode: 'PH002', department: null },
+          {
+            id: 'emp-3',
+            firstName: 'C',
+            lastName: 'Three',
+            employeeCode: 'PH003',
+            department: null,
+          },
+        ]),
+      },
+      attendanceRecord: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([
+            {
+              id: 'record-1',
+              employeeId: 'emp-1',
+              date,
+              status: 'PRESENT',
+              punchIn: null,
+              punchOut: null,
+            },
+          ]),
+      },
+      leaveRequest: {
+        findMany: jest.fn().mockResolvedValue([{ employeeId: 'emp-2' }]),
+      },
+    };
+    const service = new AttendanceService(prisma as any);
+
+    const result = await service.forDate('tenant-1', date);
+
+    expect(prisma.attendanceRecord.findMany).toHaveBeenCalledWith({
+      where: { tenantId: 'tenant-1', date },
+    });
+    expect(prisma.leaveRequest.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          tenantId: 'tenant-1',
+          fromDate: { lte: date },
+          toDate: { gte: date },
+        }),
+      }),
+    );
+    expect(result.summary).toEqual({ present: 1, late: 0, absent: 1, onLeave: 1, total: 3 });
+    expect(result.rows.map((row) => row.status)).toEqual(['PRESENT', 'ON_LEAVE', 'ABSENT']);
+  });
+
   it('imports biometric punches by employee code and reports unknown codes', async () => {
     const prisma = {
       employee: {

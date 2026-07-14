@@ -501,7 +501,11 @@ export class AttendanceService {
   }
 
   async today(tenantId: string) {
-    const today = dateOnly(new Date());
+    return this.forDate(tenantId, dateOnly(new Date()));
+  }
+
+  async forDate(tenantId: string, requestedDate: Date) {
+    const date = dateOnly(requestedDate);
     const [employees, records, onLeave] = await Promise.all([
       this.prisma.employee.findMany({
         where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] } },
@@ -513,9 +517,9 @@ export class AttendanceService {
           department: { select: { name: true } },
         },
       }),
-      this.prisma.attendanceRecord.findMany({ where: { tenantId, date: today } }),
+      this.prisma.attendanceRecord.findMany({ where: { tenantId, date } }),
       this.prisma.leaveRequest.findMany({
-        where: { tenantId, status: 'APPROVED', fromDate: { lte: today }, toDate: { gte: today } },
+        where: { tenantId, status: 'APPROVED', fromDate: { lte: date }, toDate: { gte: date } },
         select: { employeeId: true },
       }),
     ]);
@@ -533,11 +537,11 @@ export class AttendanceService {
         workingMinutes: rec?.workingMinutes ?? null,
         punchSource: rec?.punchSource ?? null,
         id: rec?.id ?? null,
-        date: rec?.date ?? today,
+        date: rec?.date ?? date,
       };
     });
     return {
-      date: today,
+      date,
       summary: {
         present: rows.filter((r) => r.status === 'PRESENT').length,
         late: rows.filter((r) => r.status === 'LATE').length,
