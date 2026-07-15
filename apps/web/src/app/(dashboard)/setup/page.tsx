@@ -410,11 +410,16 @@ function salaryFromTemplate(row: Record<string, unknown>): SalaryRow {
   };
 }
 
-function applyCompanyDefaults(row: EmployeeRow, form: CompanySetupForm): EmployeeRow {
-  const departments = departmentNames(form.departmentsText);
+function applyCompanyDefaults(
+  row: EmployeeRow,
+  form: CompanySetupForm,
+  existingDepartments: OrgUnitRecord[],
+): EmployeeRow {
+  const department = departmentNames(form.departmentsText)[0] ?? existingDepartments[0]?.name;
   return {
     ...row,
-    department: row.department === sampleEmployeeRows[0].department ? departments[0] ?? row.department : row.department,
+    department:
+      row.department === sampleEmployeeRows[0].department ? department ?? row.department : row.department,
     location: row.location === sampleEmployeeRows[0].location ? form.locationName || row.location : row.location,
     legalEntity: row.legalEntity === sampleEmployeeRows[0].legalEntity
       ? form.legalEntityName || form.legalName || form.companyName || row.legalEntity
@@ -590,19 +595,22 @@ export default function SetupPage() {
       state: legalEntity?.state ?? location?.state ?? '',
       pincode: location?.pincode ?? '',
       locationName: location?.name ?? '',
-      departmentsText: departments.map((department) => department.name).join('\n'),
+      departmentsText: '',
     });
   }, [companyTouched, departmentsQuery.data, legalEntitiesQuery.data, locationsQuery.data, organizationQuery.data]);
 
   useEffect(() => {
     if (!companyForm.companyName && !companyForm.legalEntityName && !companyForm.locationName) return;
-    setEmployeeRows((rows) => rows.map((row) => applyCompanyDefaults(row, companyForm)));
+    setEmployeeRows((rows) =>
+      rows.map((row) => applyCompanyDefaults(row, companyForm, departmentsQuery.data ?? [])),
+    );
   }, [
     companyForm.companyName,
     companyForm.departmentsText,
     companyForm.legalEntityName,
     companyForm.legalName,
     companyForm.locationName,
+    departmentsQuery.data,
   ]);
 
   const saveCompanyMutation = useMutation({
@@ -723,7 +731,11 @@ export default function SetupPage() {
     setPreview(null);
     setError('');
     if (importType === 'employees') {
-      setEmployeeRows(currentTemplate.sampleRows.map(employeeFromTemplate).map((row) => applyCompanyDefaults(row, companyForm)));
+      setEmployeeRows(
+        currentTemplate.sampleRows
+          .map(employeeFromTemplate)
+          .map((row) => applyCompanyDefaults(row, companyForm, departmentsQuery.data ?? [])),
+      );
     } else {
       setSalaryRows(currentTemplate.sampleRows.map(salaryFromTemplate));
     }
@@ -931,14 +943,35 @@ export default function SetupPage() {
                       </div>
                     </div>
                     <div>
-                      <p className="mb-3 text-sm font-semibold text-ink">Departments</p>
+                      <p className="mb-3 text-sm font-semibold text-ink">Existing Departments</p>
+                      {(departmentsQuery.data ?? []).length > 0 ? (
+                        <div className="mb-4 flex flex-wrap gap-2">
+                          {(departmentsQuery.data ?? []).map((department) => (
+                            <Badge key={department.id} variant="default">
+                              {department.name}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mb-4 text-sm text-ink-muted">No departments have been added yet.</p>
+                      )}
+                      <label
+                        className="mb-3 block text-sm font-semibold text-ink"
+                        htmlFor="new-departments"
+                      >
+                        Add Departments
+                      </label>
                       <textarea
-                        className="min-h-36 w-full rounded-2xl border border-line bg-white px-3.5 py-3 text-sm shadow-sm placeholder:text-ink-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
+                        id="new-departments"
+                        className="min-h-24 w-full rounded-2xl border border-line bg-white px-3.5 py-3 text-sm shadow-sm placeholder:text-ink-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
                         placeholder={'Engineering\nSales\nFinance'}
                         value={companyForm.departmentsText}
                         onChange={(e) => updateCompanyForm({ departmentsText: e.target.value })}
                       />
-                      <p className="mt-2 text-xs text-ink-muted">One department per line. Existing departments stay in place; new names are added.</p>
+                      <p className="mt-2 text-xs text-ink-muted">
+                        Add new departments only, one per line. Existing departments shown above will
+                        remain unchanged.
+                      </p>
                     </div>
                   </div>
                 </div>
