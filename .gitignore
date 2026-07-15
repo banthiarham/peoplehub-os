@@ -2,12 +2,14 @@
 node_modules/
 .pnp
 .pnp.js
+.pnpm-store/
 
 # Build outputs
 .next/
 dist/
 build/
 out/
+context/
 
 # Environment
 .env

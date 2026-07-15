@@ -170,6 +170,8 @@ type CompanySetupForm = {
   departmentsText: string;
 };
 
+type CompanySetupErrors = Partial<Record<keyof CompanySetupForm, string>>;
+
 type EmployeeRow = {
   employeeCode: string;
   firstName: string;
@@ -343,6 +345,64 @@ function departmentNames(text: string) {
     .filter(Boolean);
 }
 
+const panPattern = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+const tanPattern = /^[A-Z]{4}[0-9]{5}[A-Z]$/;
+const gstinPattern = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$/;
+const registrationPattern = /^[A-Z0-9/.-]+$/;
+const employeeCodePattern = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const ifscPattern = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+
+function validateCompanySetup(form: CompanySetupForm): CompanySetupErrors {
+  const errors: CompanySetupErrors = {};
+  const required = (field: keyof CompanySetupForm, label: string, maxLength: number) => {
+    const value = form[field].trim();
+    if (!value) errors[field] = `${label} is required`;
+    else if (value.length > maxLength) errors[field] = `${label} must be ${maxLength} characters or fewer`;
+  };
+  const optionalMax = (field: keyof CompanySetupForm, label: string, maxLength: number) => {
+    if (form[field].trim().length > maxLength) errors[field] = `${label} must be ${maxLength} characters or fewer`;
+  };
+  const optionalPattern = (field: keyof CompanySetupForm, label: string, pattern: RegExp, message: string) => {
+    const value = form[field].trim();
+    if (value && !pattern.test(value)) errors[field] = `${label} ${message}`;
+  };
+
+  required('companyName', 'Company name', 160);
+  if (form.country && !/^[A-Z]{2}$/.test(form.country.trim())) errors.country = 'Country code must contain 2 uppercase letters';
+  if (form.currency && !/^[A-Z]{3}$/.test(form.currency.trim())) errors.currency = 'Currency must contain 3 uppercase letters';
+  if (form.timezone && !/^(?:UTC|[A-Za-z_]+(?:\/[A-Za-z0-9_+.-]+)+)$/.test(form.timezone.trim())) errors.timezone = 'Timezone must be an IANA name such as Asia/Kolkata';
+  optionalMax('legalName', 'Legal name', 200);
+  optionalMax('industry', 'Industry', 100);
+  optionalMax('legalEntityName', 'Legal entity name', 160);
+  optionalMax('locationName', 'Location name', 160);
+  optionalMax('address', 'Address', 500);
+  optionalMax('city', 'City', 100);
+  optionalMax('state', 'State', 100);
+  optionalPattern('pan', 'PAN', panPattern, 'must have the format ABCDE1234F');
+  optionalPattern('tan', 'TAN', tanPattern, 'must have the format ABCD12345E');
+  optionalPattern('gstin', 'GSTIN', gstinPattern, 'must be a valid 15-character GSTIN');
+  optionalPattern('pfRegistrationNumber', 'PF registration number', registrationPattern, 'contains invalid characters');
+  optionalPattern('esiRegistrationNumber', 'ESI registration number', /^\d{17}$/, 'must contain 17 digits');
+  optionalPattern('ptRegistrationNumber', 'PT registration number', registrationPattern, 'contains invalid characters');
+  optionalPattern('pincode', 'Pincode', /^\d{6}$/, 'must contain 6 digits');
+  for (const department of departmentNames(form.departmentsText)) {
+    if (department.length > 120) {
+      errors.departmentsText = 'Department names must be 120 characters or fewer';
+      break;
+    }
+  }
+  return errors;
+}
+
+const companyFieldLabels: Record<keyof CompanySetupForm, string> = {
+  companyName: 'Company name', legalName: 'Legal name', industry: 'Industry', companySize: 'Company size',
+  country: 'Country code', currency: 'Currency', timezone: 'Timezone', legalEntityName: 'Legal entity name',
+  pan: 'PAN', tan: 'TAN', gstin: 'GSTIN', pfRegistrationNumber: 'PF registration number',
+  esiRegistrationNumber: 'ESI registration number', ptRegistrationNumber: 'PT registration number',
+  address: 'Address', city: 'City', state: 'State', pincode: 'Pincode', locationName: 'Location name',
+  departmentsText: 'Departments',
+};
+
 function toCsv(template: TemplateResponse) {
   const lines = [
     template.columns.join(','),
@@ -449,19 +509,45 @@ function localPreview(importType: ImportType, employeeRows: EmployeeRow[], salar
 function localEmployeePreviewRow(row: EmployeeRow, index: number, rows: EmployeeRow[]): ImportPreview['rows'][number] {
   const issues: ImportPreview['rows'][number]['issues'] = [];
   if (!row.firstName.trim()) issues.push({ field: 'firstName', code: 'required', severity: 'critical', message: 'First name is required' });
+  else if (row.firstName.trim().length > 100) issues.push({ field: 'firstName', code: 'too_long', severity: 'critical', message: 'First name must be 100 characters or fewer' });
+  if (row.lastName.trim().length > 100) issues.push({ field: 'lastName', code: 'too_long', severity: 'critical', message: 'Last name must be 100 characters or fewer' });
+  if (row.employeeCode && (!employeeCodePattern.test(row.employeeCode.trim()) || row.employeeCode.trim().length > 50)) {
+    issues.push({ field: 'employeeCode', code: 'invalid_format', severity: 'critical', message: 'Employee code must be 50 characters or fewer and use only letters, numbers, dot, underscore, slash or hyphen' });
+  }
   if (row.createUser && !row.workEmail.trim()) {
     issues.push({ field: 'workEmail', code: 'login_email_required', severity: 'critical', message: 'Work email is required when Create login is selected' });
   }
   if (row.workEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.workEmail)) {
     issues.push({ field: 'workEmail', code: 'invalid_email', severity: 'critical', message: 'Work email is not valid' });
   }
+  if (row.workEmail.trim().length > 254) issues.push({ field: 'workEmail', code: 'too_long', severity: 'critical', message: 'Work email must be 254 characters or fewer' });
+  if (row.joiningDate && Number.isNaN(new Date(row.joiningDate).getTime())) {
+    issues.push({ field: 'joiningDate', code: 'invalid_date', severity: 'critical', message: 'Joining date must be a valid date' });
+  }
+  for (const [field, value, maxLength] of [
+    ['department', row.department, 120],
+    ['designation', row.designation, 120],
+    ['location', row.location, 160],
+    ['legalEntity', row.legalEntity, 160],
+    ['salaryStructure', row.salaryStructure, 160],
+  ] as const) {
+    if (value.trim().length > maxLength) issues.push({ field, code: 'too_long', severity: 'critical', message: `${field} must be ${maxLength} characters or fewer` });
+  }
+  if (row.managerEmployeeCode && (!employeeCodePattern.test(row.managerEmployeeCode.trim()) || row.managerEmployeeCode.trim().length > 50)) {
+    issues.push({ field: 'managerEmployeeCode', code: 'invalid_format', severity: 'critical', message: 'Manager code has an invalid format' });
+  }
   if (!row.legalEntity.trim()) issues.push({ field: 'legalEntity', code: 'required', severity: 'critical', message: 'Legal entity is required for payroll' });
   if (!row.bankAccountNumber.trim() || !row.bankIfsc.trim()) {
     issues.push({ field: 'bankDetails', code: 'missing_bank_details', severity: 'warning', message: 'Bank details are missing; payroll readiness will stay blocked' });
   }
+  if (row.pan && !panPattern.test(row.pan.trim())) issues.push({ field: 'pan', code: 'invalid_format', severity: 'critical', message: 'PAN must have the format ABCDE1234F' });
+  if (row.uan && !/^\d{12}$/.test(row.uan.trim())) issues.push({ field: 'uan', code: 'invalid_format', severity: 'critical', message: 'UAN must contain 12 digits' });
+  if (row.bankAccountNumber && !/^\d{6,34}$/.test(row.bankAccountNumber.trim())) issues.push({ field: 'bankAccountNumber', code: 'invalid_format', severity: 'critical', message: 'Bank account number must contain 6 to 34 digits' });
+  if (row.bankIfsc && !ifscPattern.test(row.bankIfsc.trim())) issues.push({ field: 'bankIfsc', code: 'invalid_format', severity: 'critical', message: 'IFSC must have the format ABCD0123456' });
   if (row.salaryStructure && (!row.ctc || Number(row.ctc) <= 0)) {
     issues.push({ field: 'ctc', code: 'invalid_ctc', severity: 'critical', message: 'CTC must be greater than zero' });
   }
+  if (row.ctc && !Number.isFinite(Number(row.ctc))) issues.push({ field: 'ctc', code: 'invalid_type', severity: 'critical', message: 'CTC must be a number' });
   if (row.employeeCode && rows.some((other, otherIndex) => otherIndex !== index && other.employeeCode && other.employeeCode.trim().toLowerCase() === row.employeeCode.trim().toLowerCase())) {
     issues.push({ field: 'employeeCode', code: 'duplicate_in_file', severity: 'critical', message: 'Employee code repeats in this import' });
   }
@@ -514,6 +600,7 @@ export default function SetupPage() {
   const [loginCredentials, setLoginCredentials] = useState<LoginCredential[]>([]);
   const [error, setError] = useState('');
   const [companyError, setCompanyError] = useState('');
+  const [companyFieldErrors, setCompanyFieldErrors] = useState<CompanySetupErrors>({});
   const [companyTouched, setCompanyTouched] = useState(false);
   const [companyForm, setCompanyForm] = useState<CompanySetupForm>(emptyCompanySetupForm);
 
@@ -615,6 +702,9 @@ export default function SetupPage() {
 
   const saveCompanyMutation = useMutation({
     mutationFn: async () => {
+      const validationErrors = validateCompanySetup(companyForm);
+      setCompanyFieldErrors(validationErrors);
+      if (Object.keys(validationErrors).length) throw new Error('Correct the highlighted company fields before saving');
       const companyName = companyForm.companyName.trim();
       if (!companyName) throw new Error('Company name is required');
 
@@ -693,6 +783,8 @@ export default function SetupPage() {
   const previewMutation = useMutation({
     mutationFn: async () => {
       const body = importType === 'employees' ? employeePayload(employeeRows) : salaryPayload(salaryRows);
+      const browserPreview = localPreview(importType, employeeRows, salaryRows);
+      if (browserPreview.summary.errors > 0) return { ...browserPreview, localOnly: false };
       try {
         return await api.post(`${endpoint}/preview`, body).then((r) => r.data as ImportPreview);
       } catch (err: any) {
@@ -760,6 +852,11 @@ export default function SetupPage() {
   function updateCompanyForm(patch: Partial<CompanySetupForm>) {
     setCompanyTouched(true);
     setCompanyForm((current) => ({ ...current, ...patch }));
+    setCompanyFieldErrors((current) => {
+      const next = { ...current };
+      for (const field of Object.keys(patch) as Array<keyof CompanySetupForm>) delete next[field];
+      return next;
+    });
   }
 
   function actionForIssue(issue: ReadinessIssue & { section: string }) {
@@ -976,6 +1073,16 @@ export default function SetupPage() {
                   </div>
                 </div>
 
+                {Object.keys(companyFieldErrors).length > 0 && (
+                  <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700" role="alert">
+                    <p className="font-semibold">Correct these fields before saving:</p>
+                    <ul className="mt-1 list-disc pl-5">
+                      {(Object.entries(companyFieldErrors) as Array<[keyof CompanySetupForm, string]>).map(([field, message]) => (
+                        <li key={field}><span className="font-medium">{companyFieldLabels[field]}:</span> {message}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 {companyError && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{companyError}</div>}
 
                 <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
