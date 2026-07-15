@@ -12,6 +12,7 @@ import {
   CheckOutDto,
   CreateShiftSwapDto,
   CreateShiftDto,
+  DateQueryDto,
   DecideShiftSwapDto,
   FinalizeAttendanceDto,
   ImportBiometricPunchesDto,
@@ -79,10 +80,12 @@ export class AttendanceController {
   }
 
   @Get('today')
-  @ApiOperation({ summary: 'Org-wide live attendance for today' })
+  @ApiOperation({ summary: 'Org-wide attendance for today or a selected date' })
   @Scopes('attendance:read')
-  today(@CurrentUser() user: AuthUser) {
-    return this.attendance.today(user.tenantId);
+  today(@CurrentUser() user: AuthUser, @Query() q: DateQueryDto) {
+    return q.date
+      ? this.attendance.forDate(user.tenantId, new Date(q.date))
+      : this.attendance.today(user.tenantId);
   }
 
   @Get('me')

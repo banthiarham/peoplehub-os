@@ -153,10 +153,20 @@ interface AttendanceImportRow {
 }
 
 type CaptureMode = 'WEB' | 'MOBILE' | 'GPS' | 'QR' | 'BIOMETRIC' | 'MANUAL' | 'API_IMPORT';
-type AttendanceTab = 'today' | 'capture' | 'rules' | 'shifts' | 'rosters' | 'imports' | 'finalize' | 'swaps' | 'compoff' | 'holidays';
+type AttendanceTab =
+  | 'today'
+  | 'capture'
+  | 'rules'
+  | 'shifts'
+  | 'rosters'
+  | 'imports'
+  | 'finalize'
+  | 'swaps'
+  | 'compoff'
+  | 'holidays';
 
 const ATTENDANCE_TABS: Array<{ id: AttendanceTab; label: string; icon: typeof Clock }> = [
-  { id: 'today', label: 'Today', icon: Clock },
+  { id: 'today', label: 'Attendance', icon: Clock },
   { id: 'capture', label: 'Capture', icon: Settings2 },
   { id: 'rules', label: 'Rules', icon: Settings2 },
   { id: 'shifts', label: 'Shifts', icon: CalendarClock },
@@ -345,7 +355,13 @@ function apiError(err: unknown): string {
 export default function AttendancePage() {
   const queryClient = useQueryClient();
   const toast = useToast();
+  const todayDate = new Date().toISOString().slice(0, 10);
   const [tab, setTab] = useState<AttendanceTab>('today');
+  const [selectedDate, setSelectedDate] = useState(todayDate);
+  const displayDate =
+  selectedDate === todayDate
+    ? 'today'
+    : new Date(selectedDate).toLocaleDateString('en-GB');
   const [regularizeOpen, setRegularizeOpen] = useState(false);
   const [regDate, setRegDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [regIn, setRegIn] = useState('09:00');
@@ -360,8 +376,13 @@ export default function AttendancePage() {
   });
 
   const { data, isLoading } = useQuery({
-    queryKey: ['attendance', 'today'],
-    queryFn: () => api.get('/attendance/today').then((r) => r.data),
+    queryKey: ['attendance', 'today', selectedDate],
+    queryFn: () =>
+      api
+        .get('/attendance/today', {
+          params: selectedDate === todayDate ? undefined : { date: selectedDate },
+        })
+        .then((r) => r.data),
   });
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['attendance'] });
@@ -474,7 +495,8 @@ export default function AttendancePage() {
                 Attendance command
               </h1>
               <p className="text-xs leading-5 text-slate-600">
-                Monitor live punches, exceptions, capture modes, rosters, and payroll-ready finalization.
+                Review punches and exceptions by date, capture modes, rosters, and payroll-ready
+                finalization.
               </p>
             </div>
           </div>
@@ -511,7 +533,7 @@ export default function AttendancePage() {
           <AttendanceMetric
             label="People tracked"
             value={isLoading ? '—' : totalPeople}
-            detail={`${summary.present + summary.late} currently present`}
+            detail={`${summary.present + summary.late} marked present ${selectedDate === todayDate ? displayDate : `on ${displayDate}`}`}
             icon={Users}
             accent="#0F766E"
           />
@@ -525,14 +547,14 @@ export default function AttendancePage() {
           <AttendanceMetric
             label="Exceptions"
             value={isLoading ? '—' : exceptionRows}
-            detail={`${summary.late} late marks today`}
+            detail={`${summary.late} late marks ${selectedDate === todayDate ? displayDate : `on ${displayDate}`}`}
             icon={AlertTriangle}
             accent="#F59E0B"
           />
           <AttendanceMetric
-            label="Live sessions"
+            label="Open sessions"
             value={isLoading ? '—' : workingRows}
-            detail={`${gpsVerifiedRows} GPS verified punches`}
+            detail={`${gpsVerifiedRows} GPS verified punches ${selectedDate === todayDate ? displayDate : `on ${displayDate}`}`}
             icon={RadioTower}
             accent="#7C3AED"
           />
@@ -568,110 +590,156 @@ export default function AttendancePage() {
         })}
       </div>
 
-      {tab === 'today' && (isLoading || !data ? (
-        <div className="space-y-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-            {[...Array(4)].map((_, i) => (
-              <Skeleton key={i} className="h-24" />
-            ))}
-          </div>
-          <Skeleton className="h-96" />
-        </div>
-      ) : (
-        <div>
-          <Card className="overflow-hidden border-slate-200 bg-white">
-            <div className="border-b border-slate-200 p-4">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Live attendance ledger</p>
-                  <p className="mt-1 text-sm text-slate-600">Punch state, hours, source, and exception status.</p>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant={exceptionRows ? 'warning' : 'success'}>{exceptionRows ? 'Review needed' : 'Clean day'}</Badge>
-                  <Badge variant="outline">{rows.length} rows</Badge>
-                </div>
-              </div>
-              <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3 text-xs">
-                <CompactAttendanceMetric label={new Date().toISOString().slice(0, 10)} value={`${presentShare}%`} />
-                <CompactAttendanceMetric label="Present" value={summary.present} />
-                <CompactAttendanceMetric label="Late" value={summary.late} tone={summary.late ? 'warning' : 'default'} />
-                <CompactAttendanceMetric label="On leave" value={summary.onLeave} />
-                <CompactAttendanceMetric label="Absent" value={summary.absent} tone={summary.absent ? 'warning' : 'default'} />
-                <CompactAttendanceMetric label="Working" value={workingRows} />
-                <CompactAttendanceMetric label="GPS" value={gpsVerifiedRows} />
-              </div>
+      {tab === 'today' &&
+        (isLoading || !data ? (
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              {[...Array(4)].map((_, i) => (
+                <Skeleton key={i} className="h-24" />
+              ))}
             </div>
-            <Table>
-              <THead>
-                <TR>
-                  <TH className="w-[34%]">Employee</TH>
-                  <TH className="w-[16%]">Status</TH>
-                  <TH className="w-[16%]">Check in</TH>
-                  <TH className="w-[16%]">Check out</TH>
-                  <TH className="w-[12%]">Hours</TH>
-                  <TH className="w-[6%]">Source</TH>
-                  <TH className="w-[8%]"></TH>
-                </TR>
-              </THead>
-              <TBody>
-                {rows.map((r: TodayRow) => (
-                  <TR key={r.employee.id}>
-                    <TD>
-                      <div className="flex items-center gap-3">
-                        <Avatar name={`${r.employee.firstName} ${r.employee.lastName}`} size="sm" />
-                        <span>
-                          <span className="block font-medium">
-                            {r.employee.firstName} {r.employee.lastName}
-                          </span>
-                          <span className="block text-xs text-ink-muted">
-                            {r.employee.employeeCode} · {r.employee.department?.name ?? 'No department'}
-                          </span>
-                        </span>
-                      </div>
-                    </TD>
-                    <TD>
-                      <Badge variant={statusVariant(r.status)}>{r.status.replace(/_/g, ' ')}</Badge>
-                    </TD>
-                    <TD>
-                      <span className="whitespace-nowrap font-medium text-slate-900">{formatTime(r.punchIn)}</span>
-                    </TD>
-                    <TD>
-                      <span className="whitespace-nowrap text-slate-600">{formatTime(r.punchOut)}</span>
-                    </TD>
-                    <TD className="whitespace-nowrap text-slate-600">{formatMinutes(r.workingMinutes)}</TD>
-                    <TD>
-                      <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-500">
-                        {r.punchSource === 'GPS' && <MapPin className="h-3.5 w-3.5 text-teal-700" aria-label="GPS verified" />}
-                        {r.punchSource ?? '—'}
-                      </span>
-                    </TD>
-                    <TD>
-                      {r.id ? (
-                        <div className="flex justify-end gap-1">
-                          <Button size="sm" variant="ghost" aria-label="Edit attendance record" onClick={() => openEditRecord(r)}>
-                            <Pencil className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            aria-label="Delete attendance record"
-                            onClick={() => {
-                              if (window.confirm('Delete this attendance record?')) deleteRecord.mutate(r.id!);
-                            }}
-                            disabled={deleteRecord.isPending}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      ) : null}
-                    </TD>
+            <Skeleton className="h-96" />
+          </div>
+        ) : (
+          <div>
+            <Card className="overflow-hidden border-slate-200 bg-white">
+              <div className="border-b border-slate-200 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Attendance ledger
+                    </p>
+                    <p className="mt-1 text-sm text-slate-600">
+                      Punch state, hours, source, and exception status by date.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Input
+                      type="date"
+                      className="w-40"
+                      value={selectedDate}
+                      max={todayDate}
+                      onChange={(event) => setSelectedDate(event.target.value)}
+                      aria-label="Attendance date"
+                    />
+                    <Badge variant={exceptionRows ? 'warning' : 'success'}>
+                      {exceptionRows ? 'Review needed' : 'Clean day'}
+                    </Badge>
+                    <Badge variant="outline">{rows.length} rows</Badge>
+                  </div>
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3 text-xs">
+                  <CompactAttendanceMetric label={selectedDate} value={`${presentShare}%`} />
+                  <CompactAttendanceMetric label="Present" value={summary.present} />
+                  <CompactAttendanceMetric
+                    label="Late"
+                    value={summary.late}
+                    tone={summary.late ? 'warning' : 'default'}
+                  />
+                  <CompactAttendanceMetric label="On leave" value={summary.onLeave} />
+                  <CompactAttendanceMetric
+                    label="Absent"
+                    value={summary.absent}
+                    tone={summary.absent ? 'warning' : 'default'}
+                  />
+                  <CompactAttendanceMetric label="Working" value={workingRows} />
+                  <CompactAttendanceMetric label="GPS" value={gpsVerifiedRows} />
+                </div>
+              </div>
+              <Table>
+                <THead>
+                  <TR>
+                    <TH className="w-[34%]">Employee</TH>
+                    <TH className="w-[16%]">Status</TH>
+                    <TH className="w-[16%]">Check in</TH>
+                    <TH className="w-[16%]">Check out</TH>
+                    <TH className="w-[12%]">Hours</TH>
+                    <TH className="w-[6%]">Source</TH>
+                    <TH className="w-[8%]"></TH>
                   </TR>
-                ))}
-              </TBody>
-            </Table>
-          </Card>
-        </div>
-      ))}
+                </THead>
+                <TBody>
+                  {rows.map((r: TodayRow) => (
+                    <TR key={r.employee.id}>
+                      <TD>
+                        <div className="flex items-center gap-3">
+                          <Avatar
+                            name={`${r.employee.firstName} ${r.employee.lastName}`}
+                            size="sm"
+                          />
+                          <span>
+                            <span className="block font-medium">
+                              {r.employee.firstName} {r.employee.lastName}
+                            </span>
+                            <span className="block text-xs text-ink-muted">
+                              {r.employee.employeeCode} ·{' '}
+                              {r.employee.department?.name ?? 'No department'}
+                            </span>
+                          </span>
+                        </div>
+                      </TD>
+                      <TD>
+                        <Badge variant={statusVariant(r.status)}>
+                          {r.status.replace(/_/g, ' ')}
+                        </Badge>
+                      </TD>
+                      <TD>
+                        <span className="whitespace-nowrap font-medium text-slate-900">
+                          {formatTime(r.punchIn)}
+                        </span>
+                      </TD>
+                      <TD>
+                        <span className="whitespace-nowrap text-slate-600">
+                          {formatTime(r.punchOut)}
+                        </span>
+                      </TD>
+                      <TD className="whitespace-nowrap text-slate-600">
+                        {formatMinutes(r.workingMinutes)}
+                      </TD>
+                      <TD>
+                        <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+                          {r.punchSource === 'GPS' && (
+                            <MapPin
+                              className="h-3.5 w-3.5 text-teal-700"
+                              aria-label="GPS verified"
+                            />
+                          )}
+                          {r.punchSource ?? '—'}
+                        </span>
+                      </TD>
+                      <TD>
+                        {r.id ? (
+                          <div className="flex justify-end gap-1">
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              aria-label="Edit attendance record"
+                              onClick={() => openEditRecord(r)}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              aria-label="Delete attendance record"
+                              onClick={() => {
+                                if (window.confirm('Delete this attendance record?'))
+                                  deleteRecord.mutate(r.id!);
+                              }}
+                              disabled={deleteRecord.isPending}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        ) : null}
+                      </TD>
+                    </TR>
+                  ))}
+                </TBody>
+              </Table>
+            </Card>
+          </div>
+        ))}
 
       {tab === 'rules' && <AttendanceRulesTab />}
       {tab === 'capture' && <CaptureSettingsTab />}

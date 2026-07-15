@@ -118,6 +118,13 @@ export class MonthQueryDto {
   month?: string;
 }
 
+export class DateQueryDto {
+  @ApiPropertyOptional({ example: '2026-07-14', description: 'YYYY-MM-DD (defaults to today)' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  date?: string;
+}
+
 export class RegularizeDto {
   @ApiPropertyOptional({ description: 'Defaults to own employee id' })
   @IsOptional()
