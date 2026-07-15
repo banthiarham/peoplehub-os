@@ -181,7 +181,12 @@ export class OrganizationService {
   }
 
   async createOrgUnit(tenantId: string, kind: OrgUnitKind, dto: CreateOrgUnitDto, actorUserId: string) {
-    const data = { tenantId, name: dto.name, code: dto.code, isActive: dto.isActive ?? true };
+    const data = {
+      tenantId,
+      name: dto.name,
+      ...(dto.code !== undefined && { code: dto.code }),
+      isActive: dto.isActive ?? true,
+    };
     const created =
       kind === 'departments'
         ? await this.prisma.department.create({
@@ -208,7 +213,7 @@ export class OrganizationService {
     const existing = await this.findOrgUnit(tenantId, kind, id);
     const base = {
       name: dto.name,
-      code: dto.code,
+      ...(dto.code !== undefined && { code: dto.code }),
       isActive: dto.isActive,
     };
     const updated =
@@ -219,8 +224,13 @@ export class OrganizationService {
           })
         : kind === 'designations'
           ? await this.prisma.designation.update({
-              where: { id },
-              data: { ...base, grade: dto.grade, level: dto.level },
+            where: { id },
+              data: {
+                ...base,
+                ...(dto.code === '' && { code: null }),
+                grade: dto.grade,
+                level: dto.level,
+              },
             })
           : kind === 'cost-centers'
             ? await this.prisma.costCenter.update({ where: { id }, data: base })
