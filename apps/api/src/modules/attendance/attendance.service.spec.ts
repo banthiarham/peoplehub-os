@@ -34,6 +34,10 @@ describe('AttendanceService', () => {
       leaveRequest: {
         findMany: jest.fn().mockResolvedValue([{ employeeId: 'emp-2' }]),
       },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }),
+      },
     };
     const service = new AttendanceService(prisma as any);
 
@@ -53,6 +57,76 @@ describe('AttendanceService', () => {
     );
     expect(result.summary).toEqual({ present: 1, late: 0, absent: 1, onLeave: 1, total: 3 });
     expect(result.rows.map((row) => row.status)).toEqual(['PRESENT', 'ON_LEAVE', 'ABSENT']);
+  });
+
+  it('uses configured weekly offs after records and approved leave but before absence', async () => {
+    const date = new Date('2026-07-05T00:00:00.000Z');
+    const employees = ['emp-record', 'emp-leave', 'emp-weekend', 'emp-working'].map((id) => ({
+      id,
+      firstName: id,
+      lastName: 'Employee',
+      employeeCode: id,
+      department: null,
+    }));
+    const prisma = {
+      employee: { findMany: jest.fn().mockResolvedValue(employees) },
+      attendanceRecord: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'record-1',
+            employeeId: 'emp-record',
+            date,
+            status: 'PRESENT',
+            punchIn: null,
+            punchOut: null,
+          },
+        ]),
+      },
+      leaveRequest: { findMany: jest.fn().mockResolvedValue([{ employeeId: 'emp-leave' }]) },
+      shiftAssignment: {
+        findFirst: jest.fn().mockImplementation(({ where }: { where: { employeeId: string } }) =>
+          Promise.resolve({
+            shift: {
+              id: `shift-${where.employeeId}`,
+              weeklyOffDays: where.employeeId === 'emp-working' ? [] : [0],
+            },
+          }),
+        ),
+      },
+      shift: { findFirst: jest.fn() },
+    };
+    const service = new AttendanceService(prisma as any);
+
+    const result = await service.forDate('tenant-1', date);
+
+    expect(result.rows.map((row) => row.status)).toEqual([
+      'PRESENT',
+      'ON_LEAVE',
+      'WEEKEND',
+      'ABSENT',
+    ]);
+    expect(result.summary.absent).toBe(1);
+  });
+
+  it('updates only weekly off days on a tenant shift', async () => {
+    const prisma = {
+      shift: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'shift-1' }),
+        update: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0] }),
+      },
+    };
+    const service = new AttendanceService(prisma as any);
+
+    await expect(
+      service.updateShiftWeeklyOffs('tenant-1', 'shift-1', { weeklyOffDays: [0] }),
+    ).resolves.toEqual({ id: 'shift-1', weeklyOffDays: [0] });
+    expect(prisma.shift.findFirst).toHaveBeenCalledWith({
+      where: { id: 'shift-1', tenantId: 'tenant-1' },
+    });
+    expect(prisma.shift.update).toHaveBeenCalledWith({
+      where: { id: 'shift-1' },
+      data: { weeklyOffDays: [0] },
+    });
   });
 
   it('imports biometric punches by employee code and reports unknown codes', async () => {

@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsArray,
+  ArrayUnique,
   IsBoolean,
   IsDateString,
   IsEnum,
@@ -236,6 +237,20 @@ export class CreateShiftDto {
   @IsOptional()
   @IsBoolean()
   compOffEligible?: boolean;
+}
+
+export class UpdateShiftWeeklyOffsDto {
+  @ApiProperty({
+    type: [Number],
+    example: [0, 6],
+    description: 'Weekdays where 0=Sunday and 6=Saturday',
+  })
+  @IsArray()
+  @ArrayUnique()
+  @IsInt({ each: true })
+  @Min(0, { each: true })
+  @Max(6, { each: true })
+  weeklyOffDays!: number[];
 }
 
 export class AssignShiftDto {
