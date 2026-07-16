@@ -55,8 +55,8 @@ describe('AttendanceService', () => {
         }),
       }),
     );
-    expect(result.summary).toEqual({ present: 1, late: 0, absent: 1, onLeave: 1, total: 3 });
-    expect(result.rows.map((row) => row.status)).toEqual(['PRESENT', 'ON_LEAVE', 'ABSENT']);
+    expect(result.summary).toEqual({ present: 1, late: 0, absent: 0, onLeave: 1, total: 3 });
+    expect(result.rows.map((row) => row.status)).toEqual(['PRESENT', 'ON_LEAVE', 'WEEKEND']);
   });
 
   it('uses configured weekly offs after records and approved leave but before absence', async () => {
