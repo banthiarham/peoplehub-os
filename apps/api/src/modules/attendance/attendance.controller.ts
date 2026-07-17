@@ -24,6 +24,7 @@ import {
   QrPunchDto,
   RegularizeDto,
   UpdateAttendanceRecordDto,
+  UpdateShiftWeeklyOffsDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
   UpsertHolidayDto,
@@ -189,6 +190,18 @@ export class AttendanceController {
   @Scopes('attendance:write')
   createShift(@CurrentUser() user: AuthUser, @Body() dto: CreateShiftDto) {
     return this.attendance.createShift(user.tenantId, dto);
+  }
+
+  @Patch('shifts/:id/weekly-offs')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Update only the configured weekly off days for a shift' })
+  updateShiftWeeklyOffs(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateShiftWeeklyOffsDto,
+  ) {
+    return this.attendance.updateShiftWeeklyOffs(user.tenantId, id, dto);
   }
 
   @Post('shifts/assign')

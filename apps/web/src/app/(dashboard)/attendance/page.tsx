@@ -108,6 +108,7 @@ interface ShiftRow {
   endTime: string;
   gracePeriodMins: number;
   shiftAllowanceAmount: number | string;
+  weeklyOffDays: number[];
   _count?: { shiftAssignments?: number };
 }
 
@@ -679,7 +680,9 @@ export default function AttendancePage() {
                         </div>
                       </TD>
                       <TD>
-                        <Badge variant={statusVariant(r.status)}>
+                        <Badge
+                          variant={r.status === 'WEEKEND' ? 'violet' : statusVariant(r.status)}
+                        >
                           {r.status.replace(/_/g, ' ')}
                         </Badge>
                       </TD>
@@ -1067,14 +1070,36 @@ function ShiftsTab() {
     queryKey: ['attendance', 'shifts'],
     queryFn: () => api.get('/attendance/shifts').then((r) => r.data as ShiftRow[]),
   });
-  const [form, setForm] = useState({ name: '', type: 'FIXED', startTime: '09:00', endTime: '18:00', gracePeriodMins: '15', shiftAllowanceAmount: '0' });
+  const [form, setForm] = useState({
+    name: '',
+    type: 'FIXED',
+    startTime: '09:00',
+    endTime: '18:00',
+    gracePeriodMins: '15',
+    shiftAllowanceAmount: '0',
+  });
+  const [editingWeeklyOffs, setEditingWeeklyOffs] = useState<{ id: string; days: number[] } | null>(
+    null,
+  );
   const create = useMutation({
     mutationFn: () => api.post('/attendance/shifts', { ...form, gracePeriodMins: Number(form.gracePeriodMins), shiftAllowanceAmount: Number(form.shiftAllowanceAmount) }),
     onSuccess: () => { toast('Shift saved'); queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] }); setForm((f) => ({ ...f, name: '' })); },
     onError: (err) => toast(apiError(err), 'error'),
   });
+  const updateWeeklyOffs = useMutation({
+    mutationFn: ({ id, days }: { id: string; days: number[] }) =>
+      api.patch(`/attendance/shifts/${id}/weekly-offs`, { weeklyOffDays: days }),
+    onSuccess: () => {
+      toast('Weekly offs updated');
+      queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] });
+      setEditingWeeklyOffs(null);
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+  const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return (
-    <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
+    <>
+      <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
       <Card className="p-4">
         <h2 className="text-sm font-semibold">Create shift</h2>
         <form className="mt-3 space-y-3" onSubmit={(e) => { e.preventDefault(); create.mutate(); }}>
@@ -1090,11 +1115,104 @@ function ShiftsTab() {
       </Card>
       <Card>
         <Table>
-          <THead><TR><TH>Name</TH><TH>Type</TH><TH>Time</TH><TH>Grace</TH><TH>Allowance</TH><TH>Assigned</TH></TR></THead>
-          <TBody>{shifts?.map((s) => <TR key={s.id}><TD className="font-medium">{s.name}</TD><TD>{s.type}</TD><TD>{s.startTime} - {s.endTime}</TD><TD>{s.gracePeriodMins}m</TD><TD>₹{s.shiftAllowanceAmount}</TD><TD>{s._count?.shiftAssignments ?? 0}</TD></TR>)}</TBody>
+          <THead>
+            <TR>
+              <TH>Name</TH>
+              <TH>Type</TH>
+              <TH>Time</TH>
+              <TH>Grace</TH>
+              <TH>Allowance</TH>
+              <TH>Weekly off</TH>
+              <TH>Assigned</TH>
+            </TR>
+          </THead>
+          <TBody>
+            {shifts?.map((s) => {
+              return (
+                <TR key={s.id}>
+                  <TD className="font-medium">{s.name}</TD>
+                  <TD>{s.type}</TD>
+                  <TD>
+                    {s.startTime} - {s.endTime}
+                  </TD>
+                  <TD>{s.gracePeriodMins}m</TD>
+                  <TD>₹{s.shiftAllowanceAmount}</TD>
+                  <TD>
+                    <div className="flex items-center gap-2">
+                      <span>
+                        {s.weeklyOffDays.map((day) => weekdays[day]).join(', ') || 'None'}
+                      </span>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        aria-label={`Edit weekly offs for ${s.name}`}
+                        title="Edit weekly offs"
+                        onClick={() =>
+                          setEditingWeeklyOffs({ id: s.id, days: [...s.weeklyOffDays] })
+                        }
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </TD>
+                  <TD>{s._count?.shiftAssignments ?? 0}</TD>
+                </TR>
+              );
+            })}
+          </TBody>
         </Table>
-      </Card>
-    </div>
+        </Card>
+      </div>
+      <Dialog
+        open={editingWeeklyOffs !== null}
+        onOpenChange={(open) => !open && setEditingWeeklyOffs(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Weekly Off</DialogTitle>
+          </DialogHeader>
+          <div className="flex flex-wrap gap-3 py-2">
+            {weekdays.map((day, index) => (
+              <label key={day} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={editingWeeklyOffs?.days.includes(index) ?? false}
+                  onChange={() =>
+                    setEditingWeeklyOffs(
+                      (current) =>
+                        current && {
+                          ...current,
+                          days: current.days.includes(index)
+                            ? current.days.filter((value) => value !== index)
+                            : [...current.days, index].sort(),
+                        },
+                    )
+                  }
+                />
+                {day}
+              </label>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingWeeklyOffs(null)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={!editingWeeklyOffs || updateWeeklyOffs.isPending}
+              onClick={() =>
+                editingWeeklyOffs &&
+                updateWeeklyOffs.mutate({
+                  id: editingWeeklyOffs.id,
+                  days: editingWeeklyOffs.days,
+                })
+              }
+            >
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

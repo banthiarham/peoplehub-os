@@ -23,6 +23,7 @@ import {
   QrPunchDto,
   RegularizeDto,
   UpdateAttendanceRecordDto,
+  UpdateShiftWeeklyOffsDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
   UpsertHolidayDto,
@@ -135,6 +136,15 @@ export class AttendanceService {
     });
     if (assignment) return assignment.shift;
     return this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
+  }
+
+  private async weeklyOffAt(tenantId: string, employeeId: string, at: Date) {
+    const shift = await this.currentShiftAt(tenantId, employeeId, at);
+    const dayOfWeek = at.getUTCDay();
+    return {
+      shift,
+      isWeeklyOff: shift?.weeklyOffDays.includes(dayOfWeek) ?? (dayOfWeek === 0 || dayOfWeek === 6),
+    };
   }
 
   private async currentShift(tenantId: string, employeeId: string) {
@@ -526,20 +536,28 @@ export class AttendanceService {
     const recordMap = new Map(records.map((r) => [r.employeeId, r]));
     const leaveSet = new Set(onLeave.map((l) => l.employeeId));
 
-    const rows = employees.map((e) => {
-      const rec = recordMap.get(e.id);
-      const status = rec?.status ?? (leaveSet.has(e.id) ? 'ON_LEAVE' : 'ABSENT');
-      return {
-        employee: e,
-        status,
-        punchIn: rec?.punchIn ?? null,
-        punchOut: rec?.punchOut ?? null,
-        workingMinutes: rec?.workingMinutes ?? null,
-        punchSource: rec?.punchSource ?? null,
-        id: rec?.id ?? null,
-        date: rec?.date ?? date,
-      };
-    });
+    const rows = await Promise.all(
+      employees.map(async (e) => {
+        const rec = recordMap.get(e.id);
+        let status: AttendanceStatus;
+        if (rec) status = rec.status;
+        else if (leaveSet.has(e.id)) status = 'ON_LEAVE';
+        else {
+          const { isWeeklyOff } = await this.weeklyOffAt(tenantId, e.id, date);
+          status = isWeeklyOff ? 'WEEKEND' : 'ABSENT';
+        }
+        return {
+          employee: e,
+          status,
+          punchIn: rec?.punchIn ?? null,
+          punchOut: rec?.punchOut ?? null,
+          workingMinutes: rec?.workingMinutes ?? null,
+          punchSource: rec?.punchSource ?? null,
+          id: rec?.id ?? null,
+          date: rec?.date ?? date,
+        };
+      }),
+    );
     return {
       date,
       summary: {
@@ -973,6 +991,15 @@ export class AttendanceService {
     return this.prisma.shift.create({ data: { ...dto, tenantId } });
   }
 
+  async updateShiftWeeklyOffs(tenantId: string, id: string, dto: UpdateShiftWeeklyOffsDto) {
+    const shift = await this.prisma.shift.findFirst({ where: { id, tenantId } });
+    if (!shift) throw new NotFoundException('Shift not found');
+    return this.prisma.shift.update({
+      where: { id },
+      data: { weeklyOffDays: dto.weeklyOffDays },
+    });
+  }
+
   async assignShift(tenantId: string, dto: AssignShiftDto) {
     const shift = await this.prisma.shift.findFirst({ where: { id: dto.shiftId, tenantId } });
     if (!shift) throw new NotFoundException('Shift not found');
@@ -1174,19 +1201,17 @@ export class AttendanceService {
     }
 
     for (let d = new Date(start); d < endExclusive; d.setUTCDate(d.getUTCDate() + 1)) {
-      const dow = d.getUTCDay();
       for (const employee of employees) {
         const key = `${employee.id}:${d.toISOString().slice(0, 10)}`;
         if (existingKeys.has(key)) continue;
-        const shift = await this.currentShiftAt(tenantId, employee.id, d);
-        const isWeeklyOff = shift?.weeklyOffDays.includes(dow) ?? (dow === 0 || dow === 6);
+        const { shift, isWeeklyOff } = await this.weeklyOffAt(tenantId, employee.id, d);
         const status: AttendanceStatus = leaveDaySet.has(key)
           ? 'ON_LEAVE'
           : holidaySet.has(d.toISOString().slice(0, 10))
-          ? 'HOLIDAY'
-          : isWeeklyOff
-            ? 'WEEKEND'
-            : 'ABSENT';
+            ? 'HOLIDAY'
+            : isWeeklyOff
+              ? 'WEEKEND'
+              : 'ABSENT';
         await this.prisma.attendanceRecord.create({
           data: {
             tenantId,
