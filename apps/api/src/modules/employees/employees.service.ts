@@ -5,6 +5,7 @@ import { PermissionType, Prisma, ScopeType } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { RbacService } from '../rbac/rbac.service';
+import { LeaveBalanceInitializationService } from '../leave/leave-balance-initialization.service';
 import {
   BulkDocumentDto,
   BulkImportEmployeesDto,
@@ -46,6 +47,7 @@ export class EmployeesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly rbac: RbacService,
+    private readonly balanceInitialization: LeaveBalanceInitializationService,
   ) {}
 
   async list(user: AuthUser, q: ListEmployeesDto) {
@@ -224,6 +226,7 @@ export class EmployeesService {
           createdById: actorUserId,
         },
       });
+      await this.balanceInitialization.initializeForEmployee(tenantId, created.id, tx);
       await tx.auditLog.create({
         data: {
           tenantId,

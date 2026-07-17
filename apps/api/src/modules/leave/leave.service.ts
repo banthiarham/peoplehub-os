@@ -9,6 +9,7 @@ import {
   UpsertLeavePolicyDto,
   UpsertLeaveTypeDto,
 } from './dto/leave.dto';
+import { LeaveBalanceInitializationService } from './leave-balance-initialization.service';
 
 function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -16,7 +17,10 @@ function dateOnly(d: Date): Date {
 
 @Injectable()
 export class LeaveService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly balanceInitialization: LeaveBalanceInitializationService,
+  ) {}
 
   private requireEmployee(user: AuthUser): string {
     if (!user.employeeId) throw new ForbiddenException('No employee profile linked to this user');
@@ -55,7 +59,13 @@ export class LeaveService {
 
   async createPolicy(tenantId: string, dto: UpsertLeavePolicyDto) {
     await this.ensureLeaveType(tenantId, dto.leaveTypeId);
-    return this.prisma.leavePolicy.create({ data: { ...dto, tenantId } });
+    return this.prisma.$transaction(async (tx) => {
+      const policy = await tx.leavePolicy.create({ data: { ...dto, tenantId } });
+      if (policy.isActive) {
+        await this.balanceInitialization.initializeForPolicy(tenantId, policy.id, tx);
+      }
+      return policy;
+    });
   }
 
   async updatePolicy(tenantId: string, id: string, dto: UpsertLeavePolicyDto) {
