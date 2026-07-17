@@ -428,6 +428,7 @@ model Designation {
   id        String   @id @default(cuid())
   tenantId  String
   name      String
+  code      String?
   grade     String?
   level     Int?
   isActive  Boolean  @default(true)

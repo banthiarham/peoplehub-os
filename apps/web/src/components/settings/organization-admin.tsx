@@ -283,6 +283,7 @@ function OrgUnitCard({ kind, label }: { kind: UnitKind; label: string }) {
     mutationFn: () => {
       const payload = {
         ...Object.fromEntries(Object.entries(form).filter(([, v]) => v !== '')),
+        ...(editing !== 'new' && kind === 'designations' && form.code === '' ? { code: '' } : {}),
         ...(form.level ? { level: Number(form.level) } : {}),
         ...(form.isActive ? { isActive: form.isActive === 'true' } : {}),
       };
