@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { CandidateStage, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
+import { LeaveBalanceInitializationService } from '../leave/leave-balance-initialization.service';
 import {
   CandidateCommunicationDto,
   ConvertCandidateDto,
@@ -36,7 +37,10 @@ const PIPELINE_STAGES: CandidateStage[] = [
 
 @Injectable()
 export class RecruitmentService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly balanceInitialization?: LeaveBalanceInitializationService,
+  ) {}
 
   async listJobs(tenantId: string, status?: string) {
     const jobs = await this.prisma.jobRequisition.findMany({
@@ -561,6 +565,7 @@ export class RecruitmentService {
           locationId: dto.locationId ?? acceptedOffer?.locationId ?? candidate.jobRequisition.locationId,
         },
       });
+      await this.balanceInitialization?.initializeForEmployee(tenantId, employee.id, tx);
       await tx.candidate.update({
         where: { id: candidate.id },
         data: {
