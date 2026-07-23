@@ -79,7 +79,33 @@ export class LeaveService {
     });
   }
 
-  private async workingDays(tenantId: string, from: Date, to: Date, includeWeekends = false): Promise<number> {
+  private async currentShiftAt(tenantId: string, employeeId: string, at: Date) {
+    const assignment = await this.prisma.shiftAssignment.findFirst({
+      where: {
+        employeeId,
+        effectiveFrom: { lte: at },
+        OR: [{ effectiveTo: null }, { effectiveTo: { gte: at } }],
+      },
+      include: { shift: true },
+      orderBy: { effectiveFrom: 'desc' },
+    });
+    if (assignment) return assignment.shift;
+    return this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
+  }
+
+  private async isWeeklyOffAt(tenantId: string, employeeId: string, at: Date) {
+    const shift = await this.currentShiftAt(tenantId, employeeId, at);
+    const dayOfWeek = at.getUTCDay();
+    return shift?.weeklyOffDays.includes(dayOfWeek) ?? (dayOfWeek === 0 || dayOfWeek === 6);
+  }
+
+  private async workingDays(
+    tenantId: string,
+    employeeId: string,
+    from: Date,
+    to: Date,
+    includeWeekends = false,
+  ): Promise<number> {
     const holidays = await this.prisma.holiday.findMany({
       where: { holidayCalendar: { tenantId }, date: { gte: from, lte: to } },
       select: { date: true },
@@ -87,8 +113,9 @@ export class LeaveService {
     const holidaySet = new Set(holidays.map((h) => h.date.toISOString().slice(0, 10)));
     let days = 0;
     for (let d = new Date(from); d <= to; d.setUTCDate(d.getUTCDate() + 1)) {
-      const dow = d.getUTCDay();
-      if (!includeWeekends && (dow === 0 || dow === 6)) continue;
+      if (!includeWeekends && (await this.isWeeklyOffAt(tenantId, employeeId, new Date(d)))) {
+        continue;
+      }
       if (holidaySet.has(d.toISOString().slice(0, 10))) continue;
       days++;
     }
@@ -164,10 +191,19 @@ export class LeaveService {
       throw new BadRequestException(`${leaveType.name} requires an attachment`);
     }
 
-    let days = await this.workingDays(user.tenantId, from, to, policy?.sandwichRule ?? false);
+    let days = await this.workingDays(
+      user.tenantId,
+      employeeId,
+      from,
+      to,
+      policy?.sandwichRule ?? false,
+    );
     if (dto.halfDay) {
       if (from.getTime() !== to.getTime()) {
         throw new BadRequestException('Half day requires fromDate == toDate');
+      }
+      if (days <= 0) {
+        throw new BadRequestException('Selected range has no working days');
       }
       days = 0.5;
     }
