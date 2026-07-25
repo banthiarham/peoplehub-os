@@ -247,7 +247,7 @@ export function PeopleAddEmployeeDialog() {
               />
               Create employee login
             </label>
-            {form.createUser && !form.workEmail.trim() && (
+            {form.createUser && !form.workEmail.trim() && !credentials && (
               <p className="mt-2 text-xs text-rose-700">Work email is required when creating a login.</p>
             )}
 

@@ -6,6 +6,7 @@ import { EmploymentType, PermissionType, Prisma, ScopeType } from '@prisma/clien
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { EmailService } from '../email/email.service';
+import { LeaveBalanceInitializationService } from '../leave/leave-balance-initialization.service';
 import { SetupEmployeeImportDto, SetupEmployeeImportRowDto, SetupSalaryImportDto, SetupSalaryImportRowDto } from './dto/setup-import.dto';
 
 type Severity = 'critical' | 'warning';
@@ -83,6 +84,7 @@ export class SetupService {
     private readonly prisma: PrismaService,
     private readonly config?: ConfigService,
     private readonly emailService?: EmailService,
+    private readonly balanceInitialization?: LeaveBalanceInitializationService,
   ) {}
 
   async readiness(tenantId: string) {
@@ -354,6 +356,7 @@ export class SetupService {
             status: 'ACTIVE',
           },
         });
+        await this.balanceInitialization?.initializeForEmployee(user.tenantId, employee.id, tx);
         codeToEmployeeId.set(this.key(employeeCode), employee.id);
         imported.push({ id: employee.id, employeeCode, name: this.employeeDisplayName(employee.firstName, employee.lastName), login });
 

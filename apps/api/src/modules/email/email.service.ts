@@ -5,6 +5,7 @@ import { SmtpConfigService } from './smtp-config.service';
 import { EmailTemplateService } from './email-template.service';
 import { MockEmailProvider } from './providers/mock.provider';
 import { ResendProvider } from './providers/resend.provider';
+import { SmtpProvider } from './providers/smtp.provider';
 import { EmailStatus } from '@prisma/client';
 
 export interface QueueEmailInput {
@@ -143,22 +144,39 @@ export class EmailService {
       let result: { success: boolean; messageId?: string; error?: string };
       let providerType = 'SMTP';
 
-      // Always prefer the tenant's active SMTP provider when one is
-      // configured; the mock is only a fallback for dev environments with
-      // no provider set up.
-      const smtpConfig = await this.smtpConfigService.buildProvider(queued.tenantId);
-      if (smtpConfig) {
-        result = await smtpConfig.provider.sendEmail({
-          to: queued.to,
-          cc: queued.cc,
-          bcc: queued.bcc,
-          subject,
-          bodyHtml,
-          bodyText,
-          fromEmail: smtpConfig.fromEmail,
-          fromName: smtpConfig.fromName,
-          replyTo: smtpConfig.replyTo,
-        });
+      // Custom, one-off emails an HR admin writes through the employee
+      // screen ("communications") are personal correspondence and must go
+      // out via the org's own SMTP identity — never the platform's paid
+      // Resend account. Every other email is a system-generated HRMS
+      // notification (auth, onboarding, payroll, leave, attendance,
+      // workflows, etc.) and is routed through Resend so tenant email
+      // volume can't drive up org-owned SMTP costs.
+      const isPersonalEmployeeEmail = queued.module === 'communications';
+
+      if (isPersonalEmployeeEmail) {
+        // No platform SMTP or mock fallback here on purpose: a personal
+        // email "sent" via a platform-owned mailbox or faked by the mock
+        // provider is worse than an honest failure — the org needs to know
+        // their SMTP isn't set up, not see a false "sent" status.
+        const smtpConfig = await this.smtpConfigService.buildProvider(queued.tenantId);
+        if (smtpConfig) {
+          result = await smtpConfig.provider.sendEmail({
+            to: queued.to,
+            cc: queued.cc,
+            bcc: queued.bcc,
+            subject,
+            bodyHtml,
+            bodyText,
+            fromEmail: smtpConfig.fromEmail,
+            fromName: smtpConfig.fromName,
+            replyTo: smtpConfig.replyTo,
+          });
+        } else {
+          result = {
+            success: false,
+            error: 'No SMTP provider configured for this organization — set one up under Settings',
+          };
+        }
       } else if (this.resendApiKey) {
         providerType = 'RESEND';
         const resend = new ResendProvider({
@@ -177,6 +195,21 @@ export class EmailService {
           fromEmail: this.resendFromEmail,
           fromName: this.resendFromName,
           replyTo: this.config.get<string>('RESEND_REPLY_TO') || undefined,
+        });
+      } else if (this.platformSmtpConfig) {
+        // Platform-wide SMTP fallback used when Resend isn't configured at
+        // all (e.g. local dev without RESEND_API_KEY).
+        const platform = this.platformSmtpConfig;
+        const smtp = new SmtpProvider(platform);
+        result = await smtp.sendEmail({
+          to: queued.to,
+          cc: queued.cc,
+          bcc: queued.bcc,
+          subject,
+          bodyHtml,
+          bodyText,
+          fromEmail: platform.fromEmail,
+          fromName: platform.fromName,
         });
       } else if (this.isDemoMode) {
         providerType = 'MOCK';
@@ -289,6 +322,16 @@ export class EmailService {
     if (!employee) throw new NotFoundException('Employee not found');
     if (!employee.workEmail) {
       throw new BadRequestException('This employee has no work email on file');
+    }
+    // Personal/custom emails to employees must go out through the org's own
+    // SMTP identity, never the platform's shared provider — fail up front
+    // with a clear message instead of silently queuing something that can
+    // only fail (or worse, quietly land in a platform-owned mailbox).
+    const smtpConfigured = await this.smtpConfigService.buildProvider(tenantId);
+    if (!smtpConfigured) {
+      throw new BadRequestException(
+        'Your organization has not configured an email (SMTP) provider yet. Set one up under Settings before sending emails to employees.',
+      );
     }
     const queueId = await this.queue({
       tenantId,
@@ -412,6 +455,28 @@ export class EmailService {
       this.parseFrom(this.config.get<string>('EMAIL_FROM') || '').name ||
       'VioHr'
     );
+  }
+
+  private get platformSmtpConfig() {
+    const host = this.config.get<string>('SMTP_HOST')?.trim();
+    if (!host) return null;
+
+    const username = this.config.get<string>('SMTP_USER')?.trim() || '';
+    const { email: fromEmail, name: fromName } = this.parseFrom(
+      this.config.get<string>('EMAIL_FROM') || '',
+    );
+
+    return {
+      host,
+      port: Number(this.config.get<string>('SMTP_PORT')) || 587,
+      // No SMTP_ENCRYPTION env is exposed today; auth-less local catchers
+      // (Mailhog) use plain SMTP, real relays authenticate over STARTTLS.
+      encryption: (username ? 'STARTTLS' : 'NONE') as 'STARTTLS' | 'NONE',
+      username,
+      password: this.config.get<string>('SMTP_PASS')?.trim() || '',
+      fromEmail: fromEmail || 'noreply@viohr.local',
+      fromName: fromName || 'VioHr',
+    };
   }
 
   private parseFrom(value: string) {

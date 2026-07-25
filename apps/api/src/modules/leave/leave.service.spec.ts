@@ -69,11 +69,11 @@ describe('LeaveService', () => {
           options && 'assignment' in options
             ? options.assignment
             : {
-                shift: {
-                  id: 'shift-1',
-                  weeklyOffDays: options?.weeklyOffDays ?? [0],
-                },
+              shift: {
+                id: 'shift-1',
+                weeklyOffDays: options?.weeklyOffDays ?? [0],
               },
+            },
         ),
       },
       shift: {
@@ -91,7 +91,12 @@ describe('LeaveService', () => {
     };
   }
 
-  function apply(service: LeaveService, fromDate: string, toDate = fromDate, halfDay = false) {
+  function apply(
+    service: LeaveService,
+    fromDate: string,
+    toDate = fromDate,
+    halfDay = false,
+  ) {
     return service.apply(user as any, {
       leaveTypeId: 'lt-1',
       fromDate,
@@ -105,21 +110,25 @@ describe('LeaveService', () => {
     const prisma = prismaMock({
       policy: { ...policy, requiresAttachment: true },
     });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(apply(service, '2026-07-06')).rejects.toBeInstanceOf(BadRequestException);
+    await expect(apply(service, '2026-07-06')).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
   });
 
   it('allows Saturday when only Sunday is configured as a weekly off', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(apply(service, '2026-07-25')).resolves.toMatchObject({ days: 1 });
+    await expect(apply(service, '2026-07-25')).resolves.toMatchObject({
+      days: 1,
+    });
   });
 
   it('rejects Sunday when Sunday is configured as a weekly off', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
     await expect(apply(service, '2026-07-26')).rejects.toThrow(
       'Selected range has no working days',
@@ -128,17 +137,23 @@ describe('LeaveService', () => {
 
   it('selects the assignment effective on the requested date', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
     await apply(service, '2026-07-25');
 
     expect(prisma.shiftAssignment.findFirst).toHaveBeenCalledWith({
       where: {
         employeeId: 'emp-1',
-        effectiveFrom: { lte: new Date('2026-07-25T00:00:00.000Z') },
+        effectiveFrom: {
+          lte: new Date('2026-07-25T00:00:00.000Z'),
+        },
         OR: [
           { effectiveTo: null },
-          { effectiveTo: { gte: new Date('2026-07-25T00:00:00.000Z') } },
+          {
+            effectiveTo: {
+              gte: new Date('2026-07-25T00:00:00.000Z'),
+            },
+          },
         ],
       },
       include: { shift: true },
@@ -147,22 +162,31 @@ describe('LeaveService', () => {
   });
 
   it('uses the active tenant fallback shift for an unassigned employee', async () => {
-    const prisma = prismaMock({ assignment: null, fallbackWeeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any);
+    const prisma = prismaMock({
+      assignment: null,
+      fallbackWeeklyOffDays: [0],
+    });
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(apply(service, '2026-07-25')).resolves.toMatchObject({ days: 1 });
+    await expect(apply(service, '2026-07-25')).resolves.toMatchObject({
+      days: 1,
+    });
+
     expect(prisma.shift.findFirst).toHaveBeenCalledWith({
-      where: { tenantId: 'tenant-1', isActive: true },
+      where: {
+        tenantId: 'tenant-1',
+        isActive: true,
+      },
     });
   });
 
   it('rejects half-day leave on a configured weekly off', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(apply(service, '2026-07-26', '2026-07-26', true)).rejects.toThrow(
-      'Selected range has no working days',
-    );
+    await expect(
+      apply(service, '2026-07-26', '2026-07-26', true),
+    ).rejects.toThrow('Selected range has no working days');
   });
 
   it('counts configured working days in a range and excludes holidays', async () => {
@@ -170,9 +194,11 @@ describe('LeaveService', () => {
       weeklyOffDays: [0],
       holidays: [new Date('2026-07-27T00:00:00.000Z')],
     });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(apply(service, '2026-07-25', '2026-07-27')).resolves.toMatchObject({
+    await expect(
+      apply(service, '2026-07-25', '2026-07-27'),
+    ).resolves.toMatchObject({
       days: 1,
     });
   });
@@ -181,11 +207,16 @@ describe('LeaveService', () => {
     const prisma = prismaMock({
       weeklyOffDays: [0],
       holidays: [new Date('2026-07-27T00:00:00.000Z')],
-      policy: { ...policy, sandwichRule: true },
+      policy: {
+        ...policy,
+        sandwichRule: true,
+      },
     });
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(apply(service, '2026-07-25', '2026-07-27')).resolves.toMatchObject({
+    await expect(
+      apply(service, '2026-07-25', '2026-07-27'),
+    ).resolves.toMatchObject({
       days: 2,
     });
   });

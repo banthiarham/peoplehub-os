@@ -1,10 +1,20 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcryptjs';
 import { PermissionType, Prisma, ScopeType } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { RbacService } from '../rbac/rbac.service';
+import { EmailService } from '../email/email.service';
+import { LeaveBalanceInitializationService } from '../leave/leave-balance-initialization.service';
 import {
   BulkDocumentDto,
   BulkImportEmployeesDto,
@@ -43,9 +53,14 @@ const sensitiveFields = new Set([
 
 @Injectable()
 export class EmployeesService {
+  private readonly logger = new Logger(EmployeesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly rbac: RbacService,
+    private readonly balanceInitialization: LeaveBalanceInitializationService,
+    private readonly config?: ConfigService,
+    private readonly email?: EmailService,
   ) {}
 
   async list(user: AuthUser, q: ListEmployeesDto) {
@@ -186,6 +201,22 @@ export class EmployeesService {
     if (dto.createUser && !dto.workEmail?.trim()) {
       throw new BadRequestException('Work email is required when creating a login user');
     }
+    let existingUser: { id: string; email: string } | null = null;
+    if (dto.createUser && dto.workEmail) {
+      const found = await this.prisma.user.findFirst({
+        where: { tenantId, email: dto.workEmail.toLowerCase() },
+        include: { employee: { select: { id: true } } },
+      });
+      if (found?.employee) {
+        throw new ConflictException(
+          'A user with this work email already has an employee profile in this workspace',
+        );
+      }
+      // A user can exist without an employee profile yet — most commonly the
+      // workspace owner's own login created at signup. Link to it below
+      // instead of trying (and failing) to create a duplicate login.
+      existingUser = found ? { id: found.id, email: found.email } : null;
+    }
     const employeeCode = dto.employeeCode ?? (await this.nextEmployeeCode(tenantId));
     const { createUser, ...rest } = dto;
     const data = this.toEmployeeData(rest);
@@ -200,20 +231,26 @@ export class EmployeesService {
         },
       });
       if (createUser && dto.workEmail) {
-        const temporaryPassword = this.temporaryPassword();
-        const user = await tx.user.create({
-          data: {
-            tenantId,
-            email: dto.workEmail.toLowerCase(),
-            name: `${dto.firstName} ${dto.lastName}`,
-            passwordHash: await bcrypt.hash(temporaryPassword, 10),
-            isActive: true,
-          },
-        });
-        const employeeRole = await this.ensureEmployeeRole(tx, tenantId);
-        await tx.userRole.create({ data: { userId: user.id, roleId: employeeRole.id } });
-        await tx.employee.update({ where: { id: created.id }, data: { userId: user.id } });
-        onboardingCredentials = { email: user.email, temporaryPassword };
+        if (existingUser) {
+          await tx.employee.update({ where: { id: created.id }, data: { userId: existingUser.id } });
+          created.userId = existingUser.id;
+        } else {
+          const temporaryPassword = this.temporaryPassword();
+          const user = await tx.user.create({
+            data: {
+              tenantId,
+              email: dto.workEmail.toLowerCase(),
+              name: `${dto.firstName} ${dto.lastName}`,
+              passwordHash: await bcrypt.hash(temporaryPassword, 10),
+              isActive: true,
+            },
+          });
+          const employeeRole = await this.ensureEmployeeRole(tx, tenantId);
+          await tx.userRole.create({ data: { userId: user.id, roleId: employeeRole.id } });
+          await tx.employee.update({ where: { id: created.id }, data: { userId: user.id } });
+          created.userId = user.id;
+          onboardingCredentials = { email: user.email, temporaryPassword };
+        }
       }
       await tx.employeeLifecycleEvent.create({
         data: {
@@ -224,6 +261,7 @@ export class EmployeesService {
           createdById: actorUserId,
         },
       });
+      await this.balanceInitialization.initializeForEmployee(tenantId, created.id, tx);
       await tx.auditLog.create({
         data: {
           tenantId,
@@ -236,6 +274,15 @@ export class EmployeesService {
       });
       return created;
     });
+    if (onboardingCredentials) {
+      const tenant = await this.prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } });
+      await this.sendAccountInvitation(
+        tenantId,
+        tenant?.name ?? 'your workspace',
+        onboardingCredentials.email,
+        `${dto.firstName} ${dto.lastName}`,
+      );
+    }
     return onboardingCredentials ? { ...employee, onboardingCredentials } : employee;
   }
 
@@ -640,6 +687,44 @@ export class EmployeesService {
 
   private temporaryPassword() {
     return `VioHr@${randomBytes(6).toString('base64url')}`;
+  }
+
+  private async sendAccountInvitation(
+    tenantId: string,
+    companyName: string,
+    email: string,
+    employeeName: string,
+  ) {
+    if (!this.email) return;
+    try {
+      await this.email.sendTransactional(
+        tenantId,
+        'account_invitation',
+        email,
+        {
+          company_name: companyName,
+          employee_name: employeeName,
+          login_link: `${this.appUrl}/login`,
+        },
+        {
+          module: 'employees',
+          relatedType: 'user',
+          relatedId: email,
+        },
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Account invitation email could not be queued: ${err instanceof Error ? err.message : 'unknown error'}`,
+      );
+    }
+  }
+
+  private get appUrl() {
+    return (
+      this.config?.get<string>('APP_URL') ||
+      this.config?.get<string>('NEXT_PUBLIC_APP_URL') ||
+      'https://viohr.triviontechnologies.com'
+    ).replace(/\/$/, '');
   }
 
   private async ensureEmployeeRole(tx: Prisma.TransactionClient, tenantId: string) {

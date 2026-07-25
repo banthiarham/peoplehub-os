@@ -33,7 +33,7 @@ describe('EmployeesService', () => {
       approvalRequest: { create: jest.fn() },
       auditLog: { create: jest.fn() },
     };
-    const service = new EmployeesService(prisma as any, {} as any);
+    const service = new EmployeesService(prisma as any, {} as any, {} as any);
 
     const result = await service.update(user, 'emp-1', {
       firstName: 'Asha R',
@@ -79,7 +79,7 @@ describe('EmployeesService', () => {
       employeeProfileChange: { createMany: jest.fn() },
       auditLog: { create: jest.fn() },
     };
-    const service = new EmployeesService(prisma as any, {} as any);
+    const service = new EmployeesService(prisma as any, {} as any, {} as any);
 
     const result = await service.update({ ...user, isSuperAdmin: true, roles: ['Super Admin'] }, 'emp-1', {
       pan: 'NEWPAN1234',
@@ -113,7 +113,7 @@ describe('EmployeesService', () => {
       approvalRequest: { create: jest.fn() },
       auditLog: { create: jest.fn() },
     };
-    const service = new EmployeesService(prisma as any, {} as any);
+    const service = new EmployeesService(prisma as any, {} as any, {} as any);
 
     const result = await service.update(
       { ...user, roles: ['Tenant Owner'] },
