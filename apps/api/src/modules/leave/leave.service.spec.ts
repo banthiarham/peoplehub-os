@@ -52,13 +52,15 @@ describe('LeaveService', () => {
         }),
       },
     };
-    const service = new LeaveService(prisma as any);
+    const service = new LeaveService(prisma as any, {} as any);
 
-    await expect(service.apply(user as any, {
-      leaveTypeId: 'lt-1',
-      fromDate: '2026-07-06',
-      toDate: '2026-07-06',
-      reason: 'Medical',
-    })).rejects.toBeInstanceOf(BadRequestException);
+    await expect(
+      service.apply(user as any, {
+        leaveTypeId: 'lt-1',
+        fromDate: '2026-07-06',
+        toDate: '2026-07-06',
+        reason: 'Medical',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
