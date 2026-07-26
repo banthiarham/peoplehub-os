@@ -68,14 +68,78 @@ const unitMeta: Array<{ kind: UnitKind; label: string }> = [
 ];
 
 function apiError(err: unknown) {
-  const msg = (err as { response?: { data?: { message?: string | string[] } } })?.response?.data?.message;
+  const error = err as { response?: { data?: { message?: string | string[] } }; message?: string };
+  const msg = error?.response?.data?.message ?? error?.message;
   return Array.isArray(msg) ? msg.join(', ') : (msg ?? 'Request failed');
+}
+
+const tenantFieldLabels = {
+  name: 'Company',
+  legalName: 'Legal name',
+  country: 'Country code',
+  currency: 'Currency',
+  industry: 'Industry',
+  companySize: 'Company size',
+  timezone: 'Timezone',
+  brandColor: 'Brand color',
+  logoUrl: 'Logo URL',
+} as const;
+
+type TenantField = keyof typeof tenantFieldLabels;
+type TenantErrors = Partial<Record<TenantField, string>>;
+
+// Mirrors the company size options offered on Signup.
+const companySizes = ['1-50', '51-200', '201-500', '501-1000', '1001-2000', '2000+'];
+
+// Fields that must always be submitted; the rest are cleared by submitting an empty value.
+const requiredTenantFields = ['name', 'country', 'currency', 'timezone', 'companySize'] as const;
+const optionalTenantFields = ['legalName', 'industry', 'brandColor', 'logoUrl'] as const;
+
+function validateTenantSettings(form: Record<string, string>): TenantErrors {
+  const errors: TenantErrors = {};
+  const value = (field: TenantField) => (form[field] ?? '').trim();
+  const required = (field: TenantField, maxLength: number) => {
+    const current = value(field);
+    if (!current) errors[field] = `${tenantFieldLabels[field]} is required`;
+    else if (current.length > maxLength)
+      errors[field] = `${tenantFieldLabels[field]} must be ${maxLength} characters or fewer`;
+  };
+  const optionalMax = (field: TenantField, maxLength: number) => {
+    if (value(field).length > maxLength)
+      errors[field] = `${tenantFieldLabels[field]} must be ${maxLength} characters or fewer`;
+  };
+  // Optional fields are cleared by submitting an empty value, so blanks skip the format check.
+  const optionalPattern = (field: TenantField, pattern: RegExp, message: string) => {
+    const current = value(field);
+    if (current && !pattern.test(current)) errors[field] = `${tenantFieldLabels[field]} ${message}`;
+  };
+
+  required('name', 160);
+  optionalMax('legalName', 200);
+  optionalMax('industry', 100);
+  required('companySize', 50);
+  optionalMax('logoUrl', 500);
+  if (!/^[A-Z]{2}$/.test(value('country'))) errors.country = 'Country code must contain 2 uppercase letters';
+  if (!/^[A-Z]{3}$/.test(value('currency'))) errors.currency = 'Currency must contain 3 uppercase letters';
+  if (!/^(?:UTC|[A-Za-z_]+(?:\/[A-Za-z0-9_+.-]+)+)$/.test(value('timezone')))
+    errors.timezone = 'Timezone must be an IANA name such as Asia/Kolkata';
+  optionalPattern('brandColor', /^#[0-9A-Fa-f]{6}$/, 'must be a 6-digit hex color such as #2F6D5C');
+  optionalPattern('logoUrl', /^https?:\/\/\S+$/i, 'must start with http:// or https://');
+  return errors;
+}
+
+function tenantPayload(form: Record<string, string>) {
+  return Object.fromEntries(
+    [...requiredTenantFields, ...optionalTenantFields].map((field) => [field, (form[field] ?? '').trim()]),
+  );
 }
 
 export function OrganizationAdmin() {
   const toast = useToast();
   const queryClient = useQueryClient();
   const [tenantForm, setTenantForm] = useState<Record<string, string>>({});
+  const [tenantErrors, setTenantErrors] = useState<TenantErrors>({});
+  const [tenantTouched, setTenantTouched] = useState(false);
 
   const { data: tenant, isLoading } = useQuery<TenantSummary>({
     queryKey: ['organization'],
@@ -83,6 +147,7 @@ export function OrganizationAdmin() {
   });
 
   useEffect(() => {
+    if (tenantTouched) return;
     if (tenant) {
       setTenantForm({
         name: tenant.name ?? '',
@@ -90,19 +155,29 @@ export function OrganizationAdmin() {
         country: tenant.country ?? 'IN',
         industry: tenant.industry ?? '',
         companySize: tenant.companySize ?? '',
-        billingPlan: tenant.billingPlan ?? '',
         timezone: tenant.timezone ?? '',
         currency: tenant.currency ?? '',
         brandColor: tenant.brandColor ?? '',
         logoUrl: tenant.logoUrl ?? '',
       });
     }
-  }, [tenant]);
+  }, [tenant, tenantTouched]);
 
   const saveTenant = useMutation({
-    mutationFn: () =>
-      api.patch('/organization', Object.fromEntries(Object.entries(tenantForm).filter(([, v]) => v !== ''))),
-    onSuccess: () => {
+    mutationFn: async () => {
+      const validationErrors = validateTenantSettings(tenantForm);
+      setTenantErrors(validationErrors);
+      if (Object.keys(validationErrors).length)
+        throw new Error('Correct the highlighted company fields before saving');
+      const { data } = await api.patch('/organization', tenantPayload(tenantForm));
+      return data as Partial<TenantSummary>;
+    },
+    onSuccess: (updated) => {
+      // Seed the cache from the response so clearing the dirty flag cannot reseed stale values.
+      queryClient.setQueryData<TenantSummary>(['organization'], (current) =>
+        current ? { ...current, ...updated } : current,
+      );
+      setTenantTouched(false);
       queryClient.invalidateQueries({ queryKey: ['organization'] });
       toast('Company settings saved');
     },
@@ -137,10 +212,22 @@ export function OrganizationAdmin() {
               <Input value={tenantForm.industry ?? ''} onChange={setTenant('industry')} />
             </Labeled>
             <Labeled label="Company size">
-              <Input value={tenantForm.companySize ?? ''} onChange={setTenant('companySize')} />
+              <Select className='w-full' value={tenantForm.companySize ?? ''} onChange={setTenant('companySize')}>
+                <option value="">Select company size</option>
+                {companySizes.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </Select>
             </Labeled>
             <Labeled label="Billing plan">
-              <Input value={tenantForm.billingPlan ?? ''} onChange={setTenant('billingPlan')} />
+              <Input
+                value={tenant?.billingPlan ?? ''}
+                disabled
+                readOnly
+                className="capitalize"
+              />
             </Labeled>
             <Labeled label="Timezone">
               <Input value={tenantForm.timezone ?? ''} onChange={setTenant('timezone')} />
@@ -151,6 +238,21 @@ export function OrganizationAdmin() {
             <Labeled label="Logo URL">
               <Input value={tenantForm.logoUrl ?? ''} onChange={setTenant('logoUrl')} />
             </Labeled>
+            {Object.keys(tenantErrors).length > 0 && (
+              <div
+                className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 md:col-span-4"
+                role="alert"
+              >
+                <p className="font-semibold">Correct these fields before saving:</p>
+                <ul className="mt-1 list-disc pl-5">
+                  {(Object.entries(tenantErrors) as Array<[TenantField, string]>).map(([field, message]) => (
+                    <li key={field}>
+                      <span className="font-medium">{tenantFieldLabels[field]}:</span> {message}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="flex items-end gap-3 md:col-span-2">
               <Button onClick={() => saveTenant.mutate()} disabled={saveTenant.isPending}>
                 <Save className="h-4 w-4" /> Save company
@@ -174,9 +276,16 @@ export function OrganizationAdmin() {
     </>
   );
 
-  function setTenant(key: string) {
-    return (e: React.ChangeEvent<HTMLInputElement>) =>
+  function setTenant(key: TenantField) {
+    return (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+      setTenantTouched(true);
       setTenantForm((f) => ({ ...f, [key]: e.target.value }));
+      setTenantErrors((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+    };
   }
 }
 

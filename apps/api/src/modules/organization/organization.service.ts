@@ -103,7 +103,17 @@ export class OrganizationService {
   async updateTenant(tenantId: string, dto: UpdateTenantDto, actorUserId: string) {
     const existing = await this.prisma.tenant.findUnique({ where: { id: tenantId } });
     if (!existing) throw new NotFoundException('Tenant not found');
-    const { primaryAdminEmail: _primaryAdminEmail, slug: _slug, ...data } = dto;
+    const data: Prisma.TenantUpdateInput = {
+      ...(dto.name !== undefined && { name: dto.name.trim() }),
+      ...(dto.country !== undefined && { country: dto.country.trim() }),
+      ...(dto.currency !== undefined && { currency: dto.currency.trim() }),
+      ...(dto.timezone !== undefined && { timezone: dto.timezone.trim() }),
+      ...(dto.companySize !== undefined && { companySize: dto.companySize.trim() }),
+      ...(dto.legalName !== undefined && { legalName: this.clearable(dto.legalName) }),
+      ...(dto.industry !== undefined && { industry: this.clearable(dto.industry) }),
+      ...(dto.logoUrl !== undefined && { logoUrl: this.clearable(dto.logoUrl) }),
+      ...(dto.brandColor !== undefined && { brandColor: this.clearable(dto.brandColor) }),
+    };
     const updated = await this.prisma.tenant.update({ where: { id: tenantId }, data });
     await this.audit(tenantId, actorUserId, 'tenant.updated', 'Tenant', tenantId, existing, updated);
     return updated;
@@ -303,6 +313,12 @@ export class OrganizationService {
             : await this.prisma.businessUnit.findFirst({ where: { id, tenantId } });
     if (!row) throw new NotFoundException(`${this.objectType(kind)} not found`);
     return row;
+  }
+
+  /** Nullable tenant columns: a submitted empty value clears the stored value. */
+  private clearable(value: string) {
+    const trimmed = value.trim();
+    return trimmed === '' ? null : trimmed;
   }
 
   private objectType(kind: OrgUnitKind) {
