@@ -1,4 +1,4 @@
-import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional, OmitType, PartialType } from '@nestjs/swagger';
 import {
   IsBoolean,
   IsEmail,
@@ -8,11 +8,13 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  IsUrl,
   Length,
   Matches,
   Max,
   MaxLength,
   Min,
+  ValidateIf,
 } from 'class-validator';
 import { TenantStatus } from '@prisma/client';
 
@@ -20,6 +22,7 @@ export class CreateTenantDto {
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
+  @Matches(/\S/, { message: 'name should not be empty' })
   @MaxLength(160)
   name!: string;
 
@@ -46,9 +49,13 @@ export class CreateTenantDto {
   @MaxLength(100)
   industry?: string;
 
-  @ApiPropertyOptional()
+  // Not clearable: an empty value is rejected rather than stored or nulled.
+  @ApiPropertyOptional({ example: '51-200' })
   @IsOptional()
   @IsString()
+  @IsNotEmpty()
+  @Matches(/\S/, { message: 'companySize should not be empty' })
+  @MaxLength(50)
   companySize?: string;
 
   @ApiPropertyOptional()
@@ -75,14 +82,22 @@ export class CreateTenantDto {
   @Matches(/^[A-Z]{3}$/, { message: 'currency must be a 3-letter uppercase ISO currency code' })
   currency?: string;
 
-  @ApiPropertyOptional()
+  // An empty value clears the stored value, so format checks are skipped for it.
+  @ApiPropertyOptional({ example: 'https://cdn.example.com/logo.png' })
   @IsOptional()
+  @ValidateIf((dto: CreateTenantDto) => dto.logoUrl !== '')
   @IsString()
+  @IsUrl({ require_tld: false, require_protocol: true, protocols: ['http', 'https'] })
+  @MaxLength(500)
   logoUrl?: string;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ example: '#2F6D5C' })
   @IsOptional()
+  @ValidateIf((dto: CreateTenantDto) => dto.brandColor !== '')
   @IsString()
+  @Matches(/^#[0-9A-Fa-f]{6}$/, {
+    message: 'brandColor must be a 6-digit hex color such as #2F6D5C',
+  })
   brandColor?: string;
 
   @ApiPropertyOptional()
@@ -91,7 +106,14 @@ export class CreateTenantDto {
   primaryAdminEmail?: string;
 }
 
-export class UpdateTenantDto extends PartialType(CreateTenantDto) {}
+/**
+ * Company settings update contract. `slug`, `billingPlan`, `status`, and `primaryAdminEmail` are
+ * set during tenant provisioning and are not editable from Settings, so they are omitted here and
+ * rejected by the global validation pipe.
+ */
+export class UpdateTenantDto extends PartialType(
+  OmitType(CreateTenantDto, ['slug', 'billingPlan', 'status', 'primaryAdminEmail'] as const),
+) {}
 
 export class CreateLegalEntityDto {
   @ApiProperty()

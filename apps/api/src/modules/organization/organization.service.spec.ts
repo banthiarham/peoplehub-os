@@ -1,4 +1,177 @@
+import { NotFoundException } from '@nestjs/common';
 import { OrganizationService } from './organization.service';
+
+describe('OrganizationService tenant settings', () => {
+  const tenantId = 'tenant-1';
+  const actorUserId = 'user-1';
+  const existingTenant = {
+    id: tenantId,
+    name: 'Acme',
+    slug: 'acme',
+    legalName: 'Acme Private Limited',
+    country: 'IN',
+    industry: 'IT Services',
+    companySize: '51-200',
+    billingPlan: 'trial',
+    status: 'TRIAL',
+    timezone: 'Asia/Kolkata',
+    currency: 'INR',
+    logoUrl: 'https://cdn.example.com/logo.png',
+    brandColor: '#2F6D5C',
+  };
+
+  const createService = (tenant: unknown = existingTenant) => {
+    const prisma = {
+      tenant: {
+        findUnique: jest.fn().mockResolvedValue(tenant),
+        update: jest.fn().mockImplementation(({ data }) => ({ ...existingTenant, ...data })),
+      },
+      auditLog: { create: jest.fn().mockResolvedValue({}) },
+    };
+
+    return {
+      prisma,
+      service: new OrganizationService(prisma as never),
+    };
+  };
+
+  it('updates submitted values', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(
+      tenantId,
+      { name: 'Acme India', legalName: 'Acme India Private Limited' },
+      actorUserId,
+    );
+
+    expect(prisma.tenant.update).toHaveBeenCalledWith({
+      where: { id: tenantId },
+      data: { name: 'Acme India', legalName: 'Acme India Private Limited' },
+    });
+  });
+
+  it('trims submitted required and optional values', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(
+      tenantId,
+      {
+        name: '  Acme India  ',
+        country: ' IN ',
+        currency: ' INR ',
+        timezone: ' Asia/Kolkata ',
+        companySize: ' 201-500 ',
+        legalName: '  Acme India Private Limited  ',
+      },
+      actorUserId,
+    );
+
+    expect(prisma.tenant.update).toHaveBeenCalledWith({
+      where: { id: tenantId },
+      data: {
+        name: 'Acme India',
+        country: 'IN',
+        currency: 'INR',
+        timezone: 'Asia/Kolkata',
+        companySize: '201-500',
+        legalName: 'Acme India Private Limited',
+      },
+    });
+  });
+
+  it('never clears companySize', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(tenantId, { companySize: '' }, actorUserId);
+
+    expect(prisma.tenant.update).toHaveBeenCalledWith({
+      where: { id: tenantId },
+      data: { companySize: '' },
+    });
+    expect(prisma.tenant.update.mock.calls[0]![0].data.companySize).not.toBeNull();
+  });
+
+  it('clears optional values when submitted empty', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(
+      tenantId,
+      { legalName: '', industry: '', logoUrl: '', brandColor: '' },
+      actorUserId,
+    );
+
+    expect(prisma.tenant.update).toHaveBeenCalledWith({
+      where: { id: tenantId },
+      data: {
+        legalName: null,
+        industry: null,
+        logoUrl: null,
+        brandColor: null,
+      },
+    });
+  });
+
+  it('omits fields that were not submitted', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(tenantId, { name: 'Acme India' }, actorUserId);
+
+    const update = prisma.tenant.update.mock.calls[0]![0];
+    expect(update.data).toEqual({ name: 'Acme India' });
+    for (const field of ['legalName', 'industry', 'companySize', 'logoUrl', 'brandColor']) {
+      expect(update.data).not.toHaveProperty(field);
+    }
+  });
+
+  it('never writes immutable tenant fields', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(
+      tenantId,
+      {
+        name: 'Acme India',
+        billingPlan: 'enterprise',
+        status: 'ACTIVE',
+        slug: 'acme-india',
+        primaryAdminEmail: 'owner@acme.example',
+      } as never,
+      actorUserId,
+    );
+
+    const update = prisma.tenant.update.mock.calls[0]![0];
+    expect(update.data).toEqual({ name: 'Acme India' });
+    for (const field of ['billingPlan', 'status', 'slug', 'primaryAdminEmail']) {
+      expect(update.data).not.toHaveProperty(field);
+    }
+  });
+
+  it('audits the tenant update with previous and new values', async () => {
+    const { prisma, service } = createService();
+
+    await service.updateTenant(tenantId, { name: 'Acme India' }, actorUserId);
+
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: {
+        tenantId,
+        actorId: actorUserId,
+        action: 'tenant.updated',
+        objectType: 'Tenant',
+        objectId: tenantId,
+        oldValue: existingTenant,
+        newValue: { ...existingTenant, name: 'Acme India' },
+      },
+    });
+  });
+
+  it('throws when the tenant does not exist', async () => {
+    const { prisma, service } = createService(null);
+
+    await expect(service.updateTenant(tenantId, { name: 'Acme India' }, actorUserId)).rejects.toThrow(
+      NotFoundException,
+    );
+    expect(prisma.tenant.update).not.toHaveBeenCalled();
+  });
+});
 
 describe('OrganizationService designation codes', () => {
   const tenantId = 'tenant-1';
