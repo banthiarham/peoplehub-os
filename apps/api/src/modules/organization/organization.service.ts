@@ -9,6 +9,7 @@ import {
   UpdateOrgUnitDto,
   UpdateTenantDto,
 } from './dto/organization.dto';
+import { ensureTenantRoles } from '../rbac/role-catalog';
 
 type OrgUnitKind = 'departments' | 'designations' | 'cost-centers' | 'business-units';
 
@@ -72,6 +73,10 @@ export class OrganizationService {
         ),
         skipDuplicates: true,
       });
+
+      // Make the rest of the system role catalog available for assignment from day one.
+      // `Tenant Owner` already exists at this point, so its permissions above are preserved.
+      await ensureTenantRoles(tx, tenant.id);
 
       if (dto.primaryAdminEmail) {
         const user = await tx.user.create({

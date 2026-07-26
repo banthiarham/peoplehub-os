@@ -1,14 +1,28 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PermissionType, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import {
   AssignUserRolesDto,
   CreateRoleDto,
+  ListRoleUsersDto,
   SetFieldPermissionDto,
   SetRolePermissionsDto,
   UpdateRoleDto,
 } from './dto/rbac.dto';
+import { TENANT_OWNER_ROLE } from './role-catalog';
+
+/** Roles allowed to grant or revoke the Tenant Owner role. */
+const ELEVATED_ROLE_ASSIGNERS = ['Super Admin', TENANT_OWNER_ROLE];
+
+const DEFAULT_USER_PAGE_SIZE = 200;
+const MAX_USER_PAGE_SIZE = 500;
 
 export const SENSITIVE_EMPLOYEE_FIELDS = [
   { key: 'salary', label: 'Salary and CTC', module: 'employee.field.salary' },
@@ -47,9 +61,11 @@ export class RbacService {
     if (existing.isSystem && dto.name && dto.name !== existing.name) {
       throw new BadRequestException('System role names cannot be changed');
     }
+    // `isSystem` is intentionally not updatable through the API: system/custom status
+    // is controlled internally by the role catalog and tenant provisioning only.
     const updated = await this.prisma.role.update({
       where: { id },
-      data: { name: dto.name, description: dto.description, isSystem: dto.isSystem },
+      data: { name: dto.name, description: dto.description },
     });
     await this.audit(tenantId, actorUserId, 'role.updated', 'Role', id, existing, updated);
     return updated;
@@ -79,9 +95,25 @@ export class RbacService {
     return after;
   }
 
-  async users(tenantId: string) {
+  async users(tenantId: string, query: ListRoleUsersDto = {}) {
+    const q = query.q?.trim();
+    const take = Math.min(Math.max(query.limit ?? DEFAULT_USER_PAGE_SIZE, 1), MAX_USER_PAGE_SIZE);
     return this.prisma.user.findMany({
-      where: { tenantId },
+      where: {
+        tenantId,
+        ...(q
+          ? {
+              OR: [
+                { name: { contains: q, mode: 'insensitive' as const } },
+                { email: { contains: q, mode: 'insensitive' as const } },
+                { employee: { employeeCode: { contains: q, mode: 'insensitive' as const } } },
+                { employee: { firstName: { contains: q, mode: 'insensitive' as const } } },
+                { employee: { lastName: { contains: q, mode: 'insensitive' as const } } },
+              ],
+            }
+          : {}),
+      },
+      take,
       select: {
         id: true,
         email: true,
@@ -95,24 +127,69 @@ export class RbacService {
     });
   }
 
-  async assignUserRoles(tenantId: string, userId: string, dto: AssignUserRolesDto, actorUserId: string) {
+  async assignUserRoles(actor: AuthUser, userId: string, dto: AssignUserRolesDto) {
+    const tenantId = actor.tenantId;
+    const roleIds = [...new Set(dto.roleIds ?? [])];
+    if (!roleIds.length) {
+      throw new BadRequestException('A user must be assigned at least one role');
+    }
+
+    // Same-tenant validation: both the target user and every role must belong to the actor's tenant.
     const user = await this.prisma.user.findFirst({ where: { id: userId, tenantId } });
     if (!user) throw new NotFoundException('User not found');
-    const roles = await this.prisma.role.findMany({ where: { tenantId, id: { in: dto.roleIds } } });
-    if (roles.length !== dto.roleIds.length) throw new BadRequestException('One or more roles do not exist');
+
+    // Platform super admin accounts may only be modified by another platform super admin.
+    if (user.isSuperAdmin && !actor.isSuperAdmin) {
+      throw new ForbiddenException('Only a platform super admin can change roles for a super admin account');
+    }
+
+    const roles = await this.prisma.role.findMany({ where: { tenantId, id: { in: roleIds } } });
+    if (roles.length !== roleIds.length) throw new BadRequestException('One or more roles do not exist');
+
     const before = await this.prisma.userRole.findMany({ where: { userId }, include: { role: true } });
+    const hadOwner = before.some((ur) => ur.role.name === TENANT_OWNER_ROLE);
+    const willHaveOwner = roles.some((role) => role.name === TENANT_OWNER_ROLE);
+
+    // Only a Tenant Owner (or a platform super admin) may grant or revoke Tenant Owner.
+    if (hadOwner !== willHaveOwner && !this.canManageTenantOwner(actor)) {
+      throw new ForbiddenException('Only a Tenant Owner can grant or revoke the Tenant Owner role');
+    }
+
+    // A Tenant Owner cannot demote themselves; another owner must do it.
+    if (actor.userId === userId && hadOwner && !willHaveOwner) {
+      throw new ConflictException(
+        'You cannot remove your own Tenant Owner role. Ask another Tenant Owner to make this change.',
+      );
+    }
+
     await this.prisma.$transaction(async (tx) => {
-      await tx.userRole.deleteMany({ where: { userId } });
-      if (dto.roleIds.length) {
-        await tx.userRole.createMany({
-          data: dto.roleIds.map((roleId) => ({ userId, roleId })),
-          skipDuplicates: true,
+      // Re-checked inside the transaction so two concurrent demotions cannot both pass.
+      if (hadOwner && !willHaveOwner) {
+        const remainingOwners = await tx.userRole.count({
+          where: {
+            userId: { not: userId },
+            user: { tenantId, isActive: true },
+            role: { tenantId, name: TENANT_OWNER_ROLE },
+          },
         });
+        if (remainingOwners < 1) {
+          throw new ConflictException('A tenant must always have at least one Tenant Owner');
+        }
       }
+      await tx.userRole.deleteMany({ where: { userId } });
+      await tx.userRole.createMany({
+        data: roleIds.map((roleId) => ({ userId, roleId })),
+        skipDuplicates: true,
+      });
     });
+
     const after = await this.prisma.userRole.findMany({ where: { userId }, include: { role: true } });
-    await this.audit(tenantId, actorUserId, 'user.roles_updated', 'User', userId, before, after);
+    await this.audit(tenantId, actor.userId, 'user.roles_updated', 'User', userId, before, after, dto.reason);
     return after;
+  }
+
+  private canManageTenantOwner(actor: AuthUser) {
+    return actor.isSuperAdmin || (actor.roles ?? []).some((role) => ELEVATED_ROLE_ASSIGNERS.includes(role));
   }
 
   async fieldPermissions(tenantId: string) {
@@ -187,6 +264,7 @@ export class RbacService {
     objectId: string,
     oldValue: unknown,
     newValue: unknown,
+    reason?: string,
   ) {
     await this.prisma.auditLog.create({
       data: {
@@ -197,6 +275,7 @@ export class RbacService {
         objectId,
         oldValue: oldValue as Prisma.InputJsonValue | undefined,
         newValue: newValue as Prisma.InputJsonValue | undefined,
+        reason,
       },
     });
   }
