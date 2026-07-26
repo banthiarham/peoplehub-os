@@ -29,6 +29,19 @@ import {
   UpsertHolidayDto,
 } from './dto/attendance.dto';
 
+/**
+ * Absence statuses that approved leave supersedes during month finalization.
+ * HALF_DAY is included because it is a partial absence: leaving it in place
+ * charges its 0.5 day of attendance LOP on top of whatever the leave itself
+ * costs, so a half worked day plus half-day unpaid leave would be billed as a
+ * full LOP day, and paid leave would not fully cover the unworked half.
+ */
+const LEAVE_RECONCILABLE_STATUSES: AttendanceStatus[] = [
+  AttendanceStatus.ABSENT,
+  AttendanceStatus.MISSING_PUNCH,
+  AttendanceStatus.HALF_DAY,
+];
+
 /** Reject GPS fixes with a worse accuracy radius than this (meters). */
 const MAX_FIX_ACCURACY_M = 150;
 /** Reject GPS fixes captured longer ago than this (ms). */
@@ -1173,7 +1186,7 @@ export class AttendanceService {
         date: { gte: start, lt: endExclusive },
         employeeId: { in: employees.map((employee) => employee.id) },
       },
-      select: { employeeId: true, date: true },
+      select: { id: true, employeeId: true, date: true, status: true },
     });
     const existingKeys = new Set(existing.map((record) => `${record.employeeId}:${record.date.toISOString().slice(0, 10)}`));
     const holidays = await this.prisma.holiday.findMany({
@@ -1198,6 +1211,23 @@ export class AttendanceService {
       for (let d = new Date(leaveStart); d <= leaveEnd; d.setUTCDate(d.getUTCDate() + 1)) {
         leaveDaySet.add(`${leave.employeeId}:${d.toISOString().slice(0, 10)}`);
       }
+    }
+
+    // A day already recorded as an absence but since covered by approved leave
+    // would otherwise be charged twice: once against the leave balance and again
+    // as payroll LOP. Worked statuses are left untouched.
+    const reconciledToLeave = existing
+      .filter(
+        (record) =>
+          LEAVE_RECONCILABLE_STATUSES.includes(record.status) &&
+          leaveDaySet.has(`${record.employeeId}:${record.date.toISOString().slice(0, 10)}`),
+      )
+      .map((record) => record.id);
+    if (reconciledToLeave.length) {
+      await this.prisma.attendanceRecord.updateMany({
+        where: { id: { in: reconciledToLeave } },
+        data: { status: 'ON_LEAVE' },
+      });
     }
 
     for (let d = new Date(start); d < endExclusive; d.setUTCDate(d.getUTCDate() + 1)) {
@@ -1241,15 +1271,22 @@ export class AttendanceService {
       data: { isFinalized: true, finalizationId: finalization.id },
     });
 
-    await this.prisma.payrollVariableInput.deleteMany({
-      where: {
-        tenantId,
-        month: monthNumber,
-        year,
-        source: 'ATTENDANCE',
-        type: { in: ['OVERTIME', 'SHIFT_ALLOWANCE'] },
-      },
-    });
+    // Scoped to the finalized employees only: a location-scoped finalization
+    // recreates inputs for its own employees, so a tenant-wide delete would drop
+    // another location's attendance inputs without regenerating them.
+    const finalizedEmployeeIds = employees.map((employee) => employee.id);
+    if (finalizedEmployeeIds.length) {
+      await this.prisma.payrollVariableInput.deleteMany({
+        where: {
+          tenantId,
+          month: monthNumber,
+          year,
+          source: 'ATTENDANCE',
+          type: { in: ['OVERTIME', 'SHIFT_ALLOWANCE'] },
+          employeeId: { in: finalizedEmployeeIds },
+        },
+      });
+    }
     const byEmployee = new Map<string, { overtimeMinutes: number; allowance: number }>();
     for (const record of records) {
       const current = byEmployee.get(record.employeeId) ?? { overtimeMinutes: 0, allowance: 0 };
