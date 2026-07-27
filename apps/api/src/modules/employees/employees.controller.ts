@@ -15,14 +15,19 @@ import {
   CreateLifecycleEventDto,
   UpdateEmployeeDto,
 } from './dto/create-employee.dto';
+import { EmployeeSummaryQueryDto } from './dto/employee-summary.dto';
 import { ListEmployeesDto } from './dto/list-employees.dto';
+import { EmployeeSummaryService } from './employee-summary.service';
 import { EmployeesService } from './employees.service';
 
 @ApiTags('Employees')
 @ApiBearerAuth()
 @Controller('employees')
 export class EmployeesController {
-  constructor(private readonly employees: EmployeesService) {}
+  constructor(
+    private readonly employees: EmployeesService,
+    private readonly employeeSummary: EmployeeSummaryService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'Paginated employee directory' })
@@ -78,6 +83,18 @@ export class EmployeesController {
   @Scopes('employees:read')
   team(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.employees.team(user, id);
+  }
+
+  @Get(':id/attendance-summary')
+  @Roles('Super Admin', 'HR Admin', 'Tenant Owner')
+  @Scopes('employees:read')
+  @ApiOperation({ summary: 'Monthly attendance and leave summary for the employee profile' })
+  attendanceSummary(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Query() q: EmployeeSummaryQueryDto,
+  ) {
+    return this.employeeSummary.attendanceSummary(user, id, q.month);
   }
 
   @Post()

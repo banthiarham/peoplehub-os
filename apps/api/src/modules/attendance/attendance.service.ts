@@ -86,6 +86,11 @@ function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
 }
 
+/** Truncates an already UTC-anchored value (@db.Date columns, joining/exit dates) to its UTC day. */
+function utcDateOnly(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
 function parseMonth(month?: string): { start: Date; end: Date } {
   const now = new Date();
   const [y, m] = month ? month.split('-').map(Number) : [now.getFullYear(), now.getMonth() + 1];
@@ -334,13 +339,7 @@ export class AttendanceService {
     const shift = await this.currentShift(user.tenantId, employeeId);
     const rule = await this.attendanceRule(user.tenantId, { shiftId: shift?.id, locationId });
     const now = new Date();
-    let status: 'PRESENT' | 'LATE' = 'PRESENT';
-    if (shift) {
-      const [h, m] = shift.startTime.split(':').map(Number);
-      const shiftStart = new Date(now);
-      shiftStart.setHours(h, m + (rule?.lateMarkAfterMins ?? shift.gracePeriodMins ?? 15), 0, 0);
-      if (now > shiftStart) status = 'LATE';
-    }
+    const status: 'PRESENT' | 'LATE' = this.isLateArrival(now, shift, rule) ? 'LATE' : 'PRESENT';
     const punch = {
       shiftId: shift?.id,
       punchIn: now,
@@ -790,12 +789,168 @@ export class AttendanceService {
     return 'PRESENT';
   }
 
+  /**
+   * `workingMinutes` is the gross punch-in to punch-out span, so the shift's
+   * unpaid break has to come off before the overtime threshold is applied —
+   * otherwise a 09:00-18:00 shift with a 60m break bills 60m of overtime for
+   * simply working the shift.
+   */
   private overtimeMinutes(
     workingMinutes?: number,
-    shift?: { overtimeAfterMinutes: number } | null,
+    shift?: { overtimeAfterMinutes: number; breakDurationMins?: number } | null,
   ): number | undefined {
     if (workingMinutes == null || !shift) return undefined;
-    return Math.max(0, workingMinutes - shift.overtimeAfterMinutes);
+    const workedMinutes = workingMinutes - (shift.breakDurationMins ?? 0);
+    return Math.max(0, workedMinutes - shift.overtimeAfterMinutes);
+  }
+
+  /** Shared by the interactive punch path and the read-only monthly ledger. */
+  private isLateArrival(
+    punchIn: Date,
+    shift?: { startTime: string; gracePeriodMins: number } | null,
+    rule?: { lateMarkAfterMins: number } | null,
+  ): boolean {
+    if (!shift) return false;
+    const [h, m] = shift.startTime.split(':').map(Number);
+    const shiftStart = new Date(punchIn);
+    shiftStart.setHours(h, m + (rule?.lateMarkAfterMins ?? shift.gracePeriodMins ?? 15), 0, 0);
+    return punchIn > shiftStart;
+  }
+
+  /**
+   * Derived only — no write path sets EARLY_LEAVING today, so early departures
+   * are computed at read time from the punch-out against the shift end grace.
+   */
+  private isEarlyDeparture(
+    punchOut: Date,
+    shift?: { endTime: string; earlyLeavingGraceMins: number } | null,
+    rule?: { earlyLeavingGraceMins: number } | null,
+  ): boolean {
+    if (!shift) return false;
+    const [h, m] = shift.endTime.split(':').map(Number);
+    const shiftEnd = new Date(punchOut);
+    shiftEnd.setHours(
+      h,
+      m - (rule?.earlyLeavingGraceMins ?? shift.earlyLeavingGraceMins ?? 15),
+      0,
+      0,
+    );
+    return punchOut < shiftEnd;
+  }
+
+  private async holidayDateSet(tenantId: string, start: Date, endInclusive: Date) {
+    const holidays = await this.prisma.holiday.findMany({
+      where: { holidayCalendar: { tenantId }, date: { gte: start, lte: endInclusive } },
+      select: { date: true },
+    });
+    return new Set(holidays.map((holiday) => holiday.date.toISOString().slice(0, 10)));
+  }
+
+  /** Approved leave expanded to `${employeeId}:YYYY-MM-DD` keys, clipped to the window. */
+  private async approvedLeaveDaySet(
+    tenantId: string,
+    employeeIds: string[],
+    start: Date,
+    endInclusive: Date,
+  ) {
+    const approvedLeaves = await this.prisma.leaveRequest.findMany({
+      where: {
+        tenantId,
+        employeeId: { in: employeeIds },
+        status: 'APPROVED',
+        fromDate: { lte: endInclusive },
+        toDate: { gte: start },
+      },
+      select: { employeeId: true, fromDate: true, toDate: true },
+    });
+    const leaveDaySet = new Set<string>();
+    for (const leave of approvedLeaves) {
+      const leaveStart = leave.fromDate < start ? start : leave.fromDate;
+      const leaveEnd = leave.toDate > endInclusive ? endInclusive : leave.toDate;
+      for (let d = new Date(leaveStart); d <= leaveEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+        leaveDaySet.add(`${leave.employeeId}:${d.toISOString().slice(0, 10)}`);
+      }
+    }
+    return leaveDaySet;
+  }
+
+  private classifyExpectedDay(input: {
+    onLeave: boolean;
+    isHoliday: boolean;
+    isWeeklyOff: boolean;
+  }): AttendanceStatus {
+    if (input.onLeave) return 'ON_LEAVE';
+    if (input.isHoliday) return 'HOLIDAY';
+    if (input.isWeeklyOff) return 'WEEKEND';
+    return 'ABSENT';
+  }
+
+  /** The shift/location shape branches `attendanceRule` matches on, in the same order. */
+  private ruleMatches(
+    rule: { shiftId: string | null; locationId: string | null; isDefault: boolean },
+    shiftId: string | null | undefined,
+    locationId: string | null,
+  ): boolean {
+    if (rule.isDefault) return true;
+    if (shiftId && rule.shiftId === shiftId) {
+      return rule.locationId === null || (!!locationId && rule.locationId === locationId);
+    }
+    return !!locationId && rule.shiftId === null && rule.locationId === locationId;
+  }
+
+  /**
+   * Resolves the attendance rule for every day in a range from a single query,
+   * using the same precedence as `attendanceRule` (non-default before default,
+   * then most recently updated) so a rule that changes mid-month is honoured
+   * per date rather than pinned for the whole range.
+   */
+  private async attendanceRulesForRange(
+    tenantId: string,
+    locationId: string | null,
+    start: Date,
+    end: Date,
+  ) {
+    const rules = await this.prisma.attendanceRule.findMany({
+      where: {
+        tenantId,
+        isActive: true,
+        effectiveFrom: { lte: end },
+        AND: [{ OR: [{ effectiveTo: null }, { effectiveTo: { gte: start } }] }],
+        OR: [{ locationId }, { locationId: null }, { isDefault: true }],
+      },
+      orderBy: [{ isDefault: 'asc' }, { updatedAt: 'desc' }],
+    });
+    return (shiftId: string | null | undefined, at: Date) =>
+      rules.find(
+        (rule) =>
+          rule.effectiveFrom <= at &&
+          (rule.effectiveTo === null || rule.effectiveTo >= at) &&
+          this.ruleMatches(rule, shiftId, locationId),
+      ) ?? null;
+  }
+
+  /**
+   * Resolves the shift for every day in a range from a single query, using the
+   * same precedence as `currentShiftAt` (latest effective assignment, else the
+   * first active tenant shift).
+   */
+  private async shiftsForRange(tenantId: string, employeeId: string, start: Date, end: Date) {
+    const assignments = await this.prisma.shiftAssignment.findMany({
+      where: {
+        employeeId,
+        effectiveFrom: { lte: end },
+        OR: [{ effectiveTo: null }, { effectiveTo: { gte: start } }],
+      },
+      include: { shift: true },
+      orderBy: { effectiveFrom: 'desc' },
+    });
+    const fallback = await this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
+    return (at: Date) =>
+      assignments.find(
+        (assignment) =>
+          assignment.effectiveFrom <= at &&
+          (assignment.effectiveTo === null || assignment.effectiveTo >= at),
+      )?.shift ?? fallback;
   }
 
   async me(user: AuthUser, month?: string) {
@@ -819,6 +974,136 @@ export class AttendanceService {
               (worked.reduce((s, r) => s + (r.workingMinutes ?? 0), 0) / worked.length / 60) * 10,
             ) / 10
           : 0,
+      },
+    };
+  }
+
+  /**
+   * Read-only monthly day ledger for one employee. Stored records win per day;
+   * unrecorded days are derived with the same precedence as month finalization.
+   * Days outside the employee's joining/relieving window, and days after today,
+   * are omitted entirely rather than counted as absent.
+   */
+  async monthlyLedgerFor(
+    tenantId: string,
+    employeeId: string,
+    month: string,
+    bounds: { joiningDate?: Date | null; exitDate?: Date | null } = {},
+  ) {
+    const { start, endInclusive } = monthParts(month);
+    const joining = bounds.joiningDate ? utcDateOnly(bounds.joiningDate) : null;
+    const exit = bounds.exitDate ? utcDateOnly(bounds.exitDate) : null;
+    const today = dateOnly(new Date());
+    const windowStart = joining && joining > start ? joining : start;
+    let windowEnd = endInclusive;
+    if (exit && exit < windowEnd) windowEnd = exit;
+    const clampedToToday = today < windowEnd;
+    if (clampedToToday) windowEnd = today;
+
+    const days: Array<{
+      date: Date;
+      status: AttendanceStatus;
+      source: 'RECORD' | 'DERIVED';
+      punchIn: Date | null;
+      punchOut: Date | null;
+      workingMinutes: number | null;
+      overtimeMinutes: number | null;
+      isLate: boolean;
+      isEarlyDeparture: boolean;
+      shiftId: string | null;
+    }> = [];
+
+    if (windowStart <= windowEnd) {
+      const locationId = await this.employeeLocationId(tenantId, employeeId);
+      const [records, holidaySet, leaveDaySet, shiftAt, ruleAt] = await Promise.all([
+        this.prisma.attendanceRecord.findMany({
+          where: { tenantId, employeeId, date: { gte: windowStart, lte: windowEnd } },
+          orderBy: { date: 'asc' },
+        }),
+        this.holidayDateSet(tenantId, windowStart, windowEnd),
+        this.approvedLeaveDaySet(tenantId, [employeeId], windowStart, windowEnd),
+        this.shiftsForRange(tenantId, employeeId, windowStart, windowEnd),
+        this.attendanceRulesForRange(tenantId, locationId, windowStart, windowEnd),
+      ]);
+      const recordByDate = new Map(
+        records.map((record) => [record.date.toISOString().slice(0, 10), record]),
+      );
+
+      for (let d = new Date(windowStart); d <= windowEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+        const date = new Date(d);
+        const key = date.toISOString().slice(0, 10);
+        const record = recordByDate.get(key);
+        const shift = shiftAt(date);
+        const dayOfWeek = date.getUTCDay();
+        const isWeeklyOff =
+          shift?.weeklyOffDays.includes(dayOfWeek) ?? (dayOfWeek === 0 || dayOfWeek === 6);
+        const status =
+          record?.status ??
+          this.classifyExpectedDay({
+            onLeave: leaveDaySet.has(`${employeeId}:${key}`),
+            isHoliday: holidaySet.has(key),
+            isWeeklyOff,
+          });
+        const rule = record?.punchIn || record?.punchOut ? ruleAt(shift?.id, date) : null;
+        days.push({
+          date,
+          status,
+          source: record ? 'RECORD' : 'DERIVED',
+          punchIn: record?.punchIn ?? null,
+          punchOut: record?.punchOut ?? null,
+          workingMinutes: record?.workingMinutes ?? null,
+          overtimeMinutes: record?.overtimeMinutes ?? null,
+          shiftId: record?.shiftId ?? shift?.id ?? null,
+          isLate:
+            status === 'LATE' ||
+            (record?.punchIn ? this.isLateArrival(record.punchIn, shift, rule) : false),
+          isEarlyDeparture:
+            status === 'EARLY_LEAVING' ||
+            (record?.punchOut ? this.isEarlyDeparture(record.punchOut, shift, rule) : false),
+        });
+      }
+    }
+
+    const count = (status: AttendanceStatus) => days.filter((day) => day.status === status).length;
+    const present = count('PRESENT');
+    const late = count('LATE');
+    const halfDay = count('HALF_DAY');
+    const onLeave = count('ON_LEAVE');
+    const holiday = count('HOLIDAY');
+    const weeklyOff = count('WEEKEND');
+    const expectedWorkingDays = days.length - holiday - weeklyOff;
+    // Approved leave is neither rewarded nor penalised in the percentage.
+    const attendableDays = expectedWorkingDays - onLeave;
+    const worked = days.filter((day) => day.workingMinutes != null);
+    const totalWorkingMinutes = worked.reduce((sum, day) => sum + (day.workingMinutes ?? 0), 0);
+
+    return {
+      month,
+      windowStart,
+      windowEnd,
+      clampedToToday,
+      days,
+      counts: {
+        expectedWorkingDays,
+        present,
+        late,
+        halfDay,
+        absent: count('ABSENT'),
+        onLeave,
+        holiday,
+        weeklyOff,
+        missingPunch: count('MISSING_PUNCH'),
+        attendancePercentage:
+          attendableDays > 0
+            ? Math.round(((present + late + halfDay * 0.5) / attendableDays) * 1000) / 10
+            : null,
+        avgWorkHours: worked.length
+          ? Math.round((totalWorkingMinutes / worked.length / 60) * 10) / 10
+          : 0,
+        lateArrivals: days.filter((day) => day.isLate).length,
+        earlyDepartures: days.filter((day) => day.isEarlyDeparture).length,
+        totalWorkingMinutes,
+        overtimeMinutes: days.reduce((sum, day) => sum + (day.overtimeMinutes ?? 0), 0),
       },
     };
   }
@@ -1176,42 +1461,24 @@ export class AttendanceService {
       select: { employeeId: true, date: true },
     });
     const existingKeys = new Set(existing.map((record) => `${record.employeeId}:${record.date.toISOString().slice(0, 10)}`));
-    const holidays = await this.prisma.holiday.findMany({
-      where: { holidayCalendar: { tenantId }, date: { gte: start, lte: endInclusive } },
-      select: { date: true },
-    });
-    const holidaySet = new Set(holidays.map((holiday) => holiday.date.toISOString().slice(0, 10)));
-    const approvedLeaves = await this.prisma.leaveRequest.findMany({
-      where: {
-        tenantId,
-        employeeId: { in: employees.map((employee) => employee.id) },
-        status: 'APPROVED',
-        fromDate: { lt: endExclusive },
-        toDate: { gte: start },
-      },
-      select: { employeeId: true, fromDate: true, toDate: true },
-    });
-    const leaveDaySet = new Set<string>();
-    for (const leave of approvedLeaves) {
-      const leaveStart = leave.fromDate < start ? start : leave.fromDate;
-      const leaveEnd = leave.toDate > endInclusive ? endInclusive : leave.toDate;
-      for (let d = new Date(leaveStart); d <= leaveEnd; d.setUTCDate(d.getUTCDate() + 1)) {
-        leaveDaySet.add(`${leave.employeeId}:${d.toISOString().slice(0, 10)}`);
-      }
-    }
+    const holidaySet = await this.holidayDateSet(tenantId, start, endInclusive);
+    const leaveDaySet = await this.approvedLeaveDaySet(
+      tenantId,
+      employees.map((employee) => employee.id),
+      start,
+      endInclusive,
+    );
 
     for (let d = new Date(start); d < endExclusive; d.setUTCDate(d.getUTCDate() + 1)) {
       for (const employee of employees) {
         const key = `${employee.id}:${d.toISOString().slice(0, 10)}`;
         if (existingKeys.has(key)) continue;
         const { shift, isWeeklyOff } = await this.weeklyOffAt(tenantId, employee.id, d);
-        const status: AttendanceStatus = leaveDaySet.has(key)
-          ? 'ON_LEAVE'
-          : holidaySet.has(d.toISOString().slice(0, 10))
-            ? 'HOLIDAY'
-            : isWeeklyOff
-              ? 'WEEKEND'
-              : 'ABSENT';
+        const status = this.classifyExpectedDay({
+          onLeave: leaveDaySet.has(key),
+          isHoliday: holidaySet.has(d.toISOString().slice(0, 10)),
+          isWeeklyOff,
+        });
         await this.prisma.attendanceRecord.create({
           data: {
             tenantId,
