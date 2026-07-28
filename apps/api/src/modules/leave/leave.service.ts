@@ -81,8 +81,7 @@ export class LeaveService {
     return leaveType;
   }
 
-  async balances(tenantId: string, employeeId: string) {
-    const year = new Date().getFullYear();
+  async balances(tenantId: string, employeeId: string, year = new Date().getFullYear()) {
     return this.prisma.leaveBalance.findMany({
       where: { employee: { tenantId }, employeeId, year },
       include: { leaveType: { select: { id: true, name: true, code: true, isPaid: true } } },

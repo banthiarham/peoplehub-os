@@ -203,6 +203,31 @@ describe('LeaveService', () => {
     });
   });
 
+  it('reads balances for the requested year and defaults to the current one', async () => {
+    const prisma = { leaveBalance: { findMany: jest.fn().mockResolvedValue([]) } };
+    const service = new LeaveService(prisma as any, {} as any);
+
+    await service.balances('tenant-1', 'emp-1', 2025);
+    await service.balances('tenant-1', 'emp-1');
+
+    expect(prisma.leaveBalance.findMany).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        where: { employee: { tenantId: 'tenant-1' }, employeeId: 'emp-1', year: 2025 },
+      }),
+    );
+    expect(prisma.leaveBalance.findMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        where: {
+          employee: { tenantId: 'tenant-1' },
+          employeeId: 'emp-1',
+          year: new Date().getFullYear(),
+        },
+      }),
+    );
+  });
+
   it('preserves sandwich-rule duration behavior with configured weekly offs', async () => {
     const prisma = prismaMock({
       weeklyOffDays: [0],

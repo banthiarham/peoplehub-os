@@ -1,6 +1,7 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useSession } from 'next-auth/react';
 import { useParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import {
@@ -17,6 +18,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
+import { AttendanceLeaveSummary } from '@/components/employees/attendance-leave-summary';
 import { EmployeeSendEmailDialog } from '@/components/forms/employee-send-email-dialog';
 import { PeopleAddDocumentDialog } from '@/components/forms/people-add-document-dialog';
 import { Avatar } from '@/components/ui/avatar';
@@ -95,6 +97,7 @@ interface DeviceRow {
 
 export default function EmployeeProfilePage() {
   const { id } = useParams<{ id: string }>();
+  const { data: session } = useSession();
   const queryClient = useQueryClient();
   const toast = useToast();
   const [editOpen, setEditOpen] = useState(false);
@@ -182,6 +185,9 @@ export default function EmployeeProfilePage() {
   }
 
   const name = `${e.firstName} ${e.lastName}`;
+  const canViewAttendanceSummary = (session?.user?.roles ?? []).some((role) =>
+    ['Super Admin', 'HR Admin', 'Tenant Owner'].includes(role),
+  );
 
   return (
     <div className="space-y-4">
@@ -316,6 +322,8 @@ export default function EmployeeProfilePage() {
               <Field label="Business unit" value={e.businessUnit?.name ?? '—'} />
             </CardContent>
           </Card>
+
+          {canViewAttendanceSummary && <AttendanceLeaveSummary employeeId={id} />}
 
           <Card>
             <CardHeader>
