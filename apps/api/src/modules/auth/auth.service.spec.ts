@@ -1,7 +1,8 @@
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 import { createHash } from 'crypto';
-import { AuthService } from './auth.service';
+import { AuthService, TENANT_OWNER_SCOPES } from './auth.service';
+import { catalogRoleScopes, SYSTEM_ROLE_CATALOG } from '../rbac/role-catalog';
 
 describe('AuthService', () => {
   it('creates a trial tenant and owner account during signup', async () => {
@@ -11,8 +12,8 @@ describe('AuthService', () => {
       },
       role: {
         create: jest.fn().mockResolvedValue({ id: 'role-owner' }),
-        // signup also seeds the remaining system role catalog
-        findMany: jest.fn().mockResolvedValue([{ name: 'Tenant Owner' }]),
+        // signup also seeds the remaining system role catalog and tops the owner up
+        findMany: jest.fn().mockResolvedValue([{ id: 'role-owner', name: 'Tenant Owner', permissions: [] }]),
         upsert: jest.fn(async ({ create }: any) => ({ id: `role-${create.name}`, ...create })),
       },
       permission: {
@@ -285,5 +286,94 @@ describe('AuthService', () => {
         sub: 'oauth-client:oauth-1',
       }),
     );
+  });
+});
+
+describe('Tenant Owner scopes', () => {
+  it('covers every module the catalog grants the owner', () => {
+    for (const scope of catalogRoleScopes('Tenant Owner')) {
+      expect(TENANT_OWNER_SCOPES).toContain(scope);
+    }
+    expect(TENANT_OWNER_SCOPES).toEqual(
+      expect.arrayContaining([
+        'recruitment:read', 'recruitment:write', 'recruitment:approve',
+        'onboarding:write', 'timesheets:write', 'assets:write', 'engagement:write',
+        'performance:write', 'reports:export', 'settings:write', 'roles:write', 'tax:write',
+        'developer:read', 'developer:api_keys', 'developer:integrations',
+        'payroll:run', 'payroll:lock', 'payroll:unlock',
+      ]),
+    );
+  });
+
+  it('keeps every legacy owner scope so no existing owner loses access', () => {
+    for (const scope of [
+      'attendance:approve', 'attendance:import', 'attendance:read', 'attendance:write',
+      'documents:read', 'documents:write', 'employees:approve', 'employees:read', 'employees:write',
+      'helpdesk:approve', 'helpdesk:read', 'helpdesk:write', 'leave:approve', 'leave:read', 'leave:write',
+      'notifications:read', 'notifications:write', 'organization:read', 'organization:write',
+      'payroll:approve', 'payroll:read', 'payroll:write',
+      'workflow:approve', 'workflow:read', 'workflow:write',
+    ]) {
+      expect(TENANT_OWNER_SCOPES).toContain(scope);
+    }
+  });
+
+  it('is sorted and de-duplicated', () => {
+    expect(TENANT_OWNER_SCOPES).toEqual([...new Set(TENANT_OWNER_SCOPES)].sort());
+  });
+});
+
+describe('login scope derivation for the final catalog', () => {
+  const loginAs = async (roleName: string) => {
+    const permissions = SYSTEM_ROLE_CATALOG.find((r) => r.name === roleName)!.grants.flatMap((g) =>
+      g.permissionTypes.map((permissionType) => ({ module: g.module, permissionType })),
+    );
+    const prisma = {
+      user: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'user-1',
+          tenantId: 'tenant-1',
+          email: 'user@example.com',
+          name: roleName,
+          avatarUrl: null,
+          passwordHash: bcrypt.hashSync('Password@123', 4),
+          isSuperAdmin: false,
+          tenant: { id: 'tenant-1', slug: 'acme', name: 'Acme' },
+          employee: null,
+          userRoles: [{ role: { name: roleName, permissions } }],
+        }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const jwt = { signAsync: jest.fn().mockResolvedValue('token') } as unknown as JwtService;
+    const service = new AuthService(prisma as any, jwt);
+    const result = await service.login({ email: 'user@example.com', password: 'Password@123' });
+    return result.user.scopes;
+  };
+
+  it('gives Payroll Admin the payroll lifecycle scopes', async () => {
+    const scopes = await loginAs('Payroll Admin');
+    expect(scopes).toEqual(expect.arrayContaining(['payroll:run', 'payroll:lock', 'payroll:unlock']));
+  });
+
+  it.each(['HR Admin', 'Finance Admin', 'Manager'])(
+    'never derives a payroll lifecycle scope for %s',
+    async (roleName) => {
+      const scopes = await loginAs(roleName);
+      expect(scopes).not.toContain('payroll:run');
+      expect(scopes).not.toContain('payroll:lock');
+      expect(scopes).not.toContain('payroll:unlock');
+    },
+  );
+
+  it('gives Developer usable API-key and integration scopes', async () => {
+    const scopes = await loginAs('Developer');
+    expect(scopes).toEqual(expect.arrayContaining(['developer:api_keys', 'developer:integrations']));
+  });
+
+  it('gives Integration Admin integration scopes but not API-key scopes', async () => {
+    const scopes = await loginAs('Integration Admin');
+    expect(scopes).toContain('developer:integrations');
+    expect(scopes).not.toContain('developer:api_keys');
   });
 });

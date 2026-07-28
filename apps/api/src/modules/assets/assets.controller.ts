@@ -23,25 +23,25 @@ export class AssetsController {
   }
 
   @Post()
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   create(@CurrentUser() user: AuthUser, @Body() dto: CreateAssetDto) {
     return this.assets.create(user.tenantId, dto);
   }
 
   @Post(':id/assign')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   assign(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: AssignAssetDto) {
     return this.assets.assign(user.tenantId, id, dto.employeeId);
   }
 
   @Post(':id/return')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   returnAsset(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ReturnAssetDto) {
     return this.assets.returnAsset(user.tenantId, id, dto.condition, dto.notes);
   }
 
   @Post(':id/documents')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   addDocument(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateAssetDocumentDto) {
     return this.assets.addDocument(user.tenantId, id, dto);
   }

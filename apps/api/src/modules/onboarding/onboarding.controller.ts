@@ -31,14 +31,14 @@ export class OnboardingController {
   }
 
   @Post('templates')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   @ApiOperation({ summary: 'Create an onboarding template with scoped checklists' })
   createTemplate(@CurrentUser() user: AuthUser, @Body() dto: CreateOnboardingTemplateDto) {
     return this.onboarding.createTemplate(user.tenantId, dto);
   }
 
   @Post('start')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Recruiter')
   @ApiOperation({ summary: 'Instantiate template tasks for an employee' })
   start(@CurrentUser() user: AuthUser, @Body() dto: StartOnboardingDto) {
     return this.onboarding.start(user.tenantId, dto);
@@ -65,13 +65,13 @@ export class OnboardingController {
   }
 
   @Post('exits')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   createExit(@CurrentUser() user: AuthUser, @Body() dto: CreateExitRequestDto) {
     return this.onboarding.createExit(user.tenantId, dto, user.userId);
   }
 
   @Patch('exits/:id')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   updateExit(
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
@@ -81,7 +81,7 @@ export class OnboardingController {
   }
 
   @Patch('exit-tasks/:taskId')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   updateExitTask(
     @CurrentUser() user: AuthUser,
     @Param('taskId') taskId: string,

@@ -4,6 +4,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import { AnalyticsService } from './analytics.service';
+import { redactDashboard } from './dashboard-visibility';
 
 @ApiTags('Analytics')
 @ApiBearerAuth()
@@ -12,8 +13,8 @@ export class AnalyticsController {
   constructor(private readonly analytics: AnalyticsService) {}
 
   @Get('dashboard')
-  @ApiOperation({ summary: 'Full dashboard payload in one call' })
-  dashboard(
+  @ApiOperation({ summary: 'Full dashboard payload in one call, filtered to the caller role group' })
+  async dashboard(
     @CurrentUser() user: AuthUser,
     @Query('departmentId') departmentId?: string,
     @Query('locationId') locationId?: string,
@@ -21,7 +22,16 @@ export class AnalyticsController {
     @Query('managerId') managerId?: string,
     @Query('employmentType') employmentType?: string,
   ) {
-    return this.analytics.dashboard(user.tenantId, { departmentId, locationId, legalEntityId, managerId, employmentType });
+    const payload = await this.analytics.dashboard(user.tenantId, {
+      departmentId,
+      locationId,
+      legalEntityId,
+      managerId,
+      employmentType,
+    });
+    // Widget groups the caller may not see are blanked here, on the server, so the
+    // figures never reach the browser.
+    return redactDashboard(payload, user);
   }
 
   @Get('headcount-trend')

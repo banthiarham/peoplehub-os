@@ -24,13 +24,13 @@ export class TimesheetsController {
   }
 
   @Post('clients')
-  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager', 'Finance Admin')
   createClient(@CurrentUser() user: AuthUser, @Body() dto: CreateClientDto) {
     return this.timesheets.createClient(user.tenantId, dto);
   }
 
   @Patch('clients/:id')
-  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager', 'Finance Admin')
   updateClient(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateClientDto) {
     return this.timesheets.updateClient(user.tenantId, id, dto);
   }
@@ -41,13 +41,13 @@ export class TimesheetsController {
   }
 
   @Post('projects')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   createProject(@CurrentUser() user: AuthUser, @Body() dto: CreateProjectDto) {
     return this.timesheets.createProject(user.tenantId, dto);
   }
 
   @Patch('projects/:id')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   updateProject(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateProjectDto) {
     return this.timesheets.updateProject(user.tenantId, id, dto);
   }
@@ -58,13 +58,13 @@ export class TimesheetsController {
   }
 
   @Post('tasks')
-  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager', 'Finance Admin')
   createTask(@CurrentUser() user: AuthUser, @Body() dto: CreateProjectTaskDto) {
     return this.timesheets.createTask(user.tenantId, dto);
   }
 
   @Patch('tasks/:id')
-  @Roles('Super Admin', 'HR Admin', 'Manager', 'Finance Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager', 'Finance Admin')
   updateTask(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CreateProjectTaskDto) {
     return this.timesheets.updateTask(user.tenantId, id, dto);
   }
@@ -85,7 +85,7 @@ export class TimesheetsController {
   }
 
   @Get('payroll-sync')
-  @Roles('Super Admin', 'HR Admin', 'Payroll Admin', 'Finance Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Payroll Admin', 'Finance Admin')
   payrollSync(@CurrentUser() user: AuthUser) {
     return this.timesheets.payrollSync(user.tenantId);
   }
@@ -113,13 +113,13 @@ export class TimesheetsController {
   }
 
   @Patch(':id/approve')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   approve(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.timesheets.decide(user.tenantId, id, 'APPROVED');
   }
 
   @Patch(':id/reject')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   reject(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.timesheets.decide(user.tenantId, id, 'REJECTED');
   }

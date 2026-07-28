@@ -85,12 +85,26 @@ type DashboardData = {
     offersPending: number;
   };
   headcountByDepartment: Array<{ name: string; value: number }>;
+  /**
+   * Widget groups the API decided this caller may receive. Groups not listed come back
+   * blanked from the server, so this only controls whether the card is rendered at all.
+   */
+  visibleWidgets?: DashboardWidget[];
   upcoming: {
     birthdays: Array<{ id: string; name: string; date: string }>;
     anniversaries: Array<{ id: string; name: string; date: string }>;
     holidays: Array<{ name: string; date: string }>;
   };
 };
+
+type DashboardWidget =
+  | 'headcount'
+  | 'attendance'
+  | 'approvals'
+  | 'payroll'
+  | 'payrollReadiness'
+  | 'hiring'
+  | 'upcoming';
 
 const premiumColors = ['#0F766E', '#2563EB', '#F59E0B', '#7C3AED', '#E11D48', '#0891B2', '#475569'];
 
@@ -166,6 +180,10 @@ function ExecutiveDashboard({
   onRefresh: () => void;
 }) {
   const attendance = data.attendanceToday;
+  // The server already blanked anything this role may not see; `visibleWidgets` lets us
+  // hide the card instead of rendering a row of zeros. A missing field means "show all",
+  // so an older API build keeps working.
+  const show = (widget: DashboardWidget) => !data.visibleWidgets || data.visibleWidgets.includes(widget);
   const hasOperationalData =
     data.headcount.active > 0 ||
     data.payroll.trend.length > 0 ||
@@ -262,34 +280,42 @@ function ExecutiveDashboard({
         </div>
 
         <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-          <CommandMetric
-            label="Active workforce"
-            value={data.headcount.active}
-            detail={`${data.headcount.total} total records`}
-            icon={Users}
-            accent="#0F766E"
-          />
-          <CommandMetric
-            label="Net payroll"
-            value={formatINR(data.payroll.lastRunNet, true)}
-            detail={`${data.payroll.lastRunMonth ?? 'No payroll'} latest run`}
-            icon={IndianRupee}
-            accent="#2563EB"
-          />
-          <CommandMetric
-            label="Open decisions"
-            value={data.pendingApprovals.total}
-            detail="Approvals awaiting action"
-            icon={ShieldCheck}
-            accent="#F59E0B"
-          />
-          <CommandMetric
-            label="Talent pipeline"
-            value={data.hiring.activeCandidates}
-            detail={`${data.hiring.openPositions} open positions`}
-            icon={Target}
-            accent="#7C3AED"
-          />
+          {show('headcount') && (
+            <CommandMetric
+              label="Active workforce"
+              value={data.headcount.active}
+              detail={`${data.headcount.total} total records`}
+              icon={Users}
+              accent="#0F766E"
+            />
+          )}
+          {show('payroll') && (
+            <CommandMetric
+              label="Net payroll"
+              value={formatINR(data.payroll.lastRunNet, true)}
+              detail={`${data.payroll.lastRunMonth ?? 'No payroll'} latest run`}
+              icon={IndianRupee}
+              accent="#2563EB"
+            />
+          )}
+          {show('approvals') && (
+            <CommandMetric
+              label="Open decisions"
+              value={data.pendingApprovals.total}
+              detail="Approvals awaiting action"
+              icon={ShieldCheck}
+              accent="#F59E0B"
+            />
+          )}
+          {show('hiring') && (
+            <CommandMetric
+              label="Talent pipeline"
+              value={data.hiring.activeCandidates}
+              detail={`${data.hiring.openPositions} open positions`}
+              icon={Target}
+              accent="#7C3AED"
+            />
+          )}
           <CommandMetric
             label="Operating grade"
             value={hasOperationalData ? healthScore(data) : 'Not started'}
@@ -322,6 +348,7 @@ function ExecutiveDashboard({
       )}
 
       <section className="grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
+        {show('payroll') && (
         <Card className="overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -360,7 +387,9 @@ function ExecutiveDashboard({
             </ResponsiveContainer>
           </CardContent>
         </Card>
+        )}
 
+        {show('attendance') && (
         <Card className="overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">
             <div className="flex items-start justify-between gap-3">
@@ -401,9 +430,11 @@ function ExecutiveDashboard({
             </div>
           </CardContent>
         </Card>
+        )}
       </section>
 
       <section className="grid gap-5 xl:grid-cols-[0.85fr_1.15fr]">
+        {show('headcount') && (
         <Card className="overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">
             <CardTitle>Department Load Map</CardTitle>
@@ -423,7 +454,9 @@ function ExecutiveDashboard({
             ))}
           </CardContent>
         </Card>
+        )}
 
+        {show('payrollReadiness') && (
         <Card className="flex h-full flex-col overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">
             <CardTitle>Payroll Readiness</CardTitle>
@@ -433,9 +466,11 @@ function ExecutiveDashboard({
             <PayrollReadinessCard readiness={data.payrollReadiness} />
           </CardContent>
         </Card>
+        )}
       </section>
 
       <section className="grid gap-5 xl:grid-cols-[1fr_0.9fr_0.9fr]">
+        {show('approvals') && (
         <Card className="overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">
             <CardTitle>Decision Queue</CardTitle>
@@ -447,7 +482,9 @@ function ExecutiveDashboard({
             ))}
           </CardContent>
         </Card>
+        )}
 
+        {show('hiring') && (
         <Card className="overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">
             <CardTitle>Hiring Control</CardTitle>
@@ -462,6 +499,7 @@ function ExecutiveDashboard({
             </div>
           </CardContent>
         </Card>
+        )}
 
         <Card className="overflow-hidden border-slate-200 bg-white">
           <CardHeader className="border-slate-200 px-5 py-4">

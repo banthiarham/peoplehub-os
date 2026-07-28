@@ -1,4 +1,5 @@
 import { PermissionType, Prisma, ScopeType } from '@prisma/client';
+import { scopesForPermissions } from './permission-scopes';
 
 /**
  * Canonical catalog of the system roles every tenant should have available.
@@ -6,9 +7,8 @@ import { PermissionType, Prisma, ScopeType } from '@prisma/client';
  * Production-safety rules that this module guarantees:
  *  - roles are matched by `(tenantId, name)` and are only ever CREATED, never renamed,
  *    re-created or deleted, so existing role IDs and user assignments are preserved;
- *  - default permissions are only written for roles this module actually creates.
- *    A role that already exists keeps its current permissions untouched, so existing
- *    role-to-module access mappings are never modified.
+ *  - permission rows are only ever INSERTED. Reconciliation adds catalog rows that an
+ *    existing role is missing and never deletes, rewrites or narrows what is already there.
  *
  * `Super Admin` is deliberately NOT part of the catalog: platform-level access is
  * granted through the `users.isSuperAdmin` column, not through an assignable tenant role.
@@ -53,7 +53,7 @@ export const SYSTEM_ROLE_CATALOG: CatalogRole[] = [
       grant('employees', FULL, T),
       grant('attendance', FULL_APPROVE, T),
       grant('leave', FULL_APPROVE, T),
-      grant('payroll', FULL_APPROVE, T),
+      grant('payroll', [...FULL_APPROVE, RUN_PAYROLL, LOCK_PAYROLL, UNLOCK_PAYROLL], T),
       grant('recruitment', FULL_APPROVE, T),
       grant('onboarding', FULL_APPROVE, T),
       grant('timesheets', FULL_APPROVE, T),
@@ -68,7 +68,9 @@ export const SYSTEM_ROLE_CATALOG: CatalogRole[] = [
       grant('settings', FULL, T),
       grant('roles', FULL, T),
       grant('tax', FULL, T),
-      grant('developer', [CONFIGURE], T),
+      // The owner must be able to reach the developer/integration console, not only
+      // "configure" it: the API-key and integration routes match on their own scopes.
+      grant('developer', [VIEW, CONFIGURE, MANAGE_API_KEYS, MANAGE_INTEGRATIONS], T),
     ],
   },
   {
@@ -151,8 +153,15 @@ export const SYSTEM_ROLE_CATALOG: CatalogRole[] = [
       grant('employees', [VIEW], R),
       grant('attendance', [VIEW, APPROVE], R),
       grant('leave', [VIEW, APPROVE], R),
-      grant('payroll', [APPROVE], R),
-      grant('recruitment', MANAGE_APPROVE, R),
+      // Read-only on purpose. A generic payroll APPROVE grant derives `payroll:approve`,
+      // which the payroll run approve/lock/close routes used to accept - that let a
+      // Manager approve and lock a tenant-wide payroll run. Expense and loan sign-off
+      // stay reachable through the explicit `Manager` role on those routes.
+      grant('payroll', [VIEW], R),
+      // Requisitions and candidates have no employee to scope by, so DIRECT_REPORTS is
+      // not expressible here; hiring managers work across the tenant pipeline.
+      // Approval of requisitions and offers is a separate guard, not a catalog grant.
+      grant('recruitment', MANAGE_APPROVE, T),
       grant('onboarding', [VIEW, EDIT, APPROVE], R),
       grant('timesheets', MANAGE_APPROVE, R),
       grant('assets', [VIEW], R),
@@ -221,7 +230,8 @@ export const SYSTEM_ROLE_CATALOG: CatalogRole[] = [
       grant('attendance', [VIEW, IMPORT], T),
       grant('notifications', [VIEW, CONFIGURE], T),
       grant('settings', [CONFIGURE], T),
-      grant('developer', [MANAGE_INTEGRATIONS], T),
+      // Integrations only. API-key management is deliberately not granted here.
+      grant('developer', [VIEW, MANAGE_INTEGRATIONS], T),
     ],
   },
   {
@@ -231,7 +241,7 @@ export const SYSTEM_ROLE_CATALOG: CatalogRole[] = [
       grant('organization', [VIEW], T),
       grant('employees', [VIEW], T),
       grant('settings', [CONFIGURE], T),
-      grant('developer', [MANAGE_API_KEYS, MANAGE_INTEGRATIONS], T),
+      grant('developer', [VIEW, MANAGE_API_KEYS, MANAGE_INTEGRATIONS], T),
     ],
   },
   {
@@ -285,21 +295,167 @@ export async function missingCatalogRoleNames(
   return SYSTEM_ROLE_NAMES.filter((name) => !existingNames.has(name));
 }
 
+/** The scope strings a catalog role grants once its permissions exist. */
+export function catalogRoleScopes(roleName: string): string[] {
+  const spec = SYSTEM_ROLE_CATALOG.find((role) => role.name === roleName);
+  if (!spec) return [];
+  return scopesForPermissions(
+    spec.grants.flatMap((g) => g.permissionTypes.map((permissionType) => ({ module: g.module, permissionType }))),
+  );
+}
+
 /**
- * Idempotently creates any system roles the tenant is missing, together with their
- * default permissions. Roles that already exist are left completely untouched.
+ * How broad a scope type is. Used only to describe a mismatch in the reconciliation
+ * report - it never drives a write.
+ */
+const SCOPE_BREADTH: Record<ScopeType, number> = {
+  [ScopeType.OWN_DATA]: 1,
+  [ScopeType.DIRECT_REPORTS]: 2,
+  [ScopeType.DEPARTMENT]: 3,
+  [ScopeType.LOCATION]: 3,
+  [ScopeType.LEGAL_ENTITY]: 3,
+  [ScopeType.CUSTOM_GROUP]: 3,
+  [ScopeType.ENTIRE_TENANT]: 4,
+};
+
+/** A `(module, permissionType)` the role already holds, but at a different scope than the catalog. */
+export interface ScopeConflict {
+  roleName: string;
+  module: string;
+  permissionType: PermissionType;
+  catalogScope: ScopeType;
+  existingScope: ScopeType;
+  /** True when what the tenant already has is broader than the catalog default. */
+  existingIsWider: boolean;
+}
+
+export interface TenantRbacPlan {
+  rolesToCreate: string[];
+  rolesPresent: string[];
+  /** Catalog rows an already-existing system role is missing, keyed by role name. */
+  permissionsToAdd: Array<{ roleName: string; roleId: string; rows: Prisma.PermissionCreateManyInput[] }>;
+  permissionRowCount: number;
+  scopeConflicts: ScopeConflict[];
+}
+
+const permissionKey = (module: string, permissionType: PermissionType) => `${module}::${permissionType}`;
+
+/**
+ * Works out - without writing anything - what a tenant needs to reach the catalog state.
  *
- * Safe to call repeatedly: a second call is a no-op.
+ * Reconciliation rules, in order of precedence:
+ *  1. `(module, permissionType, scopeType)` already present -> nothing to do.
+ *  2. `(module, permissionType)` present at a DIFFERENT scope -> reported as a scope
+ *     conflict and SKIPPED. Neither the existing row nor the scope is touched, so a
+ *     deliberately narrowed or deliberately widened grant survives the backfill.
+ *  3. `(module, permissionType)` absent entirely -> queued for insert.
+ *
+ * Custom (non-catalog) roles are never inspected or modified.
+ */
+export async function planTenantRbac(
+  client: Pick<Prisma.TransactionClient, 'role'>,
+  tenantId: string,
+): Promise<TenantRbacPlan> {
+  const existingRoles = await client.role.findMany({
+    where: { tenantId, name: { in: SYSTEM_ROLE_NAMES } },
+    select: { id: true, name: true, permissions: { select: { module: true, permissionType: true, scopeType: true } } },
+  });
+  const byName = new Map(existingRoles.map((role) => [role.name, role]));
+
+  const plan: TenantRbacPlan = {
+    rolesToCreate: [],
+    rolesPresent: [],
+    permissionsToAdd: [],
+    permissionRowCount: 0,
+    scopeConflicts: [],
+  };
+
+  for (const spec of SYSTEM_ROLE_CATALOG) {
+    const existing = byName.get(spec.name);
+    if (!existing) {
+      plan.rolesToCreate.push(spec.name);
+      plan.permissionRowCount += spec.grants.reduce((sum, g) => sum + g.permissionTypes.length, 0);
+      continue;
+    }
+
+    plan.rolesPresent.push(spec.name);
+
+    const exact = new Set(
+      existing.permissions.map((p) => `${permissionKey(p.module, p.permissionType)}::${p.scopeType}`),
+    );
+    const byModuleType = new Map<string, ScopeType>();
+    for (const p of existing.permissions) {
+      if (!byModuleType.has(permissionKey(p.module, p.permissionType))) {
+        byModuleType.set(permissionKey(p.module, p.permissionType), p.scopeType);
+      }
+    }
+
+    const rows: Prisma.PermissionCreateManyInput[] = [];
+    for (const g of spec.grants) {
+      for (const permissionType of g.permissionTypes) {
+        const key = permissionKey(g.module, permissionType);
+        if (exact.has(`${key}::${g.scopeType}`)) continue;
+
+        const existingScope = byModuleType.get(key);
+        if (existingScope) {
+          plan.scopeConflicts.push({
+            roleName: spec.name,
+            module: g.module,
+            permissionType,
+            catalogScope: g.scopeType,
+            existingScope,
+            existingIsWider: SCOPE_BREADTH[existingScope] > SCOPE_BREADTH[g.scopeType],
+          });
+          continue;
+        }
+
+        rows.push({ roleId: existing.id, module: g.module, permissionType, scopeType: g.scopeType });
+      }
+    }
+
+    if (rows.length) {
+      plan.permissionsToAdd.push({ roleName: spec.name, roleId: existing.id, rows });
+      plan.permissionRowCount += rows.length;
+    }
+  }
+
+  return plan;
+}
+
+export interface EnsureTenantRolesResult {
+  /** System roles that did not exist and were created with their full catalog grants. */
+  created: string[];
+  /** System roles that already existed and were topped up, with the row count added. */
+  permissionsAdded: Array<{ roleName: string; rows: number }>;
+  permissionRowsAdded: number;
+  scopeConflicts: ScopeConflict[];
+}
+
+/**
+ * Idempotently brings a tenant to the catalog state.
+ *
+ * Purely additive:
+ *  - creates system roles the tenant is missing, with their full catalog permissions;
+ *  - inserts catalog permission rows that an EXISTING system role does not have yet,
+ *    preserving that role's id, its user assignments and any extra permissions it holds;
+ *  - never updates, narrows or deletes an existing role or permission;
+ *  - never touches custom roles.
+ *
+ * Safe to call repeatedly: a second call performs zero writes.
  */
 export async function ensureTenantRoles(
   tx: Prisma.TransactionClient,
   tenantId: string,
-): Promise<{ created: string[] }> {
-  const missing = await missingCatalogRoleNames(tx, tenantId);
-  if (!missing.length) return { created: [] };
+): Promise<EnsureTenantRolesResult> {
+  const plan = await planTenantRbac(tx, tenantId);
+  const result: EnsureTenantRolesResult = {
+    created: [],
+    permissionsAdded: [],
+    permissionRowsAdded: 0,
+    scopeConflicts: plan.scopeConflicts,
+  };
 
-  const created: string[] = [];
-  for (const name of missing) {
+  for (const name of plan.rolesToCreate) {
     const spec = SYSTEM_ROLE_CATALOG.find((role) => role.name === name)!;
     // upsert (not create) so a concurrent signup/backfill cannot fail this call.
     const role = await tx.role.upsert({
@@ -311,7 +467,14 @@ export async function ensureTenantRoles(
     if (rows.length) {
       await tx.permission.createMany({ data: rows, skipDuplicates: true });
     }
-    created.push(spec.name);
+    result.created.push(spec.name);
   }
-  return { created };
+
+  for (const entry of plan.permissionsToAdd) {
+    await tx.permission.createMany({ data: entry.rows, skipDuplicates: true });
+    result.permissionsAdded.push({ roleName: entry.roleName, rows: entry.rows.length });
+    result.permissionRowsAdded += entry.rows.length;
+  }
+
+  return result;
 }

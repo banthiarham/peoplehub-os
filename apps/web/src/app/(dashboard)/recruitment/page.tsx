@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useSession } from 'next-auth/react';
 import {
   BadgeCheck,
   Briefcase,
@@ -28,6 +29,7 @@ import { Input, Select } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { OpsTextarea } from '@/components/forms/ops-textarea';
+import { allows, viewerFromSession } from '@/lib/authz';
 
 const PIPELINE_STAGES = [
   'APPLIED',
@@ -214,6 +216,7 @@ function RecruitmentMetric({
 
 export default function RecruitmentPage() {
   const qc = useQueryClient();
+  const { data: session } = useSession();
   const [activeTab, setActiveTab] = useState<Tab>('Pipeline');
   const [error, setError] = useState<string | null>(null);
   const [jobForm, setJobForm] = useState(initialJob);
@@ -327,6 +330,9 @@ export default function RecruitmentPage() {
     },
     onError: (err) => setError(errorMessage(err)),
   });
+  // Recruiter manages the pipeline but does not sign off requisitions or offers, so the
+  // approve/reject controls are not rendered for them. The API rejects them regardless.
+  const canApprove = allows(viewerFromSession(session), 'recruitmentApprove');
   const approveJob = useMutation({
     mutationFn: ({ id, status }: { id: string; status: 'APPROVED' | 'REJECTED' }) =>
       api.patch(`/recruitment/jobs/${id}/approval`, { status, reason: status === 'REJECTED' ? 'Rejected during requisition review' : undefined }),
@@ -625,12 +631,16 @@ export default function RecruitmentPage() {
                     <TD><Badge variant={statusVariant(job.approvalStatus)}>{job.approvalStatus}</Badge></TD>
                     <TD>
                       <div className="flex gap-2">
-                        <Button type="button" size="sm" variant="outline" onClick={() => approveJob.mutate({ id: job.id, status: 'APPROVED' })}>
-                          <Check className="h-3.5 w-3.5" /> Approve
-                        </Button>
-                        <Button type="button" size="sm" variant="outline" onClick={() => approveJob.mutate({ id: job.id, status: 'REJECTED' })}>
-                          <X className="h-3.5 w-3.5" /> Reject
-                        </Button>
+                        {canApprove && (
+                          <>
+                            <Button type="button" size="sm" variant="outline" onClick={() => approveJob.mutate({ id: job.id, status: 'APPROVED' })}>
+                              <Check className="h-3.5 w-3.5" /> Approve
+                            </Button>
+                            <Button type="button" size="sm" variant="outline" onClick={() => approveJob.mutate({ id: job.id, status: 'REJECTED' })}>
+                              <X className="h-3.5 w-3.5" /> Reject
+                            </Button>
+                          </>
+                        )}
                       </div>
                     </TD>
                   </TR>
@@ -831,7 +841,9 @@ export default function RecruitmentPage() {
                     </TD>
                     <TD>
                       <div className="flex flex-wrap gap-2">
-                        <Button type="button" size="sm" variant="outline" onClick={() => approveOffer.mutate({ id: offer.id, status: 'APPROVED' })}><BadgeCheck className="h-3.5 w-3.5" /> Approve</Button>
+                        {canApprove && (
+                          <Button type="button" size="sm" variant="outline" onClick={() => approveOffer.mutate({ id: offer.id, status: 'APPROVED' })}><BadgeCheck className="h-3.5 w-3.5" /> Approve</Button>
+                        )}
                         <Button type="button" size="sm" variant="outline" onClick={() => generateLetter.mutate(offer.id)}>Letter</Button>
                         <Button type="button" size="sm" variant="outline" onClick={() => updateOfferStatus.mutate({ id: offer.id, status: 'SENT' })}>Send</Button>
                         <Button type="button" size="sm" variant="outline" onClick={() => updateOfferStatus.mutate({ id: offer.id, status: 'ACCEPTED' })}>Accept</Button>

@@ -72,8 +72,16 @@ export class RbacService {
   }
 
   async setPermissions(tenantId: string, roleId: string, dto: SetRolePermissionsDto, actorUserId: string) {
+    // Tenant ownership of the role is the cross-tenant guard: a role id from another
+    // tenant simply does not resolve here.
     const role = await this.prisma.role.findFirst({ where: { id: roleId, tenantId } });
     if (!role) throw new NotFoundException('Role not found');
+    // Sensitive-field grants have their own endpoint (`PATCH /roles/field-permissions`),
+    // which is what the audit trail and the UI read. Writing them through the generic
+    // permission editor would bypass both, so they are rejected here.
+    if (dto.permissions.some((p) => p.module.startsWith('employee.field.'))) {
+      throw new BadRequestException('Sensitive field access must be set through the field permissions endpoint');
+    }
     const before = await this.prisma.permission.findMany({ where: { roleId } });
     await this.prisma.$transaction(async (tx) => {
       await tx.permission.deleteMany({ where: { roleId, module: { not: { startsWith: 'employee.field.' } } } });
