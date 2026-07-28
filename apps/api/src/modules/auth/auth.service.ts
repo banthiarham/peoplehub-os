@@ -7,6 +7,7 @@ import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { EmailService } from '../email/email.service';
+import { ensureTenantRoles } from '../rbac/role-catalog';
 import { ChangePasswordDto, ForgotPasswordDto, LoginDto, OAuthTokenDto, ResetPasswordDto, SignupDto } from './dto/login.dto';
 import { JwtPayload } from './jwt.strategy';
 
@@ -175,6 +176,10 @@ export class AuthService {
         select: { id: true, email: true, name: true, avatarUrl: true, isSuperAdmin: true },
       });
       await tx.userRole.create({ data: { userId: owner.id, roleId: tenantOwner.id } });
+
+      // Make the rest of the system role catalog available for assignment from day one.
+      // `Tenant Owner` already exists at this point, so its permissions above are preserved.
+      await ensureTenantRoles(tx, tenant.id);
 
       await tx.legalEntity.create({
         data: {

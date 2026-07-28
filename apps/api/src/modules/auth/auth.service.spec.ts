@@ -11,6 +11,9 @@ describe('AuthService', () => {
       },
       role: {
         create: jest.fn().mockResolvedValue({ id: 'role-owner' }),
+        // signup also seeds the remaining system role catalog
+        findMany: jest.fn().mockResolvedValue([{ name: 'Tenant Owner' }]),
+        upsert: jest.fn(async ({ create }: any) => ({ id: `role-${create.name}`, ...create })),
       },
       permission: {
         createMany: jest.fn().mockResolvedValue({ count: 55 }),
@@ -72,6 +75,10 @@ describe('AuthService', () => {
       }),
     );
     expect(tx.userRole.create).toHaveBeenCalledWith({ data: { userId: 'user-1', roleId: 'role-owner' } });
+    const catalogNames = tx.role.upsert.mock.calls.map(([args]: any) => args.create.name);
+    expect(catalogNames).toEqual(expect.arrayContaining(['HR Admin', 'Recruiter', 'Manager', 'Employee']));
+    // the Tenant Owner role created above must not be re-created or modified
+    expect(catalogNames).not.toContain('Tenant Owner');
     expect(result).toEqual(
       expect.objectContaining({
         accessToken: 'signed-signup-token',

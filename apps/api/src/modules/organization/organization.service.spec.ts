@@ -1,6 +1,34 @@
 import { NotFoundException } from '@nestjs/common';
 import { OrganizationService } from './organization.service';
 
+describe('OrganizationService.createTenant', () => {
+  it('seeds the system role catalog alongside the Tenant Owner role', async () => {
+    const tx = {
+      tenant: { create: jest.fn().mockResolvedValue({ id: 'tenant-new', slug: 'new-co' }) },
+      role: {
+        create: jest.fn().mockResolvedValue({ id: 'role-owner' }),
+        findMany: jest.fn().mockResolvedValue([{ name: 'Tenant Owner' }]),
+        upsert: jest.fn(async ({ create }: any) => ({ id: `role-${create.name}`, ...create })),
+      },
+      permission: { createMany: jest.fn().mockResolvedValue({ count: 20 }) },
+      user: { create: jest.fn() },
+      userRole: { create: jest.fn() },
+      auditLog: { create: jest.fn() },
+    };
+    const prisma = {
+      tenant: { findUnique: jest.fn().mockResolvedValue(null) },
+      $transaction: jest.fn(async (fn: any) => fn(tx)),
+    };
+    const service = new OrganizationService(prisma as any);
+
+    await service.createTenant({ name: 'New Co', slug: 'new-co' } as any, 'actor-1');
+
+    const seeded = tx.role.upsert.mock.calls.map(([args]: any) => args.create.name);
+    expect(seeded).toEqual(expect.arrayContaining(['HR Admin', 'Recruiter', 'Manager', 'Employee']));
+    expect(seeded).not.toContain('Tenant Owner');
+  });
+});
+
 describe('OrganizationService tenant settings', () => {
   const tenantId = 'tenant-1';
   const actorUserId = 'user-1';
