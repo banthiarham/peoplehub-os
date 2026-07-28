@@ -523,6 +523,8 @@ export class PayrollService {
 
     const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
     const attendanceLopByEmployee = await this.attendanceLossDayMap(tenantId, monthStart, monthEnd);
+    const attendanceFinalized =
+      run.runType === 'MONTHLY' ? await this.hasMonthlyAttendanceFinalization(run) : true;
     const taxYear = await this.activeTaxYear(tenantId, monthStart, monthEnd);
     const taxContext = taxYear
       ? await this.payrollTaxContext(
@@ -543,11 +545,13 @@ export class PayrollService {
         fromDate: { lte: monthEnd },
         toDate: { gte: monthStart },
       },
-      select: { employeeId: true, days: true },
+      select: { employeeId: true, days: true, fromDate: true, toDate: true },
     });
     const lwpByEmployee = new Map<string, number>();
     for (const r of lwpRequests) {
-      lwpByEmployee.set(r.employeeId, (lwpByEmployee.get(r.employeeId) ?? 0) + r.days);
+      const daysInPeriod = this.leaveDaysInPeriod(r, monthStart, monthEnd);
+      if (daysInPeriod <= 0) continue;
+      lwpByEmployee.set(r.employeeId, (lwpByEmployee.get(r.employeeId) ?? 0) + daysInPeriod);
     }
     const employeeIds = employees.map((employee) => employee.id);
     const [variableInputs, payrollExpenses, pendingLeave, pendingExpenses, duplicateCodes] = await Promise.all([
@@ -607,6 +611,11 @@ export class PayrollService {
       const errors: string[] = [];
       const warnings: string[] = [];
       if (!salary) errors.push('Missing active salary structure or CTC for this payroll month');
+      if (!attendanceFinalized) {
+        errors.push(
+          `Attendance for ${this.period(run.year, run.month)} is not finalized; finalize attendance before processing payroll`,
+        );
+      }
       if (!emp.pan) warnings.push('PAN is missing; TDS and Form 16 data should be reviewed');
       if (!emp.uan) warnings.push('UAN is missing; PF reporting should be reviewed');
       if (!emp.bankDetails) warnings.push('Bank details are missing; bank file payout may fail');
@@ -862,7 +871,14 @@ export class PayrollService {
           components: entry.components as Prisma.InputJsonValue,
           publishedAt: new Date(),
         },
-        update: { publishedAt: new Date() },
+        update: {
+          payrollRunId: run.id,
+          grossPay: entry.grossPay,
+          totalDeductions: entry.totalDeductions,
+          netPay: entry.netPay,
+          components: entry.components as Prisma.InputJsonValue,
+          publishedAt: new Date(),
+        },
       });
     }
     await this.prisma.payrollRun.update({
@@ -1049,6 +1065,34 @@ export class PayrollService {
     return new Map(grouped.map((row) => [row.employeeId, row._count]));
   }
 
+  /**
+   * A MONTHLY run may only be costed against a finalized attendance month: until
+   * finalization runs, absences carry no LOP and a month with no records at all
+   * looks identical to a perfectly attended one. A tenant-wide finalization
+   * (locationId null) covers every location; a location-scoped run is also
+   * satisfied by the finalization for its own location.
+   */
+  private async hasMonthlyAttendanceFinalization(run: {
+    tenantId: string;
+    month: number;
+    year: number;
+    locationId: string | null;
+  }): Promise<boolean> {
+    const finalization = await this.prisma.attendanceFinalization.findFirst({
+      where: {
+        tenantId: run.tenantId,
+        month: run.month,
+        year: run.year,
+        status: 'FINALIZED',
+        ...(run.locationId
+          ? { OR: [{ locationId: null }, { locationId: run.locationId }] }
+          : { locationId: null }),
+      },
+      select: { id: true },
+    });
+    return Boolean(finalization);
+  }
+
   private async attendanceLossDayMap(tenantId: string, monthStart: Date, monthEnd: Date) {
     const records = await this.prisma.attendanceRecord.findMany({
       where: {
@@ -1064,6 +1108,33 @@ export class PayrollService {
       result.set(record.employeeId, (result.get(record.employeeId) ?? 0) + (record.status === 'HALF_DAY' ? 0.5 : 1));
     }
     return result;
+  }
+
+  /**
+   * The portion of an approved leave request that falls inside the payroll
+   * period. A request contained in the period keeps its stored `days` verbatim,
+   * so single-month and half-day requests are unchanged. A request straddling a
+   * month boundary is split across its calendar span, which keeps the sum of the
+   * monthly portions equal to the request total and stops the same leave days
+   * from being deducted again in the adjacent month.
+   */
+  private leaveDaysInPeriod(
+    leave: { fromDate: Date; toDate: Date; days: number },
+    periodStart: Date,
+    periodEnd: Date,
+  ): number {
+    const clippedFrom = leave.fromDate < periodStart ? periodStart : leave.fromDate;
+    const clippedTo = leave.toDate > periodEnd ? periodEnd : leave.toDate;
+    if (clippedTo < clippedFrom) return 0;
+    const totalSpanDays = this.inclusiveDayCount(leave.fromDate, leave.toDate);
+    if (totalSpanDays <= 0) return 0;
+    const inPeriodSpanDays = this.inclusiveDayCount(clippedFrom, clippedTo);
+    if (inPeriodSpanDays >= totalSpanDays) return leave.days;
+    return round2((leave.days * inPeriodSpanDays) / totalSpanDays);
+  }
+
+  private inclusiveDayCount(from: Date, to: Date): number {
+    return Math.floor((to.getTime() - from.getTime()) / 86_400_000) + 1;
   }
 
   private async activeTaxYear(tenantId: string, monthStart: Date, monthEnd: Date) {
