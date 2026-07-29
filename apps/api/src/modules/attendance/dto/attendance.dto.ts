@@ -268,6 +268,13 @@ export class AssignShiftDto {
   @IsOptional()
   @IsDateString()
   effectiveFrom?: string;
+
+  @ApiPropertyOptional({
+    description: 'Location this assignment applies at, for employees who work different shifts at different locations. Omit to use the employee\'s own location.',
+  })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
 }
 
 export class BiometricPunchRowDto {

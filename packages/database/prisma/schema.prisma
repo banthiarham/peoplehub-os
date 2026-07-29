@@ -398,6 +398,7 @@ model Location {
   attendanceRules           AttendanceRule[]
   attendanceCaptureSettings AttendanceCaptureSetting[]
   leavePolicies             LeavePolicy[]
+  shiftAssignments          ShiftAssignment[]
 
   @@index([tenantId])
   @@map("locations")
@@ -815,6 +816,10 @@ model ShiftAssignment {
   id             String    @id @default(cuid())
   employeeId     String
   shiftId        String
+  // Location this assignment applies at, for employees who work different
+  // shifts at different locations. Null means "use the employee's default
+  // location" (the common single-location case).
+  locationId     String?
   effectiveFrom  DateTime
   effectiveTo    DateTime?
   source         String    @default("MANUAL") // MANUAL, ROSTER_UPLOAD, SHIFT_SWAP
@@ -823,10 +828,12 @@ model ShiftAssignment {
 
   employee     Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   shift        Shift         @relation(fields: [shiftId], references: [id])
+  location     Location?     @relation(fields: [locationId], references: [id], onDelete: SetNull)
   rosterUpload RosterUpload? @relation(fields: [rosterUploadId], references: [id], onDelete: SetNull)
 
   @@index([employeeId])
   @@index([shiftId])
+  @@index([locationId])
   @@index([rosterUploadId])
   @@map("shift_assignments")
 }
