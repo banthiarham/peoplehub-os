@@ -176,6 +176,7 @@ describe('LeaveService', () => {
       where: {
         tenantId: 'tenant-1',
         isActive: true,
+        isDefault: true,
       },
     });
   });

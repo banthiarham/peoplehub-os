@@ -153,7 +153,13 @@ export class AttendanceService {
       orderBy: { effectiveFrom: 'desc' },
     });
     if (assignment) return assignment.shift;
-    return this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
+    // No explicit assignment covers this date — fall back to the tenant's
+    // designated default shift, not an arbitrary unordered row, so weekly
+    // offs/timing stay predictable for unassigned employees.
+    return (
+      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
+      this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } })
+    );
   }
 
   private async weeklyOffAt(tenantId: string, employeeId: string, at: Date) {
@@ -945,7 +951,7 @@ export class AttendanceService {
   /**
    * Resolves the shift for every day in a range from a single query, using the
    * same precedence as `currentShiftAt` (latest effective assignment, else the
-   * first active tenant shift).
+   * tenant's default shift).
    */
   private async shiftsForRange(tenantId: string, employeeId: string, start: Date, end: Date) {
     const assignments = await this.prisma.shiftAssignment.findMany({
@@ -957,7 +963,9 @@ export class AttendanceService {
       include: { shift: true },
       orderBy: { effectiveFrom: 'desc' },
     });
-    const fallback = await this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
+    const fallback =
+      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
+      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } }));
     return (at: Date) =>
       assignments.find(
         (assignment) =>
@@ -1282,11 +1290,28 @@ export class AttendanceService {
     return this.prisma.shift.findMany({
       where: { tenantId },
       include: { _count: { select: { shiftAssignments: true } } },
+      orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
     });
   }
 
   async createShift(tenantId: string, dto: CreateShiftDto) {
-    return this.prisma.shift.create({ data: { ...dto, tenantId } });
+    // A tenant's very first shift becomes the default automatically, so
+    // employees without an explicit assignment always resolve to something
+    // deterministic instead of an undefined fallback.
+    const hasAnyShift = await this.prisma.shift.findFirst({ where: { tenantId }, select: { id: true } });
+    return this.prisma.shift.create({ data: { ...dto, tenantId, isDefault: !hasAnyShift } });
+  }
+
+  async setDefaultShift(tenantId: string, id: string) {
+    const shift = await this.prisma.shift.findFirst({ where: { id, tenantId } });
+    if (!shift) throw new NotFoundException('Shift not found');
+    if (!shift.isActive) {
+      throw new BadRequestException('An inactive shift cannot be set as the default');
+    }
+    return this.prisma.$transaction(async (tx) => {
+      await tx.shift.updateMany({ where: { tenantId, isDefault: true }, data: { isDefault: false } });
+      return tx.shift.update({ where: { id }, data: { isDefault: true } });
+    });
   }
 
   async updateShiftWeeklyOffs(tenantId: string, id: string, dto: UpdateShiftWeeklyOffsDto) {
@@ -1301,15 +1326,34 @@ export class AttendanceService {
   async assignShift(tenantId: string, dto: AssignShiftDto) {
     const shift = await this.prisma.shift.findFirst({ where: { id: dto.shiftId, tenantId } });
     if (!shift) throw new NotFoundException('Shift not found');
-    const effectiveFrom = dto.effectiveFrom ? new Date(dto.effectiveFrom) : new Date();
-    await this.prisma.shiftAssignment.createMany({
-      data: dto.employeeIds.map((employeeId) => ({
-        employeeId,
-        shiftId: dto.shiftId,
-        effectiveFrom,
-      })),
+
+    const employeeIds = [...new Set(dto.employeeIds)];
+    const validEmployees = await this.prisma.employee.findMany({
+      where: { id: { in: employeeIds }, tenantId },
+      select: { id: true },
     });
-    return { assigned: dto.employeeIds.length };
+    if (validEmployees.length !== employeeIds.length) {
+      throw new BadRequestException('One or more employees do not belong to this workspace');
+    }
+
+    const effectiveFrom = dto.effectiveFrom ? new Date(dto.effectiveFrom) : new Date();
+    await this.prisma.$transaction([
+      // Close out any still-open assignment so exactly one shift is ever
+      // "current" for these employees, instead of leaving overlapping
+      // open-ended rows that only resolve correctly by ordering luck.
+      this.prisma.shiftAssignment.updateMany({
+        where: { employeeId: { in: employeeIds }, effectiveTo: null },
+        data: { effectiveTo: effectiveFrom },
+      }),
+      this.prisma.shiftAssignment.createMany({
+        data: employeeIds.map((employeeId) => ({
+          employeeId,
+          shiftId: dto.shiftId,
+          effectiveFrom,
+        })),
+      }),
+    ]);
+    return { assigned: employeeIds.length };
   }
 
   async importRoster(tenantId: string, uploadedById: string | undefined, dto: ImportRosterDto) {
@@ -1660,11 +1704,20 @@ export class AttendanceService {
 
   async createShiftSwap(user: AuthUser, dto: CreateShiftSwapDto) {
     const employeeId = this.requireEmployee(user);
-    const [requestedShift, targetShift] = await Promise.all([
+    if (dto.counterpartEmployeeId === employeeId) {
+      throw new BadRequestException('You cannot request a shift swap with yourself');
+    }
+    const [requestedShift, targetShift, counterpart] = await Promise.all([
       this.prisma.shift.findFirst({ where: { id: dto.requestedShiftId, tenantId: user.tenantId } }),
       this.prisma.shift.findFirst({ where: { id: dto.targetShiftId, tenantId: user.tenantId } }),
+      dto.counterpartEmployeeId
+        ? this.prisma.employee.findFirst({ where: { id: dto.counterpartEmployeeId, tenantId: user.tenantId } })
+        : null,
     ]);
     if (!requestedShift || !targetShift) throw new NotFoundException('Shift not found');
+    if (dto.counterpartEmployeeId && !counterpart) {
+      throw new NotFoundException('Counterpart employee not found in this workspace');
+    }
     return this.prisma.shiftSwapRequest.create({
       data: {
         tenantId: user.tenantId,

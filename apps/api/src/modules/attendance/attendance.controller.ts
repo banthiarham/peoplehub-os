@@ -211,6 +211,14 @@ export class AttendanceController {
     return this.attendance.assignShift(user.tenantId, dto);
   }
 
+  @Patch('shifts/:id/default')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Set this shift as the tenant default for unassigned employees' })
+  setDefaultShift(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.attendance.setDefaultShift(user.tenantId, id);
+  }
+
   @Post('rosters/import')
   @Roles('Super Admin', 'HR Admin')
   @Scopes('attendance:import')
