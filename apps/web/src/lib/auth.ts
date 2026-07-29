@@ -29,6 +29,8 @@ export const authOptions: NextAuthOptions = {
             email: data.user.email,
             accessToken: data.accessToken,
             roles: data.user.roles,
+            scopes: data.user.scopes ?? [],
+            isSuperAdmin: data.user.isSuperAdmin ?? false,
             employeeId: data.user.employeeId,
             tenant: data.user.tenant,
           };
@@ -43,6 +45,8 @@ export const authOptions: NextAuthOptions = {
       if (user) {
         token.accessToken = user.accessToken;
         token.roles = user.roles;
+        token.scopes = user.scopes ?? [];
+        token.isSuperAdmin = user.isSuperAdmin ?? false;
         token.employeeId = user.employeeId;
         token.tenant = user.tenant;
       }
@@ -52,6 +56,8 @@ export const authOptions: NextAuthOptions = {
       session.accessToken = token.accessToken;
       if (session.user) {
         session.user.roles = token.roles ?? [];
+        session.user.scopes = token.scopes ?? [];
+        session.user.isSuperAdmin = token.isSuperAdmin ?? false;
         session.user.employeeId = token.employeeId ?? null;
         session.user.tenant = token.tenant;
       }

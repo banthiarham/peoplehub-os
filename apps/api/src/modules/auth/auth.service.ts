@@ -7,11 +7,20 @@ import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { EmailService } from '../email/email.service';
-import { ensureTenantRoles } from '../rbac/role-catalog';
+import { scopesForPermissions } from '../rbac/permission-scopes';
+import { catalogRoleScopes, ensureTenantRoles, TENANT_OWNER_ROLE } from '../rbac/role-catalog';
 import { ChangePasswordDto, ForgotPasswordDto, LoginDto, OAuthTokenDto, ResetPasswordDto, SignupDto } from './dto/login.dto';
 import { JwtPayload } from './jwt.strategy';
 
-const TENANT_OWNER_SCOPES = [
+/**
+ * The Tenant Owner scope list that shipped before the role catalog existed.
+ *
+ * It is kept verbatim and unioned with the catalog-derived list below so that no
+ * existing Tenant Owner can lose a scope they already had, regardless of what
+ * permission rows their tenant's role actually holds. Removing it outright would
+ * make owner access depend on the backfill having run.
+ */
+const LEGACY_TENANT_OWNER_SCOPES = [
   'attendance:approve',
   'attendance:import',
   'attendance:read',
@@ -38,6 +47,14 @@ const TENANT_OWNER_SCOPES = [
   'workflow:read',
   'workflow:write',
 ];
+
+/**
+ * Every scope a Tenant Owner receives at login: the legacy list plus everything the
+ * catalog's `Tenant Owner` entry grants. Derived once at module load.
+ */
+export const TENANT_OWNER_SCOPES = [
+  ...new Set([...LEGACY_TENANT_OWNER_SCOPES, ...catalogRoleScopes(TENANT_OWNER_ROLE)]),
+].sort();
 
 const PASSWORD_RESET_EXPIRES_MS = 60 * 60 * 1000;
 
@@ -527,46 +544,14 @@ export class AuthService {
       };
     }>,
   ) {
-    if (userRoles.some((userRole) => userRole.role.name === 'Tenant Owner')) {
-      return [...TENANT_OWNER_SCOPES];
-    }
-    const scopes = new Set<string>();
-    for (const userRole of userRoles) {
-      for (const permission of userRole.role.permissions ?? []) {
-        const moduleName = this.scopeModule(permission.module);
-        for (const action of this.scopeActions(permission.permissionType)) {
-          scopes.add(`${moduleName}:${action}`);
-        }
-      }
-    }
-    return [...scopes].sort();
-  }
+    const permissions = userRoles.flatMap((userRole) => userRole.role.permissions ?? []);
+    const derived = scopesForPermissions(permissions);
 
-  private scopeModule(moduleName: string) {
-    return moduleName === 'workflows' ? 'workflow' : moduleName;
-  }
-
-  private scopeActions(permissionType: PermissionType) {
-    switch (permissionType) {
-      case PermissionType.VIEW:
-        return ['read'];
-      case PermissionType.CREATE:
-      case PermissionType.EDIT:
-      case PermissionType.DELETE:
-      case PermissionType.CONFIGURE:
-        return ['write'];
-      case PermissionType.APPROVE:
-        return ['approve'];
-      case PermissionType.EXPORT:
-        return ['export'];
-      case PermissionType.IMPORT:
-        return ['import'];
-      case PermissionType.RUN_PAYROLL:
-      case PermissionType.LOCK_PAYROLL:
-      case PermissionType.UNLOCK_PAYROLL:
-        return ['write', 'approve'];
-      default:
-        return [];
+    // A Tenant Owner always receives at least the full owner scope set, even if their
+    // tenant's role rows have not been reconciled against the catalog yet.
+    if (userRoles.some((userRole) => userRole.role.name === TENANT_OWNER_ROLE)) {
+      return [...new Set([...TENANT_OWNER_SCOPES, ...derived])].sort();
     }
+    return derived;
   }
 }

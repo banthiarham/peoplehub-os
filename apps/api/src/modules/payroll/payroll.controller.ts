@@ -21,7 +21,23 @@ import {
 } from './dto/payroll.dto';
 import { PayrollService } from './payroll.service';
 
-const PAYROLL_ROLES = ['Super Admin', 'Payroll Admin', 'HR Admin'];
+/**
+ * May read payroll configuration and act on expenses, loans and payroll inputs.
+ * Deliberately still includes HR Admin: this is the pre-existing payroll administration set.
+ */
+const PAYROLL_ROLES = ['Super Admin', 'Tenant Owner', 'Payroll Admin', 'HR Admin'];
+
+/**
+ * May move a payroll RUN through its lifecycle: process, override warnings, approve,
+ * lock and close.
+ *
+ * Separated from PAYROLL_ROLES because `payroll:approve` is also held by Finance Admin
+ * (cost sign-off) and granted on expense/loan routes, so guarding the lifecycle on it
+ * let Finance Admin and Manager approve and lock a tenant-wide payroll run. The
+ * lifecycle routes therefore match on `payroll:run` / `payroll:lock`, which only the
+ * RUN_PAYROLL / LOCK_PAYROLL permission types derive.
+ */
+const PAYROLL_LIFECYCLE_ROLES = ['Super Admin', 'Tenant Owner', 'Payroll Admin'];
 
 @ApiTags('Payroll')
 @ApiBearerAuth()
@@ -217,35 +233,38 @@ export class PayrollController {
   }
 
   @Post('runs/:id/process')
-  @Roles(...PAYROLL_ROLES)
-  @Scopes('payroll:write')
+  @Roles(...PAYROLL_LIFECYCLE_ROLES)
+  @Scopes('payroll:run')
   @ApiOperation({ summary: 'Compute gross/deductions/net for every active employee' })
   processRun(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.processRun(user.tenantId, id, user.userId);
   }
 
   @Post('runs/:id/override-warnings')
-  @Roles(...PAYROLL_ROLES)
-  @Scopes('payroll:approve')
+  @Roles(...PAYROLL_LIFECYCLE_ROLES)
+  @Scopes('payroll:run')
   @ApiOperation({ summary: 'Override payroll warnings with a required review reason' })
   overrideWarnings(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: OverrideWarningsDto) {
     return this.payroll.overrideRunWarnings(user.tenantId, id, user.userId, dto);
   }
 
   @Patch('runs/:id/approve')
-  @Roles(...PAYROLL_ROLES)
-  @Scopes('payroll:approve')
+  @Roles(...PAYROLL_LIFECYCLE_ROLES)
+  @Scopes('payroll:run')
   approveRun(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.approveRun(user.tenantId, id, user.userId);
   }
 
   @Patch('runs/:id/lock')
-  @Roles(...PAYROLL_ROLES)
-  @Scopes('payroll:approve')
+  @Roles(...PAYROLL_LIFECYCLE_ROLES)
+  @Scopes('payroll:lock')
   lockRun(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.lockRun(user.tenantId, id, user.userId);
   }
 
+  // Publish is intentionally left on the wider PAYROLL_ROLES set: it was not listed as a
+  // lifecycle action to restrict, and it can only run against an already-locked run.
+  // See the "unresolved product decision" note in the PR description.
   @Post('runs/:id/publish')
   @Roles(...PAYROLL_ROLES)
   @Scopes('payroll:write')
@@ -255,8 +274,8 @@ export class PayrollController {
   }
 
   @Patch('runs/:id/close')
-  @Roles(...PAYROLL_ROLES)
-  @Scopes('payroll:approve')
+  @Roles(...PAYROLL_LIFECYCLE_ROLES)
+  @Scopes('payroll:lock')
   closeRun(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.closeRun(user.tenantId, id, user.userId);
   }

@@ -393,3 +393,38 @@ describe('RbacService', () => {
     fieldPermissions.mockRestore();
   });
 });
+
+describe('RbacService.setPermissions', () => {
+  const service = (role: unknown) =>
+    new RbacService({
+      role: { findFirst: jest.fn().mockResolvedValue(role) },
+      permission: { findMany: jest.fn().mockResolvedValue([]) },
+      $transaction: jest.fn(),
+      auditLog: { create: jest.fn() },
+    } as never);
+
+  it('rejects a role id from another tenant', async () => {
+    await expect(
+      service(null).setPermissions('tenant-1', 'role-from-other-tenant', { permissions: [] }, 'actor-1'),
+    ).rejects.toThrow('Role not found');
+  });
+
+  it('refuses to write sensitive field grants through the generic permission editor', async () => {
+    await expect(
+      service({ id: 'role-1', tenantId: 'tenant-1', isSystem: false }).setPermissions(
+        'tenant-1',
+        'role-1',
+        {
+          permissions: [
+            {
+              module: 'employee.field.salary',
+              permissionType: 'VIEW_SENSITIVE',
+              scopeType: 'ENTIRE_TENANT',
+            } as never,
+          ],
+        },
+        'actor-1',
+      ),
+    ).rejects.toThrow('field permissions endpoint');
+  });
+});

@@ -4,7 +4,8 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import { useState } from 'react';
-import { NAV_SECTIONS } from '@/config/nav';
+import { visibleNavSections } from '@/config/nav';
+import { viewerFromSession } from '@/lib/authz';
 import { BRAND } from '@/config/brand';
 import { cn } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
@@ -23,6 +24,8 @@ export function Sidebar({
   const compact = collapsed && !hovered;
   const tenantName = session?.user?.tenant?.name ?? BRAND.name;
   const userName = session?.user?.name || session?.user?.email || `${BRAND.name} user`;
+  // Nav is filtered client-side purely to avoid dead links; the API stays authoritative.
+  const sections = visibleNavSections(viewerFromSession(session));
   return (
     <aside
       onMouseEnter={() => setHovered(true)}
@@ -66,7 +69,7 @@ export function Sidebar({
         </div>
       </div>
       <nav className={cn('scrollbar-thin flex-1 overflow-y-auto py-4', compact ? 'space-y-4 px-2' : 'space-y-5 px-3')}>
-        {NAV_SECTIONS.map((section) => (
+        {sections.map((section) => (
           <div key={section.title}>
             <p className={cn('mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500', compact && 'sr-only')}>
               {section.title}

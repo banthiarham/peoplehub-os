@@ -7,7 +7,7 @@ describe('OrganizationService.createTenant', () => {
       tenant: { create: jest.fn().mockResolvedValue({ id: 'tenant-new', slug: 'new-co' }) },
       role: {
         create: jest.fn().mockResolvedValue({ id: 'role-owner' }),
-        findMany: jest.fn().mockResolvedValue([{ name: 'Tenant Owner' }]),
+        findMany: jest.fn().mockResolvedValue([{ id: 'role-owner', name: 'Tenant Owner', permissions: [] }]),
         upsert: jest.fn(async ({ create }: any) => ({ id: `role-${create.name}`, ...create })),
       },
       permission: { createMany: jest.fn().mockResolvedValue({ count: 20 }) },

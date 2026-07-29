@@ -31,13 +31,13 @@ export class EngagementController {
   }
 
   @Post('surveys')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   createSurvey(@CurrentUser() user: AuthUser, @Body() dto: CreateSurveyDto) {
     return this.engagement.createSurvey(user.tenantId, dto);
   }
 
   @Patch('surveys/:id')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   updateSurvey(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateSurveyDto) {
     return this.engagement.updateSurvey(user.tenantId, id, dto);
   }
@@ -86,13 +86,13 @@ export class EngagementController {
   }
 
   @Post('announcements')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   createAnnouncement(@CurrentUser() user: AuthUser, @Body() dto: CreateAnnouncementDto) {
     return this.engagement.createAnnouncement(user.tenantId, dto);
   }
 
   @Post('polls')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   createPoll(@CurrentUser() user: AuthUser, @Body() dto: CreatePollDto) {
     return this.engagement.createPoll(user.tenantId, dto);
   }
@@ -103,7 +103,7 @@ export class EngagementController {
   }
 
   @Get('anonymous-feedback')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   listAnonymousFeedback(@CurrentUser() user: AuthUser) {
     return this.engagement.listAnonymousFeedback(user.tenantId);
   }

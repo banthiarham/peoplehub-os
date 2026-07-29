@@ -2,7 +2,9 @@
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { isAxiosError } from 'axios';
+import { useSession } from 'next-auth/react';
 import { api } from '@/lib/api';
+import { allows, viewerFromSession } from '@/lib/authz';
 import { Button, type ButtonProps } from '@/components/ui/button';
 import { useToast } from '@/components/ui/toaster';
 
@@ -22,6 +24,11 @@ interface RunAction {
   label: string;
   success: string;
   run: (id: string) => Promise<unknown>;
+  /**
+   * Which capability the API requires. Process/approve/lock/close are restricted to
+   * PAYROLL_LIFECYCLE_ROLES; publish stays on the wider payroll administration set.
+   */
+  capability: 'payrollLifecycle' | 'payroll';
 }
 
 const RUN_ACTIONS: Record<string, RunAction> = {
@@ -29,6 +36,7 @@ const RUN_ACTIONS: Record<string, RunAction> = {
     label: 'Process',
     success: 'Payroll run processed — ready for review',
     run: (id) => api.post(`/payroll/runs/${id}/process`),
+    capability: 'payrollLifecycle',
   },
   REVIEW: {
     label: 'Approve',
@@ -45,21 +53,25 @@ const RUN_ACTIONS: Record<string, RunAction> = {
         return api.patch(`/payroll/runs/${id}/approve`);
       }
     },
+    capability: 'payrollLifecycle',
   },
   APPROVED: {
     label: 'Lock',
     success: 'Payroll run locked',
     run: (id) => api.patch(`/payroll/runs/${id}/lock`),
+    capability: 'payrollLifecycle',
   },
   LOCKED: {
     label: 'Publish payslips',
     success: 'Payslips published',
     run: (id) => api.post(`/payroll/runs/${id}/publish`),
+    capability: 'payroll',
   },
   PUBLISHED: {
     label: 'Close',
     success: 'Payroll run closed',
     run: (id) => api.patch(`/payroll/runs/${id}/close`),
+    capability: 'payrollLifecycle',
   },
 };
 
@@ -73,7 +85,11 @@ interface PayrollRunActionButtonProps {
 export function PayrollRunActionButton({ runId, status, size = 'sm' }: PayrollRunActionButtonProps) {
   const queryClient = useQueryClient();
   const toast = useToast();
+  const { data: session } = useSession();
   const action = RUN_ACTIONS[status];
+  // Finance Admin, HR Admin and Manager can read payroll but cannot move a run through
+  // its lifecycle, so the control is not rendered for them. The API rejects it regardless.
+  const permitted = action ? allows(viewerFromSession(session), action.capability) : false;
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -87,7 +103,7 @@ export function PayrollRunActionButton({ runId, status, size = 'sm' }: PayrollRu
     onError: (err: unknown) => toast(payrollApiError(err), 'error'),
   });
 
-  if (!action) return null;
+  if (!action || !permitted) return null;
 
   return (
     <Button

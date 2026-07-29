@@ -11,6 +11,8 @@ declare module 'next-auth' {
   interface User {
     accessToken: string;
     roles: string[];
+    scopes?: string[];
+    isSuperAdmin?: boolean;
     employeeId: string | null;
     tenant?: TenantInfo;
   }
@@ -21,6 +23,8 @@ declare module 'next-auth' {
       email?: string | null;
       image?: string | null;
       roles: string[];
+      scopes: string[];
+      isSuperAdmin: boolean;
       employeeId: string | null;
       tenant?: TenantInfo;
     };
@@ -31,6 +35,8 @@ declare module 'next-auth/jwt' {
   interface JWT {
     accessToken?: string;
     roles?: string[];
+    scopes?: string[];
+    isSuperAdmin?: boolean;
     employeeId?: string | null;
     tenant?: TenantInfo;
   }

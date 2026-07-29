@@ -19,6 +19,7 @@ import { Input, Select } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toaster';
+import { allows, viewerFromSession } from '@/lib/authz';
 
 interface RoleRow {
   id: string;
@@ -52,7 +53,6 @@ function apiError(err: unknown) {
 }
 
 const TENANT_OWNER_ROLE = 'Tenant Owner';
-const RBAC_CONFIG_ROLES = ['Super Admin', TENANT_OWNER_ROLE];
 const USER_PAGE_SIZE = 25;
 
 function displayName(user: UserRow) {
@@ -71,12 +71,11 @@ export function RbacAdmin() {
   const [search, setSearch] = useState('');
   const [visibleUsers, setVisibleUsers] = useState(USER_PAGE_SIZE);
 
-  // Mirrors RBAC_CONFIG_ROLES on the API: only these may change RBAC configuration
-  // (custom roles, role permissions, sensitive-field access) or grant/revoke Tenant Owner.
-  // The API enforces this too — this just keeps controls that would 403 out of the UI.
-  // HR Admin is intentionally excluded here but keeps the user role assignment section.
-  const viewerRoles = session?.user?.roles ?? [];
-  const canConfigureRoles = viewerRoles.some((role) => RBAC_CONFIG_ROLES.includes(role));
+  // Only RBAC_CONFIG_ROLES on the API may change RBAC configuration (custom roles, role
+  // permissions, sensitive-field access) or grant/revoke Tenant Owner. The API enforces
+  // this too — this just keeps controls that would 403 out of the UI. HR Admin is
+  // excluded here but keeps the user role assignment section.
+  const canConfigureRoles = allows(viewerFromSession(session), 'configureRoles');
   const canAssignOwner = canConfigureRoles;
 
   const { data: roles, isLoading: rolesLoading } = useQuery<RoleRow[]>({
