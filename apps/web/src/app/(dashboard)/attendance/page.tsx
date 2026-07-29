@@ -1081,6 +1081,10 @@ function ShiftsTab() {
     queryKey: ['employees', 'options'],
     queryFn: () => api.get('/employees/meta/options').then((r) => r.data.managers as ShiftEmployeeOption[]),
   });
+  const { data: locationOptions } = useQuery({
+    queryKey: ['locations'],
+    queryFn: () => api.get('/locations').then((r) => r.data as { id: string; name: string }[]),
+  });
   const [form, setForm] = useState({
     name: '',
     type: 'FIXED',
@@ -1095,6 +1099,7 @@ function ShiftsTab() {
   const [assigningShift, setAssigningShift] = useState<{ id: string; name: string } | null>(null);
   const [assignEmployeeIds, setAssignEmployeeIds] = useState<string[]>([]);
   const [assignEffectiveFrom, setAssignEffectiveFrom] = useState('');
+  const [assignLocationId, setAssignLocationId] = useState('');
   const create = useMutation({
     mutationFn: () => api.post('/attendance/shifts', { ...form, gracePeriodMins: Number(form.gracePeriodMins), shiftAllowanceAmount: Number(form.shiftAllowanceAmount) }),
     onSuccess: () => { toast('Shift saved'); queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] }); setForm((f) => ({ ...f, name: '' })); },
@@ -1121,6 +1126,7 @@ function ShiftsTab() {
         shiftId: assigningShift!.id,
         employeeIds: assignEmployeeIds,
         ...(assignEffectiveFrom && { effectiveFrom: assignEffectiveFrom }),
+        ...(assignLocationId && { locationId: assignLocationId }),
       }),
     onSuccess: () => {
       toast('Shift assigned');
@@ -1128,6 +1134,7 @@ function ShiftsTab() {
       setAssigningShift(null);
       setAssignEmployeeIds([]);
       setAssignEffectiveFrom('');
+      setAssignLocationId('');
     },
     onError: (err) => toast(apiError(err), 'error'),
   });
@@ -1206,6 +1213,7 @@ function ShiftsTab() {
                           setAssigningShift({ id: s.id, name: s.name });
                           setAssignEmployeeIds([]);
                           setAssignEffectiveFrom('');
+                          setAssignLocationId('');
                         }}
                       >
                         Assign
@@ -1298,6 +1306,24 @@ function ShiftsTab() {
                 onChange={(e) => setAssignEffectiveFrom(e.target.value)}
                 className="mt-1"
               />
+            </label>
+            <label className="block text-sm">
+              <span className="text-ink-muted">Location (optional)</span>
+              <Select
+                value={assignLocationId}
+                onChange={(e) => setAssignLocationId(e.target.value)}
+                className="mt-1"
+              >
+                <option value="">Employee&apos;s own location</option>
+                {locationOptions?.map((location) => (
+                  <option key={location.id} value={location.id}>
+                    {location.name}
+                  </option>
+                ))}
+              </Select>
+              <span className="mt-1 block text-xs text-ink-muted">
+                Set this when these employees work this shift at a different location than usual.
+              </span>
             </label>
             <div className="max-h-64 overflow-y-auto rounded-lg border border-line">
               {employeeOptions?.map((employee) => (

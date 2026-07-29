@@ -142,7 +142,13 @@ export class AttendanceService {
     return user.employeeId;
   }
 
-  private async currentShiftAt(tenantId: string, employeeId: string, at: Date) {
+  /**
+   * Resolves the shift assignment covering `at`, including the location it
+   * was assigned at (for employees who work different shifts at different
+   * locations). Falls back to the tenant's default shift with no location
+   * (meaning "use the employee's own location") when nothing is assigned.
+   */
+  private async currentAssignment(tenantId: string, employeeId: string, at: Date) {
     const assignment = await this.prisma.shiftAssignment.findFirst({
       where: {
         employeeId,
@@ -152,14 +158,18 @@ export class AttendanceService {
       include: { shift: true },
       orderBy: { effectiveFrom: 'desc' },
     });
-    if (assignment) return assignment.shift;
+    if (assignment) return { shift: assignment.shift, locationId: assignment.locationId };
     // No explicit assignment covers this date — fall back to the tenant's
     // designated default shift, not an arbitrary unordered row, so weekly
     // offs/timing stay predictable for unassigned employees.
-    return (
+    const shift =
       (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
-      this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } })
-    );
+      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } }));
+    return { shift, locationId: null as string | null };
+  }
+
+  private async currentShiftAt(tenantId: string, employeeId: string, at: Date) {
+    return (await this.currentAssignment(tenantId, employeeId, at)).shift;
   }
 
   private async weeklyOffAt(tenantId: string, employeeId: string, at: Date) {
@@ -206,6 +216,16 @@ export class AttendanceService {
       select: { locationId: true },
     });
     return employee?.locationId ?? null;
+  }
+
+  /**
+   * The location that should govern capture rules, geofencing, and
+   * attendance rule resolution right now: the current shift assignment's
+   * location if one was set, otherwise the employee's own location.
+   */
+  private async resolveEffectiveLocationId(tenantId: string, employeeId: string, at: Date) {
+    const { locationId } = await this.currentAssignment(tenantId, employeeId, at);
+    return locationId ?? this.employeeLocationId(tenantId, employeeId);
   }
 
   private deriveInteractiveCaptureMode(dto: CheckInDto): AttendanceCaptureMode {
@@ -336,26 +356,34 @@ export class AttendanceService {
       this.validateGpsFix(dto);
     }
     if (setting.requiresGeofence && dto && employeeId) {
-      await this.validateGeofence(tenantId, employeeId, dto);
+      await this.validateGeofence(tenantId, employeeId, dto, locationId ?? null);
     }
   }
 
   async checkIn(user: AuthUser, dto: CheckInDto, forcedSource?: string) {
     const employeeId = this.requireEmployee(user);
     const today = dateOnly(new Date());
-    const locationId = await this.employeeLocationId(user.tenantId, employeeId);
+    // The location and shift a check-in should be evaluated against come
+    // from the employee's current shift assignment when it specifies a
+    // location (multi-location shift support), falling back to the
+    // employee's own location otherwise.
+    const { shift, locationId: assignmentLocationId } = await this.currentAssignment(
+      user.tenantId,
+      employeeId,
+      new Date(),
+    );
+    const locationId = assignmentLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
     const captureMode =
       forcedSource === 'QR' ? AttendanceCaptureMode.QR : this.deriveInteractiveCaptureMode(dto);
 
     await this.assertCaptureModeAllowed(user.tenantId, captureMode, locationId, dto, employeeId);
     await this.validateDevice(user.tenantId, employeeId, dto);
-    await this.validateGeofence(user.tenantId, employeeId, dto);
+    await this.validateGeofence(user.tenantId, employeeId, dto, locationId);
     const existing = await this.prisma.attendanceRecord.findUnique({
       where: { employeeId_date: { employeeId, date: today } },
     });
     if (existing?.punchIn) throw new BadRequestException('Already checked in today');
 
-    const shift = await this.currentShift(user.tenantId, employeeId);
     const rule = await this.attendanceRule(user.tenantId, { shiftId: shift?.id, locationId });
     const now = new Date();
     const status: 'PRESENT' | 'LATE' = this.isLateArrival(now, shift, rule) ? 'LATE' : 'PRESENT';
@@ -376,16 +404,16 @@ export class AttendanceService {
   }
 
   async qrCheckIn(user: AuthUser, dto: QrPunchDto) {
-    const [, locationId] = dto.qrCode.split(':');
-    if (!locationId || !dto.qrCode.startsWith('PHUB:')) {
+    const [, qrLocationId] = dto.qrCode.split(':');
+    if (!qrLocationId || !dto.qrCode.startsWith('PHUB:')) {
       throw new BadRequestException('Invalid attendance QR code');
     }
     const employeeId = this.requireEmployee(user);
-    const employee = await this.prisma.employee.findFirst({
-      where: { id: employeeId, tenantId: user.tenantId },
-      select: { locationId: true },
-    });
-    if (employee?.locationId !== locationId) {
+    // The QR code must match wherever the employee is actually scheduled
+    // today — their current shift assignment's location if one is set,
+    // otherwise their own default location.
+    const effectiveLocationId = await this.resolveEffectiveLocationId(user.tenantId, employeeId, new Date());
+    if (effectiveLocationId !== qrLocationId) {
       throw new ForbiddenException('This QR code does not match your assigned work location');
     }
     return this.checkIn(user, dto, 'QR');
@@ -475,12 +503,14 @@ export class AttendanceService {
     tenantId: string,
     employeeId: string,
     dto: CheckInDto,
+    locationId: string | null,
   ): Promise<void> {
+    if (!locationId) return;
     const employee = await this.prisma.employee.findFirst({
       where: { id: employeeId, tenantId },
-      select: { workMode: true, location: true },
+      select: { workMode: true },
     });
-    const loc = employee?.location;
+    const loc = await this.prisma.location.findFirst({ where: { id: locationId, tenantId } });
     if (employee?.workMode !== 'OFFICE' || !loc?.geoLat || !loc?.geoLng || !loc?.attendanceRadius) {
       return;
     }
@@ -1327,6 +1357,11 @@ export class AttendanceService {
     const shift = await this.prisma.shift.findFirst({ where: { id: dto.shiftId, tenantId } });
     if (!shift) throw new NotFoundException('Shift not found');
 
+    if (dto.locationId) {
+      const location = await this.prisma.location.findFirst({ where: { id: dto.locationId, tenantId } });
+      if (!location) throw new NotFoundException('Location not found');
+    }
+
     const employeeIds = [...new Set(dto.employeeIds)];
     const validEmployees = await this.prisma.employee.findMany({
       where: { id: { in: employeeIds }, tenantId },
@@ -1349,6 +1384,7 @@ export class AttendanceService {
         data: employeeIds.map((employeeId) => ({
           employeeId,
           shiftId: dto.shiftId,
+          locationId: dto.locationId ?? null,
           effectiveFrom,
         })),
       }),
