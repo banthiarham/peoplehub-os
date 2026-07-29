@@ -109,7 +109,14 @@ interface ShiftRow {
   gracePeriodMins: number;
   shiftAllowanceAmount: number | string;
   weeklyOffDays: number[];
+  isDefault: boolean;
   _count?: { shiftAssignments?: number };
+}
+
+interface ShiftEmployeeOption {
+  id: string;
+  firstName: string;
+  lastName: string;
 }
 
 interface RosterUploadRow {
@@ -1070,6 +1077,10 @@ function ShiftsTab() {
     queryKey: ['attendance', 'shifts'],
     queryFn: () => api.get('/attendance/shifts').then((r) => r.data as ShiftRow[]),
   });
+  const { data: employeeOptions } = useQuery({
+    queryKey: ['employees', 'options'],
+    queryFn: () => api.get('/employees/meta/options').then((r) => r.data.managers as ShiftEmployeeOption[]),
+  });
   const [form, setForm] = useState({
     name: '',
     type: 'FIXED',
@@ -1081,6 +1092,9 @@ function ShiftsTab() {
   const [editingWeeklyOffs, setEditingWeeklyOffs] = useState<{ id: string; days: number[] } | null>(
     null,
   );
+  const [assigningShift, setAssigningShift] = useState<{ id: string; name: string } | null>(null);
+  const [assignEmployeeIds, setAssignEmployeeIds] = useState<string[]>([]);
+  const [assignEffectiveFrom, setAssignEffectiveFrom] = useState('');
   const create = useMutation({
     mutationFn: () => api.post('/attendance/shifts', { ...form, gracePeriodMins: Number(form.gracePeriodMins), shiftAllowanceAmount: Number(form.shiftAllowanceAmount) }),
     onSuccess: () => { toast('Shift saved'); queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] }); setForm((f) => ({ ...f, name: '' })); },
@@ -1093,6 +1107,27 @@ function ShiftsTab() {
       toast('Weekly offs updated');
       queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] });
       setEditingWeeklyOffs(null);
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+  const setDefaultShift = useMutation({
+    mutationFn: (id: string) => api.patch(`/attendance/shifts/${id}/default`),
+    onSuccess: () => { toast('Default shift updated'); queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] }); },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+  const assignShift = useMutation({
+    mutationFn: () =>
+      api.post('/attendance/shifts/assign', {
+        shiftId: assigningShift!.id,
+        employeeIds: assignEmployeeIds,
+        ...(assignEffectiveFrom && { effectiveFrom: assignEffectiveFrom }),
+      }),
+    onSuccess: () => {
+      toast('Shift assigned');
+      queryClient.invalidateQueries({ queryKey: ['attendance', 'shifts'] });
+      setAssigningShift(null);
+      setAssignEmployeeIds([]);
+      setAssignEffectiveFrom('');
     },
     onError: (err) => toast(apiError(err), 'error'),
   });
@@ -1124,13 +1159,19 @@ function ShiftsTab() {
               <TH>Allowance</TH>
               <TH>Weekly off</TH>
               <TH>Assigned</TH>
+              <TH></TH>
             </TR>
           </THead>
           <TBody>
             {shifts?.map((s) => {
               return (
                 <TR key={s.id}>
-                  <TD className="font-medium">{s.name}</TD>
+                  <TD className="font-medium">
+                    <div className="flex items-center gap-2">
+                      {s.name}
+                      {s.isDefault && <Badge variant="success">Default</Badge>}
+                    </div>
+                  </TD>
                   <TD>{s.type}</TD>
                   <TD>
                     {s.startTime} - {s.endTime}
@@ -1156,6 +1197,31 @@ function ShiftsTab() {
                     </div>
                   </TD>
                   <TD>{s._count?.shiftAssignments ?? 0}</TD>
+                  <TD>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setAssigningShift({ id: s.id, name: s.name });
+                          setAssignEmployeeIds([]);
+                          setAssignEffectiveFrom('');
+                        }}
+                      >
+                        Assign
+                      </Button>
+                      {!s.isDefault && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={setDefaultShift.isPending}
+                          onClick={() => setDefaultShift.mutate(s.id)}
+                        >
+                          Set default
+                        </Button>
+                      )}
+                    </div>
+                  </TD>
                 </TR>
               );
             })}
@@ -1208,6 +1274,65 @@ function ShiftsTab() {
               }
             >
               Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={assigningShift !== null}
+        onOpenChange={(open) => !open && setAssigningShift(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Assign {assigningShift?.name}</DialogTitle>
+            <DialogDescription>
+              Employees selected here will be moved onto this shift starting from the effective date. Any shift they&apos;re currently on is closed out automatically.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <label className="block text-sm">
+              <span className="text-ink-muted">Effective from</span>
+              <Input
+                type="date"
+                value={assignEffectiveFrom}
+                onChange={(e) => setAssignEffectiveFrom(e.target.value)}
+                className="mt-1"
+              />
+            </label>
+            <div className="max-h-64 overflow-y-auto rounded-lg border border-line">
+              {employeeOptions?.map((employee) => (
+                <label
+                  key={employee.id}
+                  className="flex items-center gap-2 border-b border-line px-3 py-2 text-sm last:border-b-0"
+                >
+                  <input
+                    type="checkbox"
+                    checked={assignEmployeeIds.includes(employee.id)}
+                    onChange={() =>
+                      setAssignEmployeeIds((current) =>
+                        current.includes(employee.id)
+                          ? current.filter((id) => id !== employee.id)
+                          : [...current, employee.id],
+                      )
+                    }
+                  />
+                  {employee.firstName} {employee.lastName}
+                </label>
+              ))}
+              {employeeOptions?.length === 0 && (
+                <p className="px-3 py-4 text-sm text-ink-muted">No employees available.</p>
+              )}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAssigningShift(null)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={!assignEmployeeIds.length || assignShift.isPending}
+              onClick={() => assignShift.mutate()}
+            >
+              Assign {assignEmployeeIds.length || ''}
             </Button>
           </DialogFooter>
         </DialogContent>

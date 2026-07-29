@@ -99,7 +99,13 @@ export class LeaveService {
       orderBy: { effectiveFrom: 'desc' },
     });
     if (assignment) return assignment.shift;
-    return this.prisma.shift.findFirst({ where: { tenantId, isActive: true } });
+    // No explicit assignment covers this date — fall back to the tenant's
+    // designated default shift, not an arbitrary unordered row, so weekly
+    // offs stay predictable for unassigned employees.
+    return (
+      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
+      this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } })
+    );
   }
 
   private async isWeeklyOffAt(tenantId: string, employeeId: string, at: Date) {

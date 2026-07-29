@@ -779,6 +779,7 @@ model Shift {
   tenantId              String
   name                  String
   type                  ShiftType @default(FIXED)
+  isDefault             Boolean   @default(false)
   startTime             String // "09:00"
   endTime               String // "18:00"
   gracePeriodMins       Int       @default(15)
