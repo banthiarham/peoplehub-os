@@ -14,7 +14,10 @@ import {
   CreateShiftDto,
   DateQueryDto,
   DecideShiftSwapDto,
+  EffectiveShiftQueryDto,
   FinalizeAttendanceDto,
+  ListShiftAssignmentsDto,
+  UpdateShiftAssignmentDto,
   ImportBiometricPunchesDto,
   ImportAttendanceRowsDto,
   ImportRosterDto,
@@ -209,6 +212,42 @@ export class AttendanceController {
   @Scopes('attendance:write')
   assignShift(@CurrentUser() user: AuthUser, @Body() dto: AssignShiftDto) {
     return this.attendance.assignShift(user.tenantId, dto);
+  }
+
+  @Get('shift-assignments')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: 'Employee roster: current and historical shift assignments' })
+  listShiftAssignments(@CurrentUser() user: AuthUser, @Query() q: ListShiftAssignmentsDto) {
+    return this.attendance.listShiftAssignments(user.tenantId, q);
+  }
+
+  @Get('shift-assignments/effective')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: 'The shift and location attendance uses for an employee on a date' })
+  effectiveShift(@CurrentUser() user: AuthUser, @Query() q: EffectiveShiftQueryDto) {
+    return this.attendance.effectiveShiftFor(user.tenantId, q.employeeId, q.date);
+  }
+
+  @Patch('shift-assignments/:id')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Edit or replace a shift assignment' })
+  updateShiftAssignment(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateShiftAssignmentDto,
+  ) {
+    return this.attendance.updateShiftAssignment(user.tenantId, id, dto);
+  }
+
+  @Delete('shift-assignments/:id')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Delete a shift assignment' })
+  deleteShiftAssignment(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.attendance.deleteShiftAssignment(user.tenantId, id);
   }
 
   @Patch('shifts/:id/default')

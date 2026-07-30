@@ -1,5 +1,18 @@
 import { BadRequestException } from '@nestjs/common';
+import {
+  ASSIGNMENT_PRECEDENCE,
+  ShiftResolutionService,
+} from '../attendance/shift-resolution.service';
 import { LeaveService } from './leave.service';
+
+/** Leave resolves shifts through the same service attendance does. */
+function newLeaveService(prisma: unknown): LeaveService {
+  return new LeaveService(
+    prisma as never,
+    {} as never,
+    new ShiftResolutionService(prisma as never),
+  );
+}
 
 describe('LeaveService', () => {
   const user = {
@@ -110,7 +123,7 @@ describe('LeaveService', () => {
     const prisma = prismaMock({
       policy: { ...policy, requiresAttachment: true },
     });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(apply(service, '2026-07-06')).rejects.toBeInstanceOf(
       BadRequestException,
@@ -119,7 +132,7 @@ describe('LeaveService', () => {
 
   it('allows Saturday when only Sunday is configured as a weekly off', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(apply(service, '2026-07-25')).resolves.toMatchObject({
       days: 1,
@@ -128,7 +141,7 @@ describe('LeaveService', () => {
 
   it('rejects Sunday when Sunday is configured as a weekly off', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(apply(service, '2026-07-26')).rejects.toThrow(
       'Selected range has no working days',
@@ -137,13 +150,15 @@ describe('LeaveService', () => {
 
   it('selects the assignment effective on the requested date', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await apply(service, '2026-07-25');
 
+    // Same tenant-scoped, deterministically ordered query attendance uses.
     expect(prisma.shiftAssignment.findFirst).toHaveBeenCalledWith({
       where: {
         employeeId: 'emp-1',
+        employee: { tenantId: 'tenant-1' },
         effectiveFrom: {
           lte: new Date('2026-07-25T00:00:00.000Z'),
         },
@@ -157,7 +172,7 @@ describe('LeaveService', () => {
         ],
       },
       include: { shift: true },
-      orderBy: { effectiveFrom: 'desc' },
+      orderBy: ASSIGNMENT_PRECEDENCE,
     });
   });
 
@@ -166,7 +181,7 @@ describe('LeaveService', () => {
       assignment: null,
       fallbackWeeklyOffDays: [0],
     });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(apply(service, '2026-07-25')).resolves.toMatchObject({
       days: 1,
@@ -183,7 +198,7 @@ describe('LeaveService', () => {
 
   it('rejects half-day leave on a configured weekly off', async () => {
     const prisma = prismaMock({ weeklyOffDays: [0] });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(
       apply(service, '2026-07-26', '2026-07-26', true),
@@ -195,7 +210,7 @@ describe('LeaveService', () => {
       weeklyOffDays: [0],
       holidays: [new Date('2026-07-27T00:00:00.000Z')],
     });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(
       apply(service, '2026-07-25', '2026-07-27'),
@@ -206,7 +221,7 @@ describe('LeaveService', () => {
 
   it('reads balances for the requested year and defaults to the current one', async () => {
     const prisma = { leaveBalance: { findMany: jest.fn().mockResolvedValue([]) } };
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await service.balances('tenant-1', 'emp-1', 2025);
     await service.balances('tenant-1', 'emp-1');
@@ -238,7 +253,7 @@ describe('LeaveService', () => {
         sandwichRule: true,
       },
     });
-    const service = new LeaveService(prisma as any, {} as any);
+    const service = newLeaveService(prisma);
 
     await expect(
       apply(service, '2026-07-25', '2026-07-27'),

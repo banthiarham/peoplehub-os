@@ -9,6 +9,7 @@ import {
   UpsertLeavePolicyDto,
   UpsertLeaveTypeDto,
 } from './dto/leave.dto';
+import { ShiftResolutionService } from '../attendance/shift-resolution.service';
 import { LeaveBalanceInitializationService } from './leave-balance-initialization.service';
 
 function dateOnly(d: Date): Date {
@@ -20,6 +21,7 @@ export class LeaveService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly balanceInitialization: LeaveBalanceInitializationService,
+    private readonly shifts: ShiftResolutionService,
   ) {}
 
   private requireEmployee(user: AuthUser): string {
@@ -88,28 +90,10 @@ export class LeaveService {
     });
   }
 
-  private async currentShiftAt(tenantId: string, employeeId: string, at: Date) {
-    const assignment = await this.prisma.shiftAssignment.findFirst({
-      where: {
-        employeeId,
-        effectiveFrom: { lte: at },
-        OR: [{ effectiveTo: null }, { effectiveTo: { gte: at } }],
-      },
-      include: { shift: true },
-      orderBy: { effectiveFrom: 'desc' },
-    });
-    if (assignment) return assignment.shift;
-    // No explicit assignment covers this date — fall back to the tenant's
-    // designated default shift, not an arbitrary unordered row, so weekly
-    // offs stay predictable for unassigned employees.
-    return (
-      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
-      this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } })
-    );
-  }
-
   private async isWeeklyOffAt(tenantId: string, employeeId: string, at: Date) {
-    const shift = await this.currentShiftAt(tenantId, employeeId, at);
+    // Same resolver as attendance, so a leave day and an attendance day never
+    // disagree about which shift the employee is on.
+    const shift = await this.shifts.shiftAt(tenantId, employeeId, at);
     const dayOfWeek = at.getUTCDay();
     return shift?.weeklyOffDays.includes(dayOfWeek) ?? (dayOfWeek === 0 || dayOfWeek === 6);
   }

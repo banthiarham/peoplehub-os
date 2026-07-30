@@ -17,6 +17,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { AttendanceCaptureMode, AttendanceStatus, ShiftSwapStatus, ShiftType } from '@prisma/client';
+import { SUPPORTED_ATTENDANCE_DATE_FORMATS } from '../../../common/utils/attendance-date';
 
 export class CheckInDto {
   @ApiProperty({ description: 'Stable device identifier registered to this employee' })
@@ -283,8 +284,14 @@ export class BiometricPunchRowDto {
   @IsNotEmpty()
   employeeCode!: string;
 
-  @ApiProperty()
-  @IsDateString()
+  /**
+   * Validated per row by the service rather than by `@IsDateString()` so one
+   * malformed cell returns an actionable row error instead of rejecting the
+   * whole upload.
+   */
+  @ApiProperty({ example: '2026-07-01', description: SUPPORTED_ATTENDANCE_DATE_FORMATS })
+  @IsString()
+  @IsNotEmpty()
   date!: string;
 
   @ApiPropertyOptional()
@@ -499,8 +506,10 @@ export class RosterRowDto {
   @IsNotEmpty()
   employeeCode!: string;
 
-  @ApiProperty()
-  @IsDateString()
+  /** Validated per row by the service so failures are reported row by row. */
+  @ApiProperty({ example: '2026-07-01', description: SUPPORTED_ATTENDANCE_DATE_FORMATS })
+  @IsString()
+  @IsNotEmpty()
   date!: string;
 
   @ApiPropertyOptional()
@@ -512,6 +521,14 @@ export class RosterRowDto {
   @IsOptional()
   @IsString()
   shiftName?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Work location for this rostered day only. Omit to keep the employee's own location.",
+  })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
 }
 
 export class ImportRosterDto {
@@ -525,6 +542,79 @@ export class ImportRosterDto {
   @ValidateNested({ each: true })
   @Type(() => RosterRowDto)
   rows!: RosterRowDto[];
+
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      'Replace an existing assignment that starts on the same day for the same employee. Without it, conflicting rows fail with a row-level error instead of creating an ambiguous second assignment.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  replaceExisting?: boolean;
+}
+
+export class ListShiftAssignmentsDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  employeeId?: string;
+
+  @ApiPropertyOptional({ description: 'Matches employee name or code' })
+  @IsOptional()
+  @IsString()
+  search?: string;
+
+  @ApiPropertyOptional({ example: '2026-07-01' })
+  @IsOptional()
+  @IsString()
+  from?: string;
+
+  @ApiPropertyOptional({ example: '2026-07-31' })
+  @IsOptional()
+  @IsString()
+  to?: string;
+
+  @ApiPropertyOptional({ default: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(500)
+  limit?: number;
+}
+
+export class EffectiveShiftQueryDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  employeeId!: string;
+
+  @ApiProperty({ example: '2026-07-01', description: SUPPORTED_ATTENDANCE_DATE_FORMATS })
+  @IsString()
+  @IsNotEmpty()
+  date!: string;
+}
+
+export class UpdateShiftAssignmentDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  shiftId?: string;
+
+  @ApiPropertyOptional({ description: "Empty string clears the override back to the employee's location" })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiPropertyOptional({ example: '2026-07-01' })
+  @IsOptional()
+  @IsString()
+  effectiveFrom?: string;
+
+  @ApiPropertyOptional({ example: '2026-07-31', description: 'Inclusive last day. Empty string reopens the assignment.' })
+  @IsOptional()
+  @IsString()
+  effectiveTo?: string;
 }
 
 export class FinalizeAttendanceDto {

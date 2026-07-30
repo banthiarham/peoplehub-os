@@ -7,7 +7,14 @@ import {
 import { AttendanceCaptureMode, AttendanceStatus, Prisma, ShiftSwapStatus } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import {
+  parseAttendanceDate,
+  parseAttendanceDateOrError,
+  SUPPORTED_ATTENDANCE_DATE_FORMATS,
+} from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
+import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
+import { earlyDeparture, isLateArrival } from './shift-timing';
 import {
   AssignShiftDto,
   CheckInDto,
@@ -20,9 +27,11 @@ import {
   ImportBiometricPunchesDto,
   ImportRosterDto,
   ListAttendanceDto,
+  ListShiftAssignmentsDto,
   QrPunchDto,
   RegularizeDto,
   UpdateAttendanceRecordDto,
+  UpdateShiftAssignmentDto,
   UpdateShiftWeeklyOffsDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
@@ -99,6 +108,27 @@ function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
 }
 
+/** One day earlier, in the UTC-anchored day space attendance dates use. */
+function previousDay(d: Date): Date {
+  return new Date(d.getTime() - 24 * 60 * 60 * 1000);
+}
+
+/**
+ * Parses a client-supplied attendance day, rejecting formats that cannot be
+ * mapped to a calendar day without guessing. Used where a single bad value
+ * should fail the whole request; row-oriented imports use
+ * `parseAttendanceDateOrError` so the caller gets per-row feedback instead.
+ */
+function requireAttendanceDate(value: string, field = 'date'): Date {
+  const parsed = parseAttendanceDate(value);
+  if (!parsed) {
+    throw new BadRequestException(
+      `Invalid ${field} — use ${SUPPORTED_ATTENDANCE_DATE_FORMATS}`,
+    );
+  }
+  return parsed;
+}
+
 /** Truncates an already UTC-anchored value (@db.Date columns, joining/exit dates) to its UTC day. */
 function utcDateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -133,7 +163,10 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
 
 @Injectable()
 export class AttendanceService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly shifts: ShiftResolutionService,
+  ) {}
 
   private requireEmployee(user: AuthUser): string {
     if (!user.employeeId) {
@@ -142,34 +175,8 @@ export class AttendanceService {
     return user.employeeId;
   }
 
-  /**
-   * Resolves the shift assignment covering `at`, including the location it
-   * was assigned at (for employees who work different shifts at different
-   * locations). Falls back to the tenant's default shift with no location
-   * (meaning "use the employee's own location") when nothing is assigned.
-   */
-  private async currentAssignment(tenantId: string, employeeId: string, at: Date) {
-    const assignment = await this.prisma.shiftAssignment.findFirst({
-      where: {
-        employeeId,
-        effectiveFrom: { lte: at },
-        OR: [{ effectiveTo: null }, { effectiveTo: { gte: at } }],
-      },
-      include: { shift: true },
-      orderBy: { effectiveFrom: 'desc' },
-    });
-    if (assignment) return { shift: assignment.shift, locationId: assignment.locationId };
-    // No explicit assignment covers this date — fall back to the tenant's
-    // designated default shift, not an arbitrary unordered row, so weekly
-    // offs/timing stay predictable for unassigned employees.
-    const shift =
-      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
-      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } }));
-    return { shift, locationId: null as string | null };
-  }
-
   private async currentShiftAt(tenantId: string, employeeId: string, at: Date) {
-    return (await this.currentAssignment(tenantId, employeeId, at)).shift;
+    return this.shifts.shiftAt(tenantId, employeeId, at);
   }
 
   private async weeklyOffAt(tenantId: string, employeeId: string, at: Date) {
@@ -211,21 +218,7 @@ export class AttendanceService {
   }
 
   private async employeeLocationId(tenantId: string, employeeId: string) {
-    const employee = await this.prisma.employee.findFirst({
-      where: { id: employeeId, tenantId },
-      select: { locationId: true },
-    });
-    return employee?.locationId ?? null;
-  }
-
-  /**
-   * The location that should govern capture rules, geofencing, and
-   * attendance rule resolution right now: the current shift assignment's
-   * location if one was set, otherwise the employee's own location.
-   */
-  private async resolveEffectiveLocationId(tenantId: string, employeeId: string, at: Date) {
-    const { locationId } = await this.currentAssignment(tenantId, employeeId, at);
-    return locationId ?? this.employeeLocationId(tenantId, employeeId);
+    return this.shifts.employeeLocationId(tenantId, employeeId);
   }
 
   private deriveInteractiveCaptureMode(dto: CheckInDto): AttendanceCaptureMode {
@@ -363,16 +356,18 @@ export class AttendanceService {
   async checkIn(user: AuthUser, dto: CheckInDto, forcedSource?: string) {
     const employeeId = this.requireEmployee(user);
     const today = dateOnly(new Date());
-    // The location and shift a check-in should be evaluated against come
-    // from the employee's current shift assignment when it specifies a
-    // location (multi-location shift support), falling back to the
-    // employee's own location otherwise.
-    const { shift, locationId: assignmentLocationId } = await this.currentAssignment(
+    // The location and shift a check-in is evaluated against come from the one
+    // resolver: the assignment covering today when it pins a location
+    // (multi-location shift support), otherwise the employee's base location.
+    // Resolved against `today`, the day anchor, not the current instant — an
+    // assignment ending today stores `effectiveTo` at that day's midnight, so a
+    // timestamp compares past it and silently drops the override mid-morning.
+    const { shift, assignedLocationId } = await this.shifts.resolveAt(
       user.tenantId,
       employeeId,
-      new Date(),
+      today,
     );
-    const locationId = assignmentLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
+    const locationId = assignedLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
     const captureMode =
       forcedSource === 'QR' ? AttendanceCaptureMode.QR : this.deriveInteractiveCaptureMode(dto);
 
@@ -386,7 +381,7 @@ export class AttendanceService {
 
     const rule = await this.attendanceRule(user.tenantId, { shiftId: shift?.id, locationId });
     const now = new Date();
-    const status: 'PRESENT' | 'LATE' = this.isLateArrival(now, shift, rule) ? 'LATE' : 'PRESENT';
+    const status: 'PRESENT' | 'LATE' = isLateArrival(now, shift, rule) ? 'LATE' : 'PRESENT';
     const punch = {
       shiftId: shift?.id,
       punchIn: now,
@@ -411,8 +406,13 @@ export class AttendanceService {
     const employeeId = this.requireEmployee(user);
     // The QR code must match wherever the employee is actually scheduled
     // today — their current shift assignment's location if one is set,
-    // otherwise their own default location.
-    const effectiveLocationId = await this.resolveEffectiveLocationId(user.tenantId, employeeId, new Date());
+    // otherwise their own default location. Resolved against the day anchor for
+    // the same reason as `checkIn`.
+    const effectiveLocationId = await this.shifts.effectiveLocationId(
+      user.tenantId,
+      employeeId,
+      dateOnly(new Date()),
+    );
     if (effectiveLocationId !== qrLocationId) {
       throw new ForbiddenException('This QR code does not match your assigned work location');
     }
@@ -700,18 +700,42 @@ export class AttendanceService {
     const employeeByCode = new Map(employees.map((employee) => [employee.employeeCode, employee]));
     let imported = 0;
     const unknownEmployeeCodes = new Set<string>();
+    const errors: Array<{ row: number; employeeCode: string; date: string; error: string }> = [];
 
-    for (const row of dto.rows) {
+    for (const [index, row] of dto.rows.entries()) {
       const employee = employeeByCode.get(row.employeeCode);
       if (!employee) {
         unknownEmployeeCodes.add(row.employeeCode);
+        errors.push({
+          row: index + 1,
+          employeeCode: row.employeeCode,
+          date: String(row.date ?? ''),
+          error: 'Employee code not found',
+        });
         continue;
       }
-      const date = dateOnly(new Date(row.date));
+      // Row-level rather than request-level so one malformed date does not
+      // reject an otherwise clean file, and the message names the formats.
+      const parsedDate = parseAttendanceDateOrError(row.date);
+      if ('error' in parsedDate) {
+        errors.push({
+          row: index + 1,
+          employeeCode: row.employeeCode,
+          date: String(row.date ?? ''),
+          error: parsedDate.error,
+        });
+        continue;
+      }
+      const date = parsedDate.date;
+      // One resolve per row covers both the shift and the location: capture
+      // rules follow wherever the employee actually works that date, which a
+      // date-effective assignment may override away from their base location.
+      const { shift, assignedLocationId } = await this.shifts.resolveAt(tenantId, employee.id, date);
+      const locationId = assignedLocationId ?? employee.locationId;
       await this.assertCaptureModeAllowed(
         tenantId,
         this.importSourceToCaptureMode(source),
-        employee.locationId,
+        locationId,
       );
       const punchIn = row.punchIn ? new Date(row.punchIn) : undefined;
       const punchOut = row.punchOut ? new Date(row.punchOut) : undefined;
@@ -719,12 +743,11 @@ export class AttendanceService {
         punchIn && punchOut
           ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000))
           : undefined;
-      const shift = await this.currentShiftAt(tenantId, employee.id, date);
       const status = row.status ?? this.classifyAttendanceStatus({
         workingMinutes,
         shift,
         tenantId,
-        locationId: employee.locationId,
+        locationId,
         date,
       });
       await this.prisma.attendanceRecord.upsert({
@@ -762,6 +785,7 @@ export class AttendanceService {
       imported,
       skipped: dto.rows.length - imported,
       unknownEmployeeCodes: [...unknownEmployeeCodes],
+      errors,
     };
   }
 
@@ -775,7 +799,7 @@ export class AttendanceService {
       throw new BadRequestException('Finalized attendance cannot be edited');
     }
 
-    const date = dto.date ? dateOnly(new Date(dto.date)) : record.date;
+    const date = dto.date ? requireAttendanceDate(dto.date) : record.date;
     const punchIn = dto.punchIn !== undefined ? new Date(dto.punchIn) : record.punchIn;
     const punchOut = dto.punchOut !== undefined ? new Date(dto.punchOut) : record.punchOut;
     const workingMinutes =
@@ -851,40 +875,6 @@ export class AttendanceService {
     if (workingMinutes == null || !shift) return undefined;
     const workedMinutes = workingMinutes - (shift.breakDurationMins ?? 0);
     return Math.max(0, workedMinutes - shift.overtimeAfterMinutes);
-  }
-
-  /** Shared by the interactive punch path and the read-only monthly ledger. */
-  private isLateArrival(
-    punchIn: Date,
-    shift?: { startTime: string; gracePeriodMins: number } | null,
-    rule?: { lateMarkAfterMins: number } | null,
-  ): boolean {
-    if (!shift) return false;
-    const [h, m] = shift.startTime.split(':').map(Number);
-    const shiftStart = new Date(punchIn);
-    shiftStart.setHours(h, m + (rule?.lateMarkAfterMins ?? shift.gracePeriodMins ?? 15), 0, 0);
-    return punchIn > shiftStart;
-  }
-
-  /**
-   * Derived only — no write path sets EARLY_LEAVING today, so early departures
-   * are computed at read time from the punch-out against the shift end grace.
-   */
-  private isEarlyDeparture(
-    punchOut: Date,
-    shift?: { endTime: string; earlyLeavingGraceMins: number } | null,
-    rule?: { earlyLeavingGraceMins: number } | null,
-  ): boolean {
-    if (!shift) return false;
-    const [h, m] = shift.endTime.split(':').map(Number);
-    const shiftEnd = new Date(punchOut);
-    shiftEnd.setHours(
-      h,
-      m - (rule?.earlyLeavingGraceMins ?? shift.earlyLeavingGraceMins ?? 15),
-      0,
-      0,
-    );
-    return punchOut < shiftEnd;
   }
 
   private async holidayDateSet(tenantId: string, start: Date, endInclusive: Date) {
@@ -978,32 +968,6 @@ export class AttendanceService {
       ) ?? null;
   }
 
-  /**
-   * Resolves the shift for every day in a range from a single query, using the
-   * same precedence as `currentShiftAt` (latest effective assignment, else the
-   * tenant's default shift).
-   */
-  private async shiftsForRange(tenantId: string, employeeId: string, start: Date, end: Date) {
-    const assignments = await this.prisma.shiftAssignment.findMany({
-      where: {
-        employeeId,
-        effectiveFrom: { lte: end },
-        OR: [{ effectiveTo: null }, { effectiveTo: { gte: start } }],
-      },
-      include: { shift: true },
-      orderBy: { effectiveFrom: 'desc' },
-    });
-    const fallback =
-      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true, isDefault: true } })) ??
-      (await this.prisma.shift.findFirst({ where: { tenantId, isActive: true }, orderBy: { createdAt: 'asc' } }));
-    return (at: Date) =>
-      assignments.find(
-        (assignment) =>
-          assignment.effectiveFrom <= at &&
-          (assignment.effectiveTo === null || assignment.effectiveTo >= at),
-      )?.shift ?? fallback;
-  }
-
   async me(user: AuthUser, month?: string) {
     const employeeId = this.requireEmployee(user);
     const { start, end } = parseMonth(month);
@@ -1061,20 +1025,22 @@ export class AttendanceService {
       overtimeMinutes: number | null;
       isLate: boolean;
       isEarlyDeparture: boolean;
+      earlyDepartureMinutes: number;
       shiftId: string | null;
+      locationId: string | null;
     }> = [];
 
     if (windowStart <= windowEnd) {
-      const locationId = await this.employeeLocationId(tenantId, employeeId);
-      const [records, holidaySet, leaveDaySet, shiftAt, ruleAt] = await Promise.all([
+      const baseLocationId = await this.employeeLocationId(tenantId, employeeId);
+      const [records, holidaySet, leaveDaySet, resolveAt, ruleAt] = await Promise.all([
         this.prisma.attendanceRecord.findMany({
           where: { tenantId, employeeId, date: { gte: windowStart, lte: windowEnd } },
           orderBy: { date: 'asc' },
         }),
         this.holidayDateSet(tenantId, windowStart, windowEnd),
         this.approvedLeaveDaySet(tenantId, [employeeId], windowStart, windowEnd),
-        this.shiftsForRange(tenantId, employeeId, windowStart, windowEnd),
-        this.attendanceRulesForRange(tenantId, locationId, windowStart, windowEnd),
+        this.shifts.resolverForRange(tenantId, employeeId, windowStart, windowEnd),
+        this.attendanceRulesForRange(tenantId, baseLocationId, windowStart, windowEnd),
       ]);
       const recordByDate = new Map(
         records.map((record) => [record.date.toISOString().slice(0, 10), record]),
@@ -1084,7 +1050,7 @@ export class AttendanceService {
         const date = new Date(d);
         const key = date.toISOString().slice(0, 10);
         const record = recordByDate.get(key);
-        const shift = shiftAt(date);
+        const { shift, assignedLocationId } = resolveAt(date);
         const dayOfWeek = date.getUTCDay();
         const isWeeklyOff =
           shift?.weeklyOffDays.includes(dayOfWeek) ?? (dayOfWeek === 0 || dayOfWeek === 6);
@@ -1096,6 +1062,12 @@ export class AttendanceService {
             isWeeklyOff,
           });
         const rule = record?.punchIn || record?.punchOut ? ruleAt(shift?.id, date) : null;
+        const early = earlyDeparture({
+          punchOut: record?.punchOut,
+          punchIn: record?.punchIn,
+          shift,
+          rule,
+        });
         days.push({
           date,
           status,
@@ -1105,12 +1077,12 @@ export class AttendanceService {
           workingMinutes: record?.workingMinutes ?? null,
           overtimeMinutes: record?.overtimeMinutes ?? null,
           shiftId: record?.shiftId ?? shift?.id ?? null,
+          locationId: assignedLocationId ?? baseLocationId,
           isLate:
             status === 'LATE' ||
-            (record?.punchIn ? this.isLateArrival(record.punchIn, shift, rule) : false),
-          isEarlyDeparture:
-            status === 'EARLY_LEAVING' ||
-            (record?.punchOut ? this.isEarlyDeparture(record.punchOut, shift, rule) : false),
+            (record?.punchIn ? isLateArrival(record.punchIn, shift, rule) : false),
+          isEarlyDeparture: status === 'EARLY_LEAVING' || early.isEarlyDeparture,
+          earlyDepartureMinutes: early.earlyByMinutes,
         });
       }
     }
@@ -1153,6 +1125,7 @@ export class AttendanceService {
           : 0,
         lateArrivals: days.filter((day) => day.isLate).length,
         earlyDepartures: days.filter((day) => day.isEarlyDeparture).length,
+        earlyDepartureMinutes: days.reduce((sum, day) => sum + day.earlyDepartureMinutes, 0),
         totalWorkingMinutes,
         overtimeMinutes: days.reduce((sum, day) => sum + (day.overtimeMinutes ?? 0), 0),
       },
@@ -1161,7 +1134,7 @@ export class AttendanceService {
 
   async regularize(user: AuthUser, dto: RegularizeDto) {
     const employeeId = dto.employeeId ?? this.requireEmployee(user);
-    const date = dateOnly(new Date(dto.date));
+    const date = requireAttendanceDate(dto.date);
     const punchIn = dto.punchIn ? new Date(dto.punchIn) : undefined;
     const punchOut = dto.punchOut ? new Date(dto.punchOut) : undefined;
     const canApplyDirectly =
@@ -1317,11 +1290,186 @@ export class AttendanceService {
   }
 
   async listShifts(tenantId: string) {
-    return this.prisma.shift.findMany({
+    const shifts = await this.prisma.shift.findMany({
       where: { tenantId },
       include: { _count: { select: { shiftAssignments: true } } },
       orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
     });
+    // `_count.shiftAssignments` is every assignment row ever written, including
+    // expired ones and one-day roster overrides, so it reads far higher than
+    // the headcount actually on the shift. `activeAssignments` is resolved
+    // through the same precedence the punch path uses.
+    const counts = await this.shifts.activeShiftCounts(tenantId, dateOnly(new Date()));
+    return shifts.map((shift) => ({ ...shift, activeAssignments: counts.get(shift.id) ?? 0 }));
+  }
+
+  /**
+   * The assignment ledger behind Attendance → Rosters: current and historical
+   * assignments for the searched employees and window, each flagged with the
+   * assignments it overlaps so ambiguity is visible rather than hidden.
+   */
+  async listShiftAssignments(tenantId: string, q: ListShiftAssignmentsDto) {
+    const from = q.from ? requireAttendanceDate(q.from, 'from') : undefined;
+    const to = q.to ? requireAttendanceDate(q.to, 'to') : undefined;
+    const assignments = await this.prisma.shiftAssignment.findMany({
+      where: {
+        employee: {
+          tenantId,
+          ...(q.employeeId && { id: q.employeeId }),
+          ...(q.search && {
+            OR: [
+              { firstName: { contains: q.search, mode: 'insensitive' } },
+              { lastName: { contains: q.search, mode: 'insensitive' } },
+              { employeeCode: { contains: q.search, mode: 'insensitive' } },
+            ],
+          }),
+        },
+        ...(to && { effectiveFrom: { lte: to } }),
+        ...(from && { OR: [{ effectiveTo: null }, { effectiveTo: { gte: from } }] }),
+      },
+      include: {
+        shift: { select: { id: true, name: true, startTime: true, endTime: true, isDefault: true } },
+        location: { select: { id: true, name: true } },
+        employee: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            employeeCode: true,
+            location: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: [{ employeeId: 'asc' }, ...ASSIGNMENT_PRECEDENCE],
+      take: Math.min(q.limit ?? 200, 500),
+    });
+
+    const byEmployee = new Map<string, typeof assignments>();
+    for (const assignment of assignments) {
+      const bucket = byEmployee.get(assignment.employeeId) ?? [];
+      bucket.push(assignment);
+      byEmployee.set(assignment.employeeId, bucket);
+    }
+    const today = dateOnly(new Date());
+
+    return assignments.map((assignment) => {
+      const siblings = byEmployee.get(assignment.employeeId) ?? [];
+      const overlaps = siblings.filter(
+        (other) =>
+          other.id !== assignment.id &&
+          other.effectiveFrom <= (assignment.effectiveTo ?? new Date(8640000000000000)) &&
+          (other.effectiveTo === null || other.effectiveTo >= assignment.effectiveFrom),
+      );
+      const isActive =
+        assignment.effectiveFrom <= today &&
+        (assignment.effectiveTo === null || assignment.effectiveTo >= today);
+      return {
+        ...assignment,
+        // The location this assignment actually puts the employee at: its own
+        // override, or the employee's base location when it sets none.
+        effectiveLocation: assignment.location ?? assignment.employee.location ?? null,
+        locationIsOverride: Boolean(assignment.locationId),
+        status: isActive
+          ? 'ACTIVE'
+          : assignment.effectiveFrom > today
+            ? 'SCHEDULED'
+            : ('EXPIRED' as const),
+        overlappingAssignmentIds: overlaps.map((other) => other.id),
+      };
+    });
+  }
+
+  /** The assignment that governs attendance for one employee on one date. */
+  async effectiveShiftFor(tenantId: string, employeeId: string, date: string) {
+    const at = requireAttendanceDate(date);
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: employeeId, tenantId },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        employeeCode: true,
+        locationId: true,
+        location: { select: { id: true, name: true } },
+      },
+    });
+    if (!employee) throw new NotFoundException('Employee not found');
+    const resolved = await this.shifts.resolveAt(tenantId, employeeId, at);
+    const overrideLocation = resolved.assignedLocationId
+      ? await this.prisma.location.findFirst({
+          where: { id: resolved.assignedLocationId, tenantId },
+          select: { id: true, name: true },
+        })
+      : null;
+    return {
+      date: at,
+      employeeId,
+      // Named so a caller can never present this resolution as if it applied to
+      // anyone but the employee actually asked about.
+      employee: {
+        id: employee.id,
+        firstName: employee.firstName,
+        lastName: employee.lastName,
+        employeeCode: employee.employeeCode,
+      },
+      shift: resolved.shift,
+      assignment: resolved.assignment,
+      source: resolved.assignment ? resolved.assignment.source : 'TENANT_DEFAULT',
+      effectiveLocation: overrideLocation ?? employee.location ?? null,
+      defaultLocation: employee.location ?? null,
+      locationIsOverride: Boolean(resolved.assignedLocationId),
+    };
+  }
+
+  async updateShiftAssignment(tenantId: string, id: string, dto: UpdateShiftAssignmentDto) {
+    const assignment = await this.prisma.shiftAssignment.findFirst({
+      where: { id, employee: { tenantId } },
+    });
+    if (!assignment) throw new NotFoundException('Shift assignment not found');
+    if (dto.shiftId) {
+      const shift = await this.prisma.shift.findFirst({ where: { id: dto.shiftId, tenantId } });
+      if (!shift) throw new NotFoundException('Shift not found');
+    }
+    if (dto.locationId) {
+      const location = await this.prisma.location.findFirst({
+        where: { id: dto.locationId, tenantId },
+      });
+      if (!location) throw new NotFoundException('Location not found');
+    }
+    const effectiveFrom = dto.effectiveFrom
+      ? requireAttendanceDate(dto.effectiveFrom, 'effectiveFrom')
+      : assignment.effectiveFrom;
+    const effectiveTo =
+      dto.effectiveTo === undefined
+        ? assignment.effectiveTo
+        : dto.effectiveTo === null || dto.effectiveTo === ''
+          ? null
+          : requireAttendanceDate(dto.effectiveTo, 'effectiveTo');
+    if (effectiveTo && effectiveTo < effectiveFrom) {
+      throw new BadRequestException('Effective to cannot be before effective from');
+    }
+    return this.prisma.shiftAssignment.update({
+      where: { id },
+      data: {
+        ...(dto.shiftId && { shiftId: dto.shiftId }),
+        // `locationId: null` clears the override back to the employee's base
+        // location; omitting it leaves the override untouched.
+        ...(dto.locationId !== undefined && { locationId: dto.locationId || null }),
+        effectiveFrom,
+        effectiveTo,
+      },
+      include: { shift: { select: { id: true, name: true } }, location: { select: { id: true, name: true } } },
+    });
+  }
+
+  async deleteShiftAssignment(tenantId: string, id: string) {
+    const assignment = await this.prisma.shiftAssignment.findFirst({
+      where: { id, employee: { tenantId } },
+      select: { id: true },
+    });
+    if (!assignment) throw new NotFoundException('Shift assignment not found');
+    await this.prisma.shiftAssignment.delete({ where: { id } });
+    return { deleted: true };
   }
 
   async createShift(tenantId: string, dto: CreateShiftDto) {
@@ -1371,14 +1519,39 @@ export class AttendanceService {
       throw new BadRequestException('One or more employees do not belong to this workspace');
     }
 
-    const effectiveFrom = dto.effectiveFrom ? new Date(dto.effectiveFrom) : new Date();
+    const effectiveFrom = dto.effectiveFrom
+      ? requireAttendanceDate(dto.effectiveFrom, 'effectiveFrom')
+      : dateOnly(new Date());
+
+    // A later-starting open-ended assignment would shadow this one from its own
+    // start date onwards. That is not something this workflow can replace
+    // safely, so it is reported instead of being silently left ambiguous.
+    const shadowing = await this.prisma.shiftAssignment.findFirst({
+      where: {
+        employeeId: { in: employeeIds },
+        effectiveTo: null,
+        effectiveFrom: { gt: effectiveFrom },
+      },
+      include: { employee: { select: { employeeCode: true } } },
+    });
+    if (shadowing) {
+      throw new BadRequestException(
+        `${shadowing.employee.employeeCode} already has an open-ended assignment starting ${shadowing.effectiveFrom
+          .toISOString()
+          .slice(0, 10)} — delete or end-date it before assigning from ${effectiveFrom
+          .toISOString()
+          .slice(0, 10)}`,
+      );
+    }
+
     await this.prisma.$transaction([
-      // Close out any still-open assignment so exactly one shift is ever
-      // "current" for these employees, instead of leaving overlapping
-      // open-ended rows that only resolve correctly by ordering luck.
+      // Close out any still-open assignment the day before the new one starts.
+      // `effectiveTo` is the inclusive last day, so closing it *on*
+      // `effectiveFrom` left both rows covering that day and made the boundary
+      // day depend on row ordering.
       this.prisma.shiftAssignment.updateMany({
         where: { employeeId: { in: employeeIds }, effectiveTo: null },
-        data: { effectiveTo: effectiveFrom },
+        data: { effectiveTo: previousDay(effectiveFrom) },
       }),
       this.prisma.shiftAssignment.createMany({
         data: employeeIds.map((employeeId) => ({
@@ -1394,9 +1567,15 @@ export class AttendanceService {
 
   async importRoster(tenantId: string, uploadedById: string | undefined, dto: ImportRosterDto) {
     if (!dto.rows.length) throw new BadRequestException('Roster import requires at least one row');
-    const dates = dto.rows.map((row) => dateOnly(new Date(row.date)));
-    const periodStart = new Date(Math.min(...dates.map((date) => date.getTime())));
-    const periodEnd = new Date(Math.max(...dates.map((date) => date.getTime())));
+    const parsedDates = dto.rows.map((row) => parseAttendanceDate(row.date));
+    const validDates = parsedDates.filter((date): date is Date => date !== null);
+    if (!validDates.length) {
+      throw new BadRequestException(
+        `Roster import has no usable dates — use ${SUPPORTED_ATTENDANCE_DATE_FORMATS}`,
+      );
+    }
+    const periodStart = new Date(Math.min(...validDates.map((date) => date.getTime())));
+    const periodEnd = new Date(Math.max(...validDates.map((date) => date.getTime())));
     const employees = await this.prisma.employee.findMany({
       where: { tenantId, employeeCode: { in: [...new Set(dto.rows.map((row) => row.employeeCode))] } },
       select: { id: true, employeeCode: true },
@@ -1406,22 +1585,78 @@ export class AttendanceService {
     const shiftById = new Map(shifts.map((shift) => [shift.id, shift]));
     const shiftByName = new Map(shifts.map((shift) => [shift.name.toLowerCase(), shift]));
 
+    // Every assignment already covering any day in the uploaded window, so a
+    // conflicting row is reported (or explicitly replaced) instead of silently
+    // adding a second assignment for the same employee and day.
+    const existingAssignments = await this.prisma.shiftAssignment.findMany({
+      where: {
+        employee: { tenantId },
+        employeeId: { in: employees.map((employee) => employee.id) },
+        effectiveFrom: { lte: periodEnd },
+        OR: [{ effectiveTo: null }, { effectiveTo: { gte: periodStart } }],
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        effectiveFrom: true,
+        effectiveTo: true,
+        source: true,
+        shift: { select: { name: true } },
+      },
+    });
+
     const roster = await this.prisma.rosterUpload.create({
       data: { tenantId, name: dto.name, periodStart, periodEnd, uploadedById },
     });
     let imported = 0;
     let failed = 0;
-    const errors: Array<{ employeeCode: string; date: string; error: string }> = [];
+    let replaced = 0;
+    const errors: Array<{ row: number; employeeCode: string; date: string; error: string }> = [];
+    const seenRowKeys = new Set<string>();
 
-    for (const row of dto.rows) {
+    for (const [index, row] of dto.rows.entries()) {
       const employee = employeeByCode.get(row.employeeCode);
       const shift = row.shiftId
         ? shiftById.get(row.shiftId)
         : row.shiftName
           ? shiftByName.get(row.shiftName.toLowerCase())
           : undefined;
-      const rowDate = dateOnly(new Date(row.date));
-      const error = !employee ? 'Employee code not found' : !shift ? 'Shift not found' : undefined;
+      const rowDate = parsedDates[index];
+      const rowKey = `${row.employeeCode}:${rowDate?.toISOString().slice(0, 10)}`;
+
+      let error: string | undefined;
+      if (!rowDate) {
+        error = `Unsupported date "${String(row.date ?? '').trim()}" — use ${SUPPORTED_ATTENDANCE_DATE_FORMATS}`;
+      } else if (!employee) {
+        error = 'Employee code not found';
+      } else if (!shift) {
+        error = 'Shift not found';
+      } else if (seenRowKeys.has(rowKey)) {
+        error = 'Duplicate row for this employee and date in the same file';
+      }
+
+      // An assignment already covering this day is ambiguous unless the upload
+      // explicitly asked to replace it.
+      const conflicts =
+        !error && employee && rowDate
+          ? existingAssignments.filter(
+              (existing) =>
+                existing.employeeId === employee.id &&
+                existing.effectiveFrom <= rowDate &&
+                (existing.effectiveTo === null || existing.effectiveTo >= rowDate) &&
+                // Open-ended base assignments are the employee's standing shift;
+                // a single-day roster override on top of one is the intended
+                // model, so only same-day assignments are true conflicts.
+                existing.effectiveTo !== null &&
+                existing.effectiveFrom.getTime() === rowDate.getTime(),
+            )
+          : [];
+      if (conflicts.length && !dto.replaceExisting) {
+        error = `${row.employeeCode} already has a ${conflicts[0].shift.name} assignment on ${rowDate!
+          .toISOString()
+          .slice(0, 10)} (source ${conflicts[0].source}) — re-upload with "replace existing" to overwrite it`;
+      }
+
       await this.prisma.rosterUploadRow.create({
         data: {
           rosterUploadId: roster.id,
@@ -1429,31 +1664,57 @@ export class AttendanceService {
           employeeCode: row.employeeCode,
           shiftId: shift?.id,
           shiftName: row.shiftName ?? shift?.name,
-          date: rowDate,
+          // `date` is non-null in the schema; unparseable rows keep the period
+          // start so the failure is still recorded and reviewable.
+          date: rowDate ?? periodStart,
           status: error ? 'FAILED' : 'IMPORTED',
           error,
         },
       });
-      if (error || !employee || !shift) {
+      if (error || !employee || !shift || !rowDate) {
         failed++;
-        errors.push({ employeeCode: row.employeeCode, date: row.date, error: error ?? 'Unknown roster error' });
+        errors.push({
+          row: index + 1,
+          employeeCode: row.employeeCode,
+          date: String(row.date ?? ''),
+          error: error ?? 'Unknown roster error',
+        });
         continue;
       }
-      const nextDay = new Date(rowDate);
-      nextDay.setUTCDate(nextDay.getUTCDate() + 1);
-      await this.prisma.shiftAssignment.create({
+
+      seenRowKeys.add(rowKey);
+      if (conflicts.length) {
+        await this.prisma.shiftAssignment.deleteMany({
+          where: { id: { in: conflicts.map((conflict) => conflict.id) } },
+        });
+        replaced += conflicts.length;
+      }
+      const created = await this.prisma.shiftAssignment.create({
         data: {
           employeeId: employee.id,
           shiftId: shift.id,
+          // Inclusive last day: a one-day roster row covers exactly its own
+          // day. It previously ran to the next day and leaked onto a date the
+          // roster never mentioned.
           effectiveFrom: rowDate,
-          effectiveTo: nextDay,
+          effectiveTo: rowDate,
+          locationId: row.locationId ?? null,
           source: 'ROSTER_UPLOAD',
           rosterUploadId: roster.id,
         },
+        select: {
+          id: true,
+          employeeId: true,
+          effectiveFrom: true,
+          effectiveTo: true,
+          source: true,
+          shift: { select: { name: true } },
+        },
       });
+      existingAssignments.push(created);
       imported++;
     }
-    return this.prisma.rosterUpload.update({
+    const upload = await this.prisma.rosterUpload.update({
       where: { id: roster.id },
       data: {
         status: failed > 0 ? 'FAILED' : 'IMPORTED',
@@ -1463,6 +1724,7 @@ export class AttendanceService {
       },
       include: { rows: { take: 25, orderBy: { createdAt: 'desc' } } },
     });
+    return { ...upload, replacedCount: replaced };
   }
 
   async listRosters(tenantId: string) {
@@ -1787,26 +2049,25 @@ export class AttendanceService {
       },
     });
     if (dto.status === ShiftSwapStatus.APPROVED) {
-      const nextDay = new Date(request.targetDate);
-      nextDay.setUTCDate(nextDay.getUTCDate() + 1);
+      // `effectiveTo` is the inclusive last day, so a one-day swap starts and
+      // ends on the swapped date. Running to the next day leaked the swapped
+      // shift onto a date nobody swapped.
       await this.prisma.shiftAssignment.create({
         data: {
           employeeId: request.requesterEmployeeId,
           shiftId: request.targetShiftId,
           effectiveFrom: request.targetDate,
-          effectiveTo: nextDay,
+          effectiveTo: request.targetDate,
           source: 'SHIFT_SWAP',
         },
       });
       if (request.counterpartEmployeeId) {
-        const requesterNextDay = new Date(request.requestedDate);
-        requesterNextDay.setUTCDate(requesterNextDay.getUTCDate() + 1);
         await this.prisma.shiftAssignment.create({
           data: {
             employeeId: request.counterpartEmployeeId,
             shiftId: request.requestedShiftId,
             effectiveFrom: request.requestedDate,
-            effectiveTo: requesterNextDay,
+            effectiveTo: request.requestedDate,
             source: 'SHIFT_SWAP',
           },
         });
