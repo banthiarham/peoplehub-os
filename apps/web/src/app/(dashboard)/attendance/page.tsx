@@ -27,6 +27,7 @@ import type { ChangeEvent } from 'react';
 import { api } from '@/lib/api';
 import { downloadFile } from '@/lib/download';
 import { getDeviceId, getDeviceInfo } from '@/lib/device';
+import { asArray, employeeLabel, employeeOptionsFrom, type EmployeeOption } from '@/lib/options';
 import { captureFreshFix } from '@/lib/geo';
 import { cn, formatDate, formatTime } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
@@ -41,6 +42,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { EmptyState } from '@/components/ui/empty-state';
 import { Input, Select } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { StatCard } from '@/components/ui/stat-card';
@@ -110,13 +112,9 @@ interface ShiftRow {
   shiftAllowanceAmount: number | string;
   weeklyOffDays: number[];
   isDefault: boolean;
+  /** Employees whose effective shift today is this one, via the shared resolver. */
+  activeAssignments?: number;
   _count?: { shiftAssignments?: number };
-}
-
-interface ShiftEmployeeOption {
-  id: string;
-  firstName: string;
-  lastName: string;
 }
 
 interface RosterUploadRow {
@@ -158,6 +156,38 @@ interface AttendanceImportRow {
   punchIn: string;
   punchOut: string;
   status: string;
+  /** Set when the uploaded date cell could not be normalized. */
+  dateError?: string;
+}
+
+interface ShiftAssignmentRow {
+  id: string;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+  source: string;
+  status: 'ACTIVE' | 'SCHEDULED' | 'EXPIRED';
+  locationIsOverride: boolean;
+  overlappingAssignmentIds: string[];
+  shift: { id: string; name: string; startTime: string; endTime: string } | null;
+  effectiveLocation: { id: string; name: string } | null;
+  employee: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    employeeCode: string;
+    /** The employee's permanent/default location, never changed by an assignment. */
+    location: { id: string; name: string } | null;
+  };
+}
+
+interface EffectiveShift {
+  source: string;
+  date: string;
+  locationIsOverride: boolean;
+  employee: { id: string; firstName: string; lastName: string; employeeCode: string };
+  shift: { id: string; name: string; startTime: string; endTime: string } | null;
+  effectiveLocation: { id: string; name: string } | null;
+  defaultLocation: { id: string; name: string } | null;
 }
 
 type CaptureMode = 'WEB' | 'MOBILE' | 'GPS' | 'QR' | 'BIOMETRIC' | 'MANUAL' | 'API_IMPORT';
@@ -215,7 +245,52 @@ const ATTENDANCE_STATUS_OPTIONS = [
   'ON_LEAVE',
 ];
 
-const ATTENDANCE_IMPORT_TEMPLATE = 'employeeCode,date,punchIn,punchOut,status\nVH-1001,2026-07-15,09:00,18:30,PRESENT\n';
+/** Kept in sync with SUPPORTED_ATTENDANCE_DATE_FORMATS in the API. */
+const SUPPORTED_DATE_FORMATS_HELP =
+  'Supported date formats: YYYY-MM-DD (2026-07-15) or ISO 8601 date-time (2026-07-15T00:00:00.000Z).';
+
+const ATTENDANCE_IMPORT_TEMPLATE = [
+  '# date accepts YYYY-MM-DD or an ISO 8601 date-time, e.g. 2026-07-15 or 2026-07-15T00:00:00.000Z',
+  'employeeCode,date,punchIn,punchOut,status',
+  'VH-1001,2026-07-15,09:00,18:30,PRESENT',
+  'VH-1002,2026-07-15T00:00:00.000Z,09:10,18:00,PRESENT',
+  '',
+].join('\n');
+
+/** Today, so a sample roster row is never dated in the past. */
+const ROSTER_SAMPLE_DATE = new Date().toISOString().slice(0, 10);
+
+function rosterTemplate(sampleLines: string[]): string {
+  return [
+    '# employeeCode,date,shiftName — date accepts YYYY-MM-DD or an ISO 8601 date-time',
+    ...sampleLines,
+    '',
+  ].join('\n');
+}
+
+const DATE_ONLY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATE_TIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[T ]\d{2}:\d{2}/;
+
+/**
+ * Normalizes an imported date cell to YYYY-MM-DD without letting the browser
+ * timezone move the day. The calendar day is read from the literal date part,
+ * so `2026-07-01T00:00:00.000Z` stays July 1st everywhere.
+ */
+function normalizeImportDate(value: string): { date: string } | { error: string } {
+  const trimmed = value.trim();
+  if (!trimmed) return { error: `Date is required. ${SUPPORTED_DATE_FORMATS_HELP}` };
+  const match = DATE_ONLY_PATTERN.exec(trimmed) ?? ISO_DATE_TIME_PATTERN.exec(trimmed);
+  if (match) {
+    const [, year, month, day] = match;
+    const parsed = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+    const roundTrips =
+      parsed.getUTCFullYear() === Number(year) &&
+      parsed.getUTCMonth() === Number(month) - 1 &&
+      parsed.getUTCDate() === Number(day);
+    if (roundTrips) return { date: `${year}-${month}-${day}` };
+  }
+  return { error: `Unsupported date "${trimmed}". ${SUPPORTED_DATE_FORMATS_HELP}` };
+}
 
 function formatMinutes(minutes: number | null | undefined) {
   if (!minutes) return '—';
@@ -260,19 +335,23 @@ function parseAttendanceCsv(text: string): AttendanceImportRow[] {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const header = lines[0]?.toLowerCase();
   const dataLines = header?.includes('employeecode') ? lines.slice(1) : lines;
-  return dataLines.map((line, index) => {
-    const [employeeCode = '', date = '', punchIn = '', punchOut = '', status = 'PRESENT'] = line
-      .split(',')
-      .map((cell) => cell.trim());
-    return {
-      id: `${Date.now()}-${index}`,
-      employeeCode,
-      date,
-      punchIn,
-      punchOut,
-      status: status || 'PRESENT',
-    };
-  });
+  return dataLines
+    .filter((line) => !line.startsWith('#'))
+    .map((line, index) => {
+      const [employeeCode = '', date = '', punchIn = '', punchOut = '', status = 'PRESENT'] = line
+        .split(',')
+        .map((cell) => cell.trim());
+      const normalized = normalizeImportDate(date);
+      return {
+        id: `${Date.now()}-${index}`,
+        employeeCode,
+        date: 'date' in normalized ? normalized.date : '',
+        punchIn,
+        punchOut,
+        status: status || 'PRESENT',
+        ...('error' in normalized && date ? { dateError: normalized.error } : {}),
+      };
+    });
 }
 
 function newAttendanceImportRow(): AttendanceImportRow {
@@ -352,6 +431,33 @@ function AttendanceMetric({
       </div>
     </div>
   );
+}
+
+/**
+ * Employee dropdown options, always as an array.
+ *
+ * `['employees', 'options']` is a shared React Query cache key: the employees,
+ * employee detail and org pages all cache the *whole* options object under it.
+ * Caching only `data.managers` here meant whichever page mounted first decided
+ * the cached shape, so arriving from one of those pages handed this page an
+ * object and `.map()` threw. The query now caches the same object everyone else
+ * does, and `employeeOptionsFrom` selects the array from either shape.
+ */
+function useEmployeeOptions(): EmployeeOption[] {
+  const { data } = useQuery({
+    queryKey: ['employees', 'options'],
+    queryFn: () => api.get('/employees/meta/options').then((r) => r.data),
+  });
+  return employeeOptionsFrom(data);
+}
+
+/** Work locations, always as an array. */
+function useLocationOptions(): LocationOption[] {
+  const { data } = useQuery({
+    queryKey: ['locations'],
+    queryFn: () => api.get('/locations').then((r) => r.data),
+  });
+  return asArray<LocationOption>(data);
 }
 
 function apiError(err: unknown): string {
@@ -1073,18 +1179,13 @@ function RuleForm({ onSubmit, pending }: { onSubmit: (payload: Record<string, un
 function ShiftsTab() {
   const queryClient = useQueryClient();
   const toast = useToast();
-  const { data: shifts } = useQuery({
+  const { data: shiftsData } = useQuery({
     queryKey: ['attendance', 'shifts'],
-    queryFn: () => api.get('/attendance/shifts').then((r) => r.data as ShiftRow[]),
+    queryFn: () => api.get('/attendance/shifts').then((r) => r.data),
   });
-  const { data: employeeOptions } = useQuery({
-    queryKey: ['employees', 'options'],
-    queryFn: () => api.get('/employees/meta/options').then((r) => r.data.managers as ShiftEmployeeOption[]),
-  });
-  const { data: locationOptions } = useQuery({
-    queryKey: ['locations'],
-    queryFn: () => api.get('/locations').then((r) => r.data as { id: string; name: string }[]),
-  });
+  const shifts: ShiftRow[] = Array.isArray(shiftsData) ? shiftsData : [];
+  const employeeOptions = useEmployeeOptions();
+  const locationOptions = useLocationOptions();
   const [form, setForm] = useState({
     name: '',
     type: 'FIXED',
@@ -1141,100 +1242,122 @@ function ShiftsTab() {
   const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return (
     <>
-      <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
-      <Card className="p-4">
-        <h2 className="text-sm font-semibold">Create shift</h2>
-        <form className="mt-3 space-y-3" onSubmit={(e) => { e.preventDefault(); create.mutate(); }}>
-          <Input placeholder="Shift name" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
-          <div className="grid grid-cols-2 gap-2">
-            <Select value={form.type} onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}><option>FIXED</option><option>ROTATIONAL</option><option>FLEXIBLE</option><option>NIGHT</option><option>SPLIT</option></Select>
-            <Input type="number" placeholder="Allowance" value={form.shiftAllowanceAmount} onChange={(e) => setForm((f) => ({ ...f, shiftAllowanceAmount: e.target.value }))} />
-            <Input type="time" value={form.startTime} onChange={(e) => setForm((f) => ({ ...f, startTime: e.target.value }))} />
-            <Input type="time" value={form.endTime} onChange={(e) => setForm((f) => ({ ...f, endTime: e.target.value }))} />
+      <div className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <Card className="h-fit p-4">
+          <h2 className="text-sm font-semibold">Create shift</h2>
+          <form className="mt-3 space-y-3" onSubmit={(e) => { e.preventDefault(); create.mutate(); }}>
+            <label className="block text-sm">
+              <span className="text-ink-muted">Shift name</span>
+              <Input className="mt-1" placeholder="Standard Shift" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
+            </label>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block text-sm">
+                <span className="text-ink-muted">Type</span>
+                <Select className="mt-1" value={form.type} onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}><option>FIXED</option><option>ROTATIONAL</option><option>FLEXIBLE</option><option>NIGHT</option><option>SPLIT</option></Select>
+              </label>
+              <label className="block text-sm">
+                <span className="text-ink-muted">Allowance (₹)</span>
+                <Input className="mt-1" type="number" min="0" value={form.shiftAllowanceAmount} onChange={(e) => setForm((f) => ({ ...f, shiftAllowanceAmount: e.target.value }))} />
+              </label>
+              <label className="block text-sm">
+                <span className="text-ink-muted">Start</span>
+                <Input className="mt-1" type="time" value={form.startTime} onChange={(e) => setForm((f) => ({ ...f, startTime: e.target.value }))} />
+              </label>
+              <label className="block text-sm">
+                <span className="text-ink-muted">End</span>
+                <Input className="mt-1" type="time" value={form.endTime} onChange={(e) => setForm((f) => ({ ...f, endTime: e.target.value }))} />
+              </label>
+            </div>
+            <Button type="submit" className="w-full" disabled={create.isPending || !form.name}>Save shift</Button>
+          </form>
+        </Card>
+        <Card className="overflow-hidden">
+          <div className="border-b border-slate-200 p-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Shifts</p>
+            <p className="mt-1 text-sm text-slate-600">
+              &ldquo;On shift today&rdquo; is the headcount the shared shift resolver puts on each shift right
+              now, including employees covered by the default shift.
+            </p>
           </div>
-          <Button type="submit" disabled={create.isPending || !form.name}>Save shift</Button>
-        </form>
-      </Card>
-      <Card>
-        <Table>
-          <THead>
-            <TR>
-              <TH>Name</TH>
-              <TH>Type</TH>
-              <TH>Time</TH>
-              <TH>Grace</TH>
-              <TH>Allowance</TH>
-              <TH>Weekly off</TH>
-              <TH>Assigned</TH>
-              <TH></TH>
-            </TR>
-          </THead>
-          <TBody>
-            {shifts?.map((s) => {
-              return (
-                <TR key={s.id}>
-                  <TD className="font-medium">
-                    <div className="flex items-center gap-2">
-                      {s.name}
-                      {s.isDefault && <Badge variant="success">Default</Badge>}
-                    </div>
-                  </TD>
-                  <TD>{s.type}</TD>
-                  <TD>
-                    {s.startTime} - {s.endTime}
-                  </TD>
-                  <TD>{s.gracePeriodMins}m</TD>
-                  <TD>₹{s.shiftAllowanceAmount}</TD>
-                  <TD>
-                    <div className="flex items-center gap-2">
-                      <span>
-                        {s.weeklyOffDays.map((day) => weekdays[day]).join(', ') || 'None'}
-                      </span>
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        aria-label={`Edit weekly offs for ${s.name}`}
-                        title="Edit weekly offs"
-                        onClick={() =>
-                          setEditingWeeklyOffs({ id: s.id, days: [...s.weeklyOffDays] })
-                        }
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </TD>
-                  <TD>{s._count?.shiftAssignments ?? 0}</TD>
-                  <TD>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => {
-                          setAssigningShift({ id: s.id, name: s.name });
-                          setAssignEmployeeIds([]);
-                          setAssignEffectiveFrom('');
-                          setAssignLocationId('');
-                        }}
-                      >
-                        Assign
-                      </Button>
-                      {!s.isDefault && (
+          <div className="overflow-x-auto">
+            <Table>
+              <THead>
+                <TR>
+                  <TH>Name</TH>
+                  <TH>Type</TH>
+                  <TH>Time</TH>
+                  <TH>Grace</TH>
+                  <TH>Allowance</TH>
+                  <TH>Weekly off</TH>
+                  <TH>On shift today</TH>
+                  <TH></TH>
+                </TR>
+              </THead>
+              <TBody>
+                {shifts.map((s) => (
+                  <TR key={s.id}>
+                    <TD className="font-medium">
+                      <div className="flex items-center gap-2 whitespace-nowrap">
+                        {s.name}
+                        {s.isDefault && <Badge variant="success">Default</Badge>}
+                      </div>
+                    </TD>
+                    <TD>{s.type}</TD>
+                    <TD className="whitespace-nowrap">
+                      {s.startTime} - {s.endTime}
+                    </TD>
+                    <TD>{s.gracePeriodMins}m</TD>
+                    <TD>₹{s.shiftAllowanceAmount}</TD>
+                    <TD>
+                      <div className="flex items-center gap-1 whitespace-nowrap">
+                        <span>
+                          {s.weeklyOffDays.map((day) => weekdays[day]).join(', ') || 'None'}
+                        </span>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          aria-label={`Edit weekly offs for ${s.name}`}
+                          title="Edit weekly offs"
+                          onClick={() =>
+                            setEditingWeeklyOffs({ id: s.id, days: [...s.weeklyOffDays] })
+                          }
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </TD>
+                    <TD>{s.activeAssignments ?? 0}</TD>
+                    <TD>
+                      <div className="flex items-center gap-2 whitespace-nowrap">
                         <Button
                           size="sm"
-                          variant="ghost"
-                          disabled={setDefaultShift.isPending}
-                          onClick={() => setDefaultShift.mutate(s.id)}
+                          variant="outline"
+                          onClick={() => {
+                            setAssigningShift({ id: s.id, name: s.name });
+                            setAssignEmployeeIds([]);
+                            setAssignEffectiveFrom('');
+                            setAssignLocationId('');
+                          }}
                         >
-                          Set default
+                          Assign
                         </Button>
-                      )}
-                    </div>
-                  </TD>
-                </TR>
-              );
-            })}
-          </TBody>
-        </Table>
+                        {!s.isDefault && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={setDefaultShift.isPending}
+                            onClick={() => setDefaultShift.mutate(s.id)}
+                          >
+                            Set default
+                          </Button>
+                        )}
+                      </div>
+                    </TD>
+                  </TR>
+                ))}
+              </TBody>
+            </Table>
+          </div>
         </Card>
       </div>
       <Dialog
@@ -1315,7 +1438,7 @@ function ShiftsTab() {
                 className="mt-1"
               >
                 <option value="">Employee&apos;s own location</option>
-                {locationOptions?.map((location) => (
+                {locationOptions.map((location) => (
                   <option key={location.id} value={location.id}>
                     {location.name}
                   </option>
@@ -1326,7 +1449,7 @@ function ShiftsTab() {
               </span>
             </label>
             <div className="max-h-64 overflow-y-auto rounded-lg border border-line">
-              {employeeOptions?.map((employee) => (
+              {employeeOptions.map((employee) => (
                 <label
                   key={employee.id}
                   className="flex items-center gap-2 border-b border-line px-3 py-2 text-sm last:border-b-0"
@@ -1345,7 +1468,7 @@ function ShiftsTab() {
                   {employee.firstName} {employee.lastName}
                 </label>
               ))}
-              {employeeOptions?.length === 0 && (
+              {employeeOptions.length === 0 && (
                 <p className="px-3 py-4 text-sm text-ink-muted">No employees available.</p>
               )}
             </div>
@@ -1368,6 +1491,444 @@ function ShiftsTab() {
 }
 
 function RostersTab() {
+  return (
+    <div className="space-y-4">
+      <EmployeeRosterCard />
+      <RosterImportCard />
+    </div>
+  );
+}
+
+const ASSIGNMENT_STATUS_VARIANT: Record<ShiftAssignmentRow['status'], 'success' | 'info' | 'outline'> = {
+  ACTIVE: 'success',
+  SCHEDULED: 'info',
+  EXPIRED: 'outline',
+};
+
+/**
+ * States which shift attendance uses for **one named employee** on the selected
+ * date. It never renders without an employee selection, because a roster table
+ * spanning many employees has no single effective shift.
+ */
+function EffectiveShiftSummary({
+  employeeId,
+  onDate,
+  effective,
+}: {
+  employeeId: string;
+  onDate: string;
+  effective?: EffectiveShift;
+}) {
+  if (!employeeId) {
+    return (
+      <p className="mt-3 text-xs text-slate-500">
+        Select a single employee to see which shift attendance uses on a given date. The table below
+        covers every employee in range, so no one shift applies to all of it.
+      </p>
+    );
+  }
+  if (!effective) return null;
+
+  const name = employeeLabel(effective.employee);
+  const shiftName = effective.shift?.name ?? 'no shift';
+  const locationName = effective.effectiveLocation?.name ?? 'no location';
+  const fromTenantDefault = effective.source === 'TENANT_DEFAULT';
+
+  return (
+    <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+      <p className="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-800">
+        <CalendarClock className="h-4 w-4 shrink-0 text-slate-500" />
+        <span>
+          {name} uses {shiftName} at {locationName} on {formatDate(onDate)}.
+        </span>
+      </p>
+      <p className="mt-1 text-xs text-slate-600">
+        {fromTenantDefault
+          ? 'No roster assignment covers this date, so the tenant default shift applies.'
+          : `Resolved from a ${effective.source.replace(/_/g, ' ').toLowerCase()} assignment covering this date.`}
+        {effective.locationIsOverride
+          ? ` The assignment overrides the working location for this date; base location: ${
+              effective.defaultLocation?.name ?? 'none set'
+            }.`
+          : ' The location is the employee default.'}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Employee roster: the assignment ledger behind attendance. Every row is read
+ * from the same resolver the punch path uses, so the shift shown here is the
+ * shift attendance actually applies.
+ */
+function EmployeeRosterCard() {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const today = new Date().toISOString().slice(0, 10);
+  const [employeeId, setEmployeeId] = useState('');
+  const [from, setFrom] = useState(() => `${today.slice(0, 8)}01`);
+  const [to, setTo] = useState(today);
+  const [onDate, setOnDate] = useState(today);
+  const [editing, setEditing] = useState<ShiftAssignmentRow | null>(null);
+  const [editForm, setEditForm] = useState({ shiftId: '', locationId: '', effectiveFrom: '', effectiveTo: '' });
+
+  const employeeOptions = useEmployeeOptions();
+  const locationOptions = useLocationOptions();
+
+  const { data: assignments, isLoading } = useQuery({
+    queryKey: ['attendance', 'shift-assignments', employeeId, from, to],
+    queryFn: () =>
+      api
+        .get('/attendance/shift-assignments', {
+          params: { ...(employeeId && { employeeId }), ...(from && { from }), ...(to && { to }) },
+        })
+        .then((r) => r.data),
+  });
+  const { data: shifts } = useQuery({
+    queryKey: ['attendance', 'shifts'],
+    queryFn: () => api.get('/attendance/shifts').then((r) => r.data),
+  });
+
+  // Resolved for one named employee only. Without a selection there is no
+  // single answer, so the lookup does not run rather than showing one
+  // employee's shift above a table of many.
+  const { data: effective } = useQuery({
+    enabled: Boolean(employeeId && onDate),
+    queryKey: ['attendance', 'effective-shift', employeeId, onDate],
+    queryFn: () =>
+      api
+        .get('/attendance/shift-assignments/effective', {
+          params: { employeeId, date: onDate },
+        })
+        .then((r) => r.data as EffectiveShift),
+  });
+
+  const refresh = () =>
+    queryClient.invalidateQueries({ queryKey: ['attendance', 'shift-assignments'] });
+
+  const update = useMutation({
+    mutationFn: () =>
+      api.patch(`/attendance/shift-assignments/${editing!.id}`, {
+        ...(editForm.shiftId && { shiftId: editForm.shiftId }),
+        locationId: editForm.locationId,
+        ...(editForm.effectiveFrom && { effectiveFrom: editForm.effectiveFrom }),
+        effectiveTo: editForm.effectiveTo,
+      }),
+    onSuccess: () => {
+      toast('Shift assignment updated');
+      setEditing(null);
+      refresh();
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => api.delete(`/attendance/shift-assignments/${id}`),
+    onSuccess: () => {
+      toast('Shift assignment deleted');
+      refresh();
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  const rows: ShiftAssignmentRow[] = Array.isArray(assignments) ? assignments : [];
+  const shiftRows: ShiftRow[] = Array.isArray(shifts) ? shifts : [];
+  const overlapping = rows.filter((row) => row.overlappingAssignmentIds.length).length;
+
+  return (
+    <>
+      <Card className="overflow-hidden border-slate-200 bg-white">
+        <div className="border-b border-slate-200 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Employee roster
+              </p>
+              <p className="mt-1 text-sm text-slate-600">
+                Current and historical shift assignments, the location each one applies at, and where
+                the assignment came from.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="block text-xs font-medium text-slate-500">
+                Employee
+                <Select
+                  className="mt-1 w-56"
+                  value={employeeId}
+                  onChange={(event) => setEmployeeId(event.target.value)}
+                >
+                  <option value="">All employees</option>
+                  {employeeOptions.map((employee) => (
+                    <option key={employee.id} value={employee.id}>
+                      {employeeLabel(employee)}
+                    </option>
+                  ))}
+                </Select>
+              </label>
+              <label className="block text-xs font-medium text-slate-500">
+                From
+                <Input
+                  className="mt-1 w-36"
+                  type="date"
+                  value={from}
+                  onChange={(event) => setFrom(event.target.value)}
+                />
+              </label>
+              <label className="block text-xs font-medium text-slate-500">
+                To
+                <Input
+                  className="mt-1 w-36"
+                  type="date"
+                  value={to}
+                  onChange={(event) => setTo(event.target.value)}
+                />
+              </label>
+              <label className="block text-xs font-medium text-slate-500">
+                Shift used on
+                <Input
+                  className="mt-1 w-36"
+                  type="date"
+                  value={onDate}
+                  onChange={(event) => setOnDate(event.target.value)}
+                />
+              </label>
+            </div>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Badge variant="outline">{rows.length} assignments</Badge>
+            {overlapping > 0 && (
+              <Badge variant="warning">{overlapping} overlapping</Badge>
+            )}
+          </div>
+          <EffectiveShiftSummary employeeId={employeeId} onDate={onDate} effective={effective} />
+        </div>
+
+        <div className="overflow-x-auto">
+          <Table>
+            <THead>
+              <TR>
+                <TH>Employee</TH>
+                <TH>Shift</TH>
+                <TH>Effective</TH>
+                <TH>Location</TH>
+                <TH>Source</TH>
+                <TH>Status</TH>
+                <TH></TH>
+              </TR>
+            </THead>
+            <TBody>
+              {rows.map((row) => (
+                <TR key={row.id}>
+                  <TD className="font-medium">
+                    {row.employee.firstName} {row.employee.lastName}
+                    <span className="ml-2 text-xs text-slate-500">{row.employee.employeeCode}</span>
+                  </TD>
+                  <TD>
+                    {row.shift?.name ?? '—'}
+                    {row.shift && (
+                      <span className="ml-2 text-xs text-slate-500">
+                        {row.shift.startTime}–{row.shift.endTime}
+                      </span>
+                    )}
+                  </TD>
+                  <TD className="whitespace-nowrap">
+                    {formatDate(row.effectiveFrom)} → {row.effectiveTo ? formatDate(row.effectiveTo) : 'Open'}
+                  </TD>
+                  <TD>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span>{row.effectiveLocation?.name ?? '—'}</span>
+                      <Badge variant={row.locationIsOverride ? 'violet' : 'outline'}>
+                        {row.locationIsOverride ? 'Assignment override' : 'Employee default'}
+                      </Badge>
+                    </div>
+                    {/* The permanent location stays visible so an override is
+                        never mistaken for a change to the employee record. */}
+                    {row.locationIsOverride && (
+                      <p className="mt-1 text-xs text-slate-500">
+                        Base location: {row.employee.location?.name ?? 'none set'}
+                      </p>
+                    )}
+                  </TD>
+                  <TD>{row.source.replace(/_/g, ' ')}</TD>
+                  <TD>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={ASSIGNMENT_STATUS_VARIANT[row.status]}>{row.status}</Badge>
+                      {row.overlappingAssignmentIds.length > 0 && (
+                        <Badge variant="warning">
+                          Overlaps {row.overlappingAssignmentIds.length}
+                        </Badge>
+                      )}
+                    </div>
+                  </TD>
+                  <TD>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        aria-label="Edit shift assignment"
+                        onClick={() => {
+                          setEditing(row);
+                          setEditForm({
+                            shiftId: row.shift?.id ?? '',
+                            locationId: row.locationIsOverride ? (row.effectiveLocation?.id ?? '') : '',
+                            effectiveFrom: row.effectiveFrom.slice(0, 10),
+                            effectiveTo: row.effectiveTo ? row.effectiveTo.slice(0, 10) : '',
+                          });
+                        }}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        aria-label="Delete shift assignment"
+                        disabled={remove.isPending}
+                        onClick={() => remove.mutate(row.id)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </TD>
+                </TR>
+              ))}
+            </TBody>
+          </Table>
+          {!isLoading && rows.length === 0 && (
+            <div className="p-4">
+              <EmptyState
+                icon={Users}
+                title="No assignments in this window"
+                description="Widen the date range, clear the employee filter, or assign a shift from the Shifts tab."
+              />
+            </div>
+          )}
+        </div>
+      </Card>
+
+      <Dialog open={editing !== null} onOpenChange={(open) => !open && setEditing(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Edit assignment — {editing?.employee.firstName} {editing?.employee.lastName}
+            </DialogTitle>
+            <DialogDescription>
+              Changing the location here overrides the working location for this assignment only. The
+              employee&apos;s own location is never changed.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <label className="block text-sm">
+              <span className="text-ink-muted">Shift</span>
+              <Select
+                className="mt-1"
+                value={editForm.shiftId}
+                onChange={(event) => setEditForm((form) => ({ ...form, shiftId: event.target.value }))}
+              >
+                {shiftRows.map((shift) => (
+                  <option key={shift.id} value={shift.id}>
+                    {shift.name}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            <label className="block text-sm">
+              <span className="text-ink-muted">Location</span>
+              <Select
+                className="mt-1"
+                value={editForm.locationId}
+                onChange={(event) =>
+                  setEditForm((form) => ({ ...form, locationId: event.target.value }))
+                }
+              >
+                <option value="">Employee&apos;s own location</option>
+                {locationOptions.map((location) => (
+                  <option key={location.id} value={location.id}>
+                    {location.name}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block text-sm">
+                <span className="text-ink-muted">Effective from</span>
+                <Input
+                  className="mt-1"
+                  type="date"
+                  value={editForm.effectiveFrom}
+                  onChange={(event) =>
+                    setEditForm((form) => ({ ...form, effectiveFrom: event.target.value }))
+                  }
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="text-ink-muted">Effective to (inclusive)</span>
+                <Input
+                  className="mt-1"
+                  type="date"
+                  value={editForm.effectiveTo}
+                  onChange={(event) =>
+                    setEditForm((form) => ({ ...form, effectiveTo: event.target.value }))
+                  }
+                />
+                <span className="mt-1 block text-xs text-ink-muted">Leave empty for open-ended.</span>
+              </label>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditing(null)}>
+              Cancel
+            </Button>
+            <Button disabled={update.isPending} onClick={() => update.mutate()}>
+              Save assignment
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/**
+ * Roster sample rows built from this tenant's own employee codes and shift
+ * names, so the placeholder never suggests codes like `VH-1001` that the tenant
+ * does not use. Falls back to values explicitly labelled as examples when the
+ * tenant has no employees or shifts to read yet.
+ */
+function useRosterSample(): { lines: string[]; isReal: boolean } {
+  const { data: employeePage } = useQuery({
+    queryKey: ['employees', { rosterSample: true }],
+    queryFn: () => api.get('/employees', { params: { pageSize: 2 } }).then((r) => r.data),
+  });
+  const { data: shiftsData } = useQuery({
+    queryKey: ['attendance', 'shifts'],
+    queryFn: () => api.get('/attendance/shifts').then((r) => r.data),
+  });
+
+  const employees = Array.isArray(employeePage?.data) ? employeePage.data : [];
+  const shifts: ShiftRow[] = Array.isArray(shiftsData) ? shiftsData : [];
+  const codes = employees
+    .map((employee: { employeeCode?: string }) => employee.employeeCode)
+    .filter((code: string | undefined): code is string => Boolean(code));
+  const shiftNames = shifts.map((shift) => shift.name);
+  if (!codes.length || !shiftNames.length) {
+    return {
+      isReal: false,
+      lines: [
+        `EXAMPLE-0001,${ROSTER_SAMPLE_DATE},Example Day Shift`,
+        `EXAMPLE-0002,${ROSTER_SAMPLE_DATE}T00:00:00.000Z,Example Night Shift`,
+      ],
+    };
+  }
+  return {
+    isReal: true,
+    lines: [
+      `${codes[0]},${ROSTER_SAMPLE_DATE},${shiftNames[0]}`,
+      `${codes[1] ?? codes[0]},${ROSTER_SAMPLE_DATE}T00:00:00.000Z,${shiftNames[1] ?? shiftNames[0]}`,
+    ],
+  };
+}
+
+function RosterImportCard() {
   const queryClient = useQueryClient();
   const toast = useToast();
   const { data } = useQuery({
@@ -1375,13 +1936,137 @@ function RostersTab() {
     queryFn: () => api.get('/attendance/rosters').then((r) => r.data as RosterUploadRow[]),
   });
   const [name, setName] = useState('Roster upload');
-  const [rows, setRows] = useState('EMP-0001,2026-07-15,Standard Shift\nEMP-0002,2026-07-15,Night Operations');
+  const [replaceExisting, setReplaceExisting] = useState(false);
+  const [rows, setRows] = useState('');
+  const [rowErrors, setRowErrors] = useState<Array<{ row: number; employeeCode: string; error: string }>>([]);
+  const sample = useRosterSample();
   const upload = useMutation({
-    mutationFn: () => api.post('/attendance/rosters/import', { name, rows: rows.split('\n').filter(Boolean).map((line) => { const [employeeCode, date, shiftName] = line.split(',').map((x) => x.trim()); return { employeeCode, date, shiftName }; }) }),
-    onSuccess: () => { toast('Roster imported'); queryClient.invalidateQueries({ queryKey: ['attendance', 'rosters'] }); },
+    mutationFn: () =>
+      api.post('/attendance/rosters/import', {
+        name,
+        replaceExisting,
+        rows: rows
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line && !line.startsWith('#'))
+          .map((line) => {
+            const [employeeCode, date, shiftName] = line.split(',').map((cell) => cell.trim());
+            return { employeeCode, date, shiftName };
+          }),
+      }),
+    onSuccess: (response) => {
+      const failures = (response.data.errors ?? []) as Array<{
+        row: number;
+        employeeCode: string;
+        error: string;
+      }>;
+      setRowErrors(failures);
+      toast(
+        `Imported ${response.data.importedCount}, failed ${response.data.failedCount}${
+          response.data.replacedCount ? `, replaced ${response.data.replacedCount}` : ''
+        }`,
+        failures.length ? 'info' : 'success',
+      );
+      queryClient.invalidateQueries({ queryKey: ['attendance'] });
+    },
     onError: (err) => toast(apiError(err), 'error'),
   });
-  return <ImportListCard title="Roster import" name={name} setName={setName} rows={rows} setRows={setRows} action="Import roster" pending={upload.isPending} onSubmit={() => upload.mutate()} data={data} />;
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
+      <Card className="p-4">
+        <h2 className="text-sm font-semibold">Roster import</h2>
+        <p className="mt-1 text-xs text-slate-500">
+          One row per employee and day: employeeCode,date,shiftName. {SUPPORTED_DATE_FORMATS_HELP}
+        </p>
+        <Input className="mt-3" value={name} onChange={(e) => setName(e.target.value)} />
+        <textarea
+          className="mt-3 min-h-40 w-full rounded-md border border-line p-3 font-mono text-xs"
+          value={rows}
+          placeholder={sample.lines.join('\n')}
+          onChange={(e) => setRows(e.target.value)}
+        />
+        <p className="mt-1 text-xs text-slate-500">
+          {sample.isReal
+            ? 'The greyed-out rows use real employee codes and shift names from this workspace.'
+            : 'The greyed-out rows are placeholders only — EXAMPLE-0001 and the example shift names do not exist in this workspace.'}{' '}
+          <button
+            type="button"
+            className="font-semibold text-teal-700 underline underline-offset-2"
+            onClick={() => setRows(sample.lines.join('\n'))}
+          >
+            Use these rows
+          </button>
+        </p>
+        <label className="mt-3 flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={replaceExisting}
+            onChange={(e) => setReplaceExisting(e.target.checked)}
+          />
+          <span>
+            Replace existing assignments
+            <span className="mt-0.5 block text-xs text-ink-muted">
+              Without this, a row that collides with an assignment already starting that day fails
+              instead of creating a second, ambiguous assignment.
+            </span>
+          </span>
+        </label>
+        <div className="mt-3 flex items-center gap-2">
+          <Button onClick={() => upload.mutate()} disabled={upload.isPending || !rows.trim()}>
+            Import roster
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() =>
+              downloadTextFile('roster-import-template.csv', rosterTemplate(sample.lines))
+            }
+          >
+            <Download className="h-3.5 w-3.5" /> Template
+          </Button>
+        </div>
+        {rowErrors.length > 0 && (
+          <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-800">
+              {rowErrors.length} row{rowErrors.length === 1 ? '' : 's'} rejected
+            </p>
+            <ul className="mt-2 space-y-1 text-xs text-amber-900">
+              {rowErrors.slice(0, 10).map((failure) => (
+                <li key={`${failure.row}-${failure.employeeCode}`}>
+                  Row {failure.row} ({failure.employeeCode}): {failure.error}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </Card>
+      <Card>
+        <Table>
+          <THead>
+            <TR>
+              <TH>Name</TH>
+              <TH>Status</TH>
+              <TH>Imported</TH>
+              <TH>Failed</TH>
+            </TR>
+          </THead>
+          <TBody>
+            {data?.map((history) => (
+              <TR key={history.id}>
+                <TD>{history.name}</TD>
+                <TD>
+                  <Badge variant={statusVariant(history.status)}>{history.status}</Badge>
+                </TD>
+                <TD>{history.importedCount}</TD>
+                <TD>{history.failedCount}</TD>
+              </TR>
+            ))}
+          </TBody>
+        </Table>
+      </Card>
+    </div>
+  );
 }
 
 function AttendanceImportsTab() {
@@ -1401,14 +2086,23 @@ function AttendanceImportsTab() {
         })),
     }),
     onSuccess: (r) => {
-      toast(`Imported ${r.data.imported}, skipped ${r.data.skipped}`);
+      const failures = (r.data.errors ?? []) as Array<{ row: number; error: string }>;
+      toast(
+        `Imported ${r.data.imported}, skipped ${r.data.skipped}`,
+        failures.length ? 'info' : 'success',
+      );
+      setImportErrors(failures);
       queryClient.invalidateQueries({ queryKey: ['attendance'] });
     },
     onError: (err) => toast(apiError(err), 'error'),
   });
 
+  const [importErrors, setImportErrors] = useState<Array<{ row: number; error: string }>>([]);
+
   const updateRow = (id: string, patch: Partial<AttendanceImportRow>) => {
-    setRows((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+    setRows((current) =>
+      current.map((row) => (row.id === id ? { ...row, ...patch, dateError: undefined } : row)),
+    );
   };
 
   const handleFile = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1430,6 +2124,7 @@ function AttendanceImportsTab() {
             <p className="mt-1 text-sm text-slate-600">
               Upload a CSV or add rows below, review every value, then import clean attendance corrections.
             </p>
+            <p className="mt-1 text-xs text-slate-500">{SUPPORTED_DATE_FORMATS_HELP}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="outline" size="sm" onClick={() => downloadTextFile('attendance-import-template.csv', ATTENDANCE_IMPORT_TEMPLATE)}>
@@ -1470,7 +2165,15 @@ function AttendanceImportsTab() {
                   />
                 </TD>
                 <TD>
-                  <Input type="date" value={row.date} onChange={(e) => updateRow(row.id, { date: e.target.value })} />
+                  <Input
+                    type="date"
+                    value={row.date}
+                    aria-invalid={Boolean(row.dateError)}
+                    onChange={(e) => updateRow(row.id, { date: e.target.value })}
+                  />
+                  {row.dateError && (
+                    <p className="mt-1 max-w-[16rem] text-xs text-rose-600">{row.dateError}</p>
+                  )}
                 </TD>
                 <TD>
                   <Input
@@ -1509,6 +2212,19 @@ function AttendanceImportsTab() {
           </TBody>
         </Table>
       </div>
+
+      {importErrors.length > 0 && (
+        <div className="border-t border-amber-200 bg-amber-50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-800">
+            {importErrors.length} row{importErrors.length === 1 ? '' : 's'} rejected
+          </p>
+          <ul className="mt-2 space-y-1 text-sm text-amber-900">
+            {importErrors.slice(0, 10).map((failure) => (
+              <li key={failure.row}>Row {failure.row}: {failure.error}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 p-4">
         <p className="text-sm text-slate-600">
@@ -1575,6 +2291,3 @@ function HolidaysTab() {
   return <div className="grid gap-4 xl:grid-cols-[360px_1fr]"><Card className="p-4"><Input placeholder="Holiday name" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} /><Input className="mt-2" type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} /><label className="mt-2 flex items-center gap-2 text-sm"><input type="checkbox" checked={form.isOptional} onChange={(e) => setForm((f) => ({ ...f, isOptional: e.target.checked }))} />Optional</label><Button className="mt-3" onClick={() => create.mutate()} disabled={!form.name || create.isPending}>Save holiday</Button></Card><Card><Table><THead><TR><TH>Name</TH><TH>Date</TH><TH>Type</TH></TR></THead><TBody>{data?.map((h) => <TR key={h.id}><TD>{h.name}</TD><TD>{formatDate(h.date)}</TD><TD>{h.isOptional ? 'Optional' : 'Mandatory'}</TD></TR>)}</TBody></Table></Card></div>;
 }
 
-function ImportListCard({ title, name, setName, rows, setRows, action, pending, onSubmit, data }: { title: string; name: string; setName: (v: string) => void; rows: string; setRows: (v: string) => void; action: string; pending: boolean; onSubmit: () => void; data?: RosterUploadRow[] }) {
-  return <div className="grid gap-4 xl:grid-cols-[420px_1fr]"><Card className="p-4"><h2 className="text-sm font-semibold">{title}</h2><Input className="mt-3" value={name} onChange={(e) => setName(e.target.value)} /><textarea className="mt-3 min-h-40 w-full rounded-md border border-line p-3 text-sm" value={rows} onChange={(e) => setRows(e.target.value)} /><Button className="mt-3" onClick={onSubmit} disabled={pending}>{action}</Button></Card><Card><Table><THead><TR><TH>Name</TH><TH>Status</TH><TH>Imported</TH><TH>Failed</TH></TR></THead><TBody>{data?.map((r) => <TR key={r.id}><TD>{r.name}</TD><TD><Badge variant={statusVariant(r.status)}>{r.status}</Badge></TD><TD>{r.importedCount}</TD><TD>{r.failedCount}</TD></TR>)}</TBody></Table></Card></div>;
-}
