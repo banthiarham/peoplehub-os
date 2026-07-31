@@ -3,7 +3,10 @@ import {
   earlyDeparture,
   isLateArrival,
   isOvernightShift,
+  overtimeAfterShiftEnd,
+  shiftDurationMinutes,
   shiftEndFor,
+  workingDayThresholds,
 } from './shift-timing';
 
 /** Shift times are wall-clock, so fixtures are built in the server's zone. */
@@ -129,6 +132,164 @@ describe('earlyDeparture', () => {
         earlyDeparture({ punchOut: localAt(2, 5, 30), shift: nightShift }),
       ).toEqual({ isEarlyDeparture: true, earlyByMinutes: 15 });
     });
+  });
+});
+
+describe('shiftDurationMinutes', () => {
+  it('measures a same-day shift', () => {
+    expect(shiftDurationMinutes(dayShift)).toBe(540);
+  });
+
+  it('measures an overnight shift across midnight', () => {
+    expect(shiftDurationMinutes(nightShift)).toBe(480);
+  });
+
+  it('has no duration without a schedule', () => {
+    expect(shiftDurationMinutes(null)).toBeNull();
+    expect(shiftDurationMinutes({ startTime: '09:00', endTime: null })).toBeNull();
+  });
+});
+
+describe('workingDayThresholds', () => {
+  // `minWorking = span - break`, `halfDay = floor(minWorking / 2)`. `dayShift`
+  // and `nightShift` configure no break, so their span is the full day; every
+  // case that expects a smaller mark states its break explicitly.
+  it('scales a full day and half day to the shift that was actually scheduled', () => {
+    // The fixed 480/240 marks treated every shift as an eight hour one.
+    expect(workingDayThresholds(dayShift)).toEqual({
+      minWorkingMinutes: 540, // 540 span, no break
+      halfDayAfterMinutes: 270,
+    });
+    expect(workingDayThresholds({ startTime: '08:00', endTime: '20:00' })).toEqual({
+      minWorkingMinutes: 720, // 720 span, no break
+      halfDayAfterMinutes: 360,
+    });
+  });
+
+  it('scales an overnight shift off its true length, not its clock arithmetic', () => {
+    expect(workingDayThresholds(nightShift)).toEqual({
+      minWorkingMinutes: 480, // 22:00-06:00 is 480 across midnight, no break
+      halfDayAfterMinutes: 240,
+    });
+  });
+
+  it('floors the half day mark for an odd shift length', () => {
+    expect(workingDayThresholds({ startTime: '09:00', endTime: '17:31' })).toEqual({
+      minWorkingMinutes: 511,
+      halfDayAfterMinutes: 255,
+    });
+  });
+
+  it('takes the unpaid break off the scheduled span', () => {
+    // Gross presence is what these marks are compared against, so the break has
+    // to come off or a single late minute would cost half a day. A 09:00-18:00
+    // shift with an hour break lands back on the historical 480/240.
+    expect(workingDayThresholds({ ...dayShift, breakDurationMins: 60 })).toEqual({
+      minWorkingMinutes: 480, // 540 span - 60 break
+      halfDayAfterMinutes: 240,
+    });
+    expect(
+      workingDayThresholds({ startTime: '08:00', endTime: '20:00', breakDurationMins: 180 }),
+    ).toEqual({
+      minWorkingMinutes: 540, // 720 span - 180 break
+      halfDayAfterMinutes: 270,
+    });
+    expect(workingDayThresholds({ startTime: '08:00', endTime: '20:00', breakDurationMins: 60 })).toEqual({
+      minWorkingMinutes: 660, // 720 span - 60 break, the service spec's split shift
+      halfDayAfterMinutes: 330,
+    });
+    expect(workingDayThresholds({ ...nightShift, breakDurationMins: 60 })).toEqual({
+      minWorkingMinutes: 420, // 480 span - 60 break
+      halfDayAfterMinutes: 210,
+    });
+  });
+
+  it('ignores a break at least as long as the shift', () => {
+    expect(workingDayThresholds({ ...dayShift, breakDurationMins: 540 })).toEqual({
+      minWorkingMinutes: 540, // falls back to the full span
+      halfDayAfterMinutes: 270,
+    });
+  });
+
+  it('falls back to configured values when the shift has no schedule to measure', () => {
+    expect(
+      workingDayThresholds({ minWorkingMinutes: 400, halfDayAfterMinutes: 200 }),
+    ).toEqual({ minWorkingMinutes: 400, halfDayAfterMinutes: 200 });
+  });
+
+  it('falls back to the eight hour defaults with no shift at all', () => {
+    expect(workingDayThresholds(null)).toEqual({
+      minWorkingMinutes: 480,
+      halfDayAfterMinutes: 240,
+    });
+  });
+});
+
+describe('overtimeAfterShiftEnd', () => {
+  const punchedOutAt = (hour: number, minute: number, second = 0) =>
+    overtimeAfterShiftEnd({
+      punchIn: localAt(1, 9, 0),
+      punchOut: new Date(2026, 5, 1, hour, minute, second),
+      shift: dayShift,
+    });
+
+  it('bills nothing for leaving before the shift end', () => {
+    expect(punchedOutAt(17, 30)).toBe(0);
+  });
+
+  it('bills nothing for leaving exactly at the shift end', () => {
+    expect(punchedOutAt(18, 0)).toBe(0);
+  });
+
+  it('bills every minute clocked after the shift end', () => {
+    expect(punchedOutAt(18, 45)).toBe(45);
+    expect(punchedOutAt(19, 30)).toBe(90);
+  });
+
+  it('floors a part-minute overrun', () => {
+    expect(punchedOutAt(18, 0, 45)).toBe(0);
+    expect(punchedOutAt(18, 1, 30)).toBe(1);
+  });
+
+  it('ignores the break and the overtime threshold entirely', () => {
+    // A 60m break and a 480m overtimeAfterMinutes used to cancel this out to 0.
+    expect(
+      overtimeAfterShiftEnd({
+        punchIn: localAt(1, 9, 0),
+        punchOut: localAt(1, 18, 30),
+        shift: { ...dayShift, breakDurationMins: 60, overtimeAfterMinutes: 480 } as never,
+      }),
+    ).toBe(30);
+  });
+
+  describe('overnight shifts', () => {
+    it('bills from the morning the shift actually ends', () => {
+      expect(
+        overtimeAfterShiftEnd({
+          punchIn: localAt(1, 22, 0),
+          punchOut: localAt(2, 7, 30),
+          shift: nightShift,
+        }),
+      ).toBe(90);
+    });
+
+    it('bills nothing for clocking off before the overnight end', () => {
+      expect(
+        overtimeAfterShiftEnd({
+          punchIn: localAt(1, 22, 0),
+          punchOut: localAt(2, 5, 45),
+          shift: nightShift,
+        }),
+      ).toBe(0);
+    });
+  });
+
+  it('is undefined without a punch-out or a schedule to measure', () => {
+    expect(overtimeAfterShiftEnd({ punchIn: localAt(1, 9, 0), shift: dayShift })).toBeUndefined();
+    expect(overtimeAfterShiftEnd({ punchOut: localAt(1, 19, 0), shift: null })).toBeUndefined();
+    expect(
+      overtimeAfterShiftEnd({ punchOut: localAt(1, 19, 0), shift: { startTime: '09:00' } }),
+    ).toBeUndefined();
   });
 });
 

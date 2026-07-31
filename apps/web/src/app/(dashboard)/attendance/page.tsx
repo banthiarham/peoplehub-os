@@ -28,6 +28,17 @@ import { api } from '@/lib/api';
 import { downloadFile } from '@/lib/download';
 import { getDeviceId, getDeviceInfo } from '@/lib/device';
 import { asArray, employeeLabel, employeeOptionsFrom, type EmployeeOption } from '@/lib/options';
+import {
+  ATTENDANCE_IMPORT_TEMPLATE,
+  ATTENDANCE_STATUS_OPTIONS,
+  SUPPORTED_DATE_FORMATS_HELP,
+  combineDateTime,
+  newAttendanceImportRow,
+  normalizeImportDate,
+  parseAttendanceCsv,
+  toAttendanceImportPayload,
+  type AttendanceImportRow,
+} from '@/lib/attendance-import';
 import { captureFreshFix } from '@/lib/geo';
 import { cn, formatDate, formatTime } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
@@ -149,17 +160,6 @@ interface HolidayRow {
   isOptional: boolean;
 }
 
-interface AttendanceImportRow {
-  id: string;
-  employeeCode: string;
-  date: string;
-  punchIn: string;
-  punchOut: string;
-  status: string;
-  /** Set when the uploaded date cell could not be normalized. */
-  dateError?: string;
-}
-
 interface ShiftAssignmentRow {
   id: string;
   effectiveFrom: string;
@@ -236,27 +236,6 @@ const CAPTURE_MODE_HELP: Record<CaptureMode, string> = {
   API_IMPORT: 'External attendance system sync endpoint.',
 };
 
-const ATTENDANCE_STATUS_OPTIONS = [
-  'PRESENT',
-  'LATE',
-  'HALF_DAY',
-  'ABSENT',
-  'MISSING_PUNCH',
-  'ON_LEAVE',
-];
-
-/** Kept in sync with SUPPORTED_ATTENDANCE_DATE_FORMATS in the API. */
-const SUPPORTED_DATE_FORMATS_HELP =
-  'Supported date formats: YYYY-MM-DD (2026-07-15) or ISO 8601 date-time (2026-07-15T00:00:00.000Z).';
-
-const ATTENDANCE_IMPORT_TEMPLATE = [
-  '# date accepts YYYY-MM-DD or an ISO 8601 date-time, e.g. 2026-07-15 or 2026-07-15T00:00:00.000Z',
-  'employeeCode,date,punchIn,punchOut,status',
-  'VH-1001,2026-07-15,09:00,18:30,PRESENT',
-  'VH-1002,2026-07-15T00:00:00.000Z,09:10,18:00,PRESENT',
-  '',
-].join('\n');
-
 /** Today, so a sample roster row is never dated in the past. */
 const ROSTER_SAMPLE_DATE = new Date().toISOString().slice(0, 10);
 
@@ -266,30 +245,6 @@ function rosterTemplate(sampleLines: string[]): string {
     ...sampleLines,
     '',
   ].join('\n');
-}
-
-const DATE_ONLY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
-const ISO_DATE_TIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[T ]\d{2}:\d{2}/;
-
-/**
- * Normalizes an imported date cell to YYYY-MM-DD without letting the browser
- * timezone move the day. The calendar day is read from the literal date part,
- * so `2026-07-01T00:00:00.000Z` stays July 1st everywhere.
- */
-function normalizeImportDate(value: string): { date: string } | { error: string } {
-  const trimmed = value.trim();
-  if (!trimmed) return { error: `Date is required. ${SUPPORTED_DATE_FORMATS_HELP}` };
-  const match = DATE_ONLY_PATTERN.exec(trimmed) ?? ISO_DATE_TIME_PATTERN.exec(trimmed);
-  if (match) {
-    const [, year, month, day] = match;
-    const parsed = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
-    const roundTrips =
-      parsed.getUTCFullYear() === Number(year) &&
-      parsed.getUTCMonth() === Number(month) - 1 &&
-      parsed.getUTCDate() === Number(day);
-    if (roundTrips) return { date: `${year}-${month}-${day}` };
-  }
-  return { error: `Unsupported date "${trimmed}". ${SUPPORTED_DATE_FORMATS_HELP}` };
 }
 
 function formatMinutes(minutes: number | null | undefined) {
@@ -309,18 +264,6 @@ function formatTimeInput(value: string | null | undefined) {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
-function combineDateTime(date: string, time: string) {
-  if (!date || !time) return undefined;
-  return new Date(`${date}T${time}:00`).toISOString();
-}
-
-function normalizeImportDateTime(date: string, value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.includes('T')) return new Date(trimmed).toISOString();
-  return combineDateTime(date, trimmed);
-}
-
 function downloadTextFile(filename: string, content: string) {
   const blob = new Blob([content], { type: 'text/csv;charset=utf-8' });
   const url = window.URL.createObjectURL(blob);
@@ -329,41 +272,6 @@ function downloadTextFile(filename: string, content: string) {
   link.download = filename;
   link.click();
   window.URL.revokeObjectURL(url);
-}
-
-function parseAttendanceCsv(text: string): AttendanceImportRow[] {
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const header = lines[0]?.toLowerCase();
-  const dataLines = header?.includes('employeecode') ? lines.slice(1) : lines;
-  return dataLines
-    .filter((line) => !line.startsWith('#'))
-    .map((line, index) => {
-      const [employeeCode = '', date = '', punchIn = '', punchOut = '', status = 'PRESENT'] = line
-        .split(',')
-        .map((cell) => cell.trim());
-      const normalized = normalizeImportDate(date);
-      return {
-        id: `${Date.now()}-${index}`,
-        employeeCode,
-        date: 'date' in normalized ? normalized.date : '',
-        punchIn,
-        punchOut,
-        status: status || 'PRESENT',
-        ...('error' in normalized && date ? { dateError: normalized.error } : {}),
-      };
-    });
-}
-
-function newAttendanceImportRow(): AttendanceImportRow {
-  const date = new Date().toISOString().slice(0, 10);
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    employeeCode: '',
-    date,
-    punchIn: '09:00',
-    punchOut: '18:00',
-    status: 'PRESENT',
-  };
 }
 
 function CompactAttendanceMetric({
@@ -2074,17 +1982,9 @@ function AttendanceImportsTab() {
   const toast = useToast();
   const [rows, setRows] = useState<AttendanceImportRow[]>([newAttendanceImportRow()]);
   const upload = useMutation({
-    mutationFn: () => api.post('/attendance/import/manual', {
-      rows: rows
-        .filter((row) => row.employeeCode.trim() && row.date)
-        .map((row) => ({
-          employeeCode: row.employeeCode.trim(),
-          date: row.date,
-          punchIn: normalizeImportDateTime(row.date, row.punchIn),
-          punchOut: normalizeImportDateTime(row.date, row.punchOut),
-          status: row.status,
-        })),
-    }),
+    // `status` is omitted for rows that leave it blank, so the API derives it.
+    mutationFn: () =>
+      api.post('/attendance/import/manual', { rows: toAttendanceImportPayload(rows) }),
     onSuccess: (r) => {
       const failures = (r.data.errors ?? []) as Array<{ row: number; error: string }>;
       toast(
@@ -2191,6 +2091,9 @@ function AttendanceImportsTab() {
                 </TD>
                 <TD>
                   <Select value={row.status} onChange={(e) => updateRow(row.id, { status: e.target.value })}>
+                    {/* Blank is the default: the API derives the status from
+                        the punches, the shift and the attendance rule. */}
+                    <option value="">Auto — from punches</option>
                     {ATTENDANCE_STATUS_OPTIONS.map((status) => (
                       <option key={status} value={status}>{status.replace(/_/g, ' ')}</option>
                     ))}
