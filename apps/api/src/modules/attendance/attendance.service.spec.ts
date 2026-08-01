@@ -340,7 +340,7 @@ describe('AttendanceService', () => {
   describe('check-out reclassifies the finished day', () => {
     const user = { tenantId: 'tenant-1', employeeId: 'emp-1' } as never;
     const device = { deviceId: 'device-1' } as never;
-    /** 09:00-18:00 less a 60 minute break: 480 full day, 240 half day. */
+    /** 09:00-18:00, a 540 minute span: PRESENT from 405, HALF_DAY from 135. */
     const shift = {
       id: 'shift-1',
       startTime: '09:00',
@@ -473,6 +473,27 @@ describe('AttendanceService', () => {
 
       const late = await workDay(newAttendanceService(punchHarness()), at(9, 30), at(14, 30));
       expect(late).toMatchObject({ workingMinutes: 300, status: 'HALF_DAY' });
+    });
+
+    it('marks three hours of the 09:00-18:00 shift HALF_DAY, not ABSENT', async () => {
+      // The reported bug: a third of the shift is partial attendance, and
+      // calling it an absence hid that the employee turned up at all.
+      const record = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(12, 0));
+      expect(record).toMatchObject({ workingMinutes: 180, status: 'HALF_DAY' });
+    });
+
+    it('holds the half day and full day marks at 135 and 405 minutes', async () => {
+      const justAbsent = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(11, 14));
+      expect(justAbsent).toMatchObject({ workingMinutes: 134, status: 'ABSENT' });
+
+      const justHalf = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(11, 15));
+      expect(justHalf).toMatchObject({ workingMinutes: 135, status: 'HALF_DAY' });
+
+      const justShort = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(15, 44));
+      expect(justShort).toMatchObject({ workingMinutes: 404, status: 'HALF_DAY' });
+
+      const justFull = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(15, 45));
+      expect(justFull).toMatchObject({ workingMinutes: 405, status: 'PRESENT' });
     });
 
     it('keeps PRESENT for a full day started on time', async () => {
@@ -735,18 +756,16 @@ describe('AttendanceService', () => {
     }
 
     /**
-     * `breakDurationMins` is spelled out on every fixture rather than inherited,
-     * because it is what makes each expected threshold below add up:
-     * `minWorking = span - break`, `halfDay = floor(minWorking / 2)`.
-     *
-     * `overtimeAfterMinutes`, `halfDayAfterMinutes` and `minWorkingMinutes` are
-     * carried deliberately and must have no effect on either calculation now.
+     * Status is a share of the scheduled span: PRESENT from 75%, HALF_DAY from
+     * 25%. `breakDurationMins`, `overtimeAfterMinutes`, `halfDayAfterMinutes`
+     * and `minWorkingMinutes` are carried on every fixture deliberately and
+     * must have no effect on either calculation.
      */
     const dayShift = {
       id: 'shift-day',
       startTime: '09:00',
       endTime: '18:00',
-      breakDurationMins: 60, // 540 span - 60 = 480 full day, 240 half day
+      breakDurationMins: 60, // 540 span: 405 full day, 135 half day
       overtimeAfterMinutes: 480,
       halfDayAfterMinutes: 240,
       minWorkingMinutes: 480,
@@ -756,14 +775,14 @@ describe('AttendanceService', () => {
       id: 'shift-night',
       startTime: '22:00',
       endTime: '06:00',
-      breakDurationMins: 60, // 480 span - 60 = 420 full day, 210 half day
+      breakDurationMins: 60, // 480 span: 360 full day, 120 half day
     };
     const splitShift = {
       ...dayShift,
       id: 'shift-split',
       startTime: '08:00',
       endTime: '20:00',
-      breakDurationMins: 60, // 720 span - 60 = 660 full day, 330 half day
+      breakDurationMins: 60, // 720 span: 540 full day, 180 half day
     };
 
     async function importOne(
@@ -805,46 +824,66 @@ describe('AttendanceService', () => {
       ).resolves.toMatchObject({ workingMinutes: 570, overtimeMinutes: 90 });
     });
 
-    it('scales the half day mark to the shift length instead of a fixed 240', async () => {
-      // 720 span - 60 break = 660 full day, so half of it is 330 — not the 240
-      // every shift used to be measured against.
+    it('scores a day against its own shift length, not a fixed number of minutes', async () => {
+      // 720 span: a half day starts at 180 minutes and a full day at 540, so
+      // the 300 minute day that used to import as ABSENT is a half day.
       await expect(
         importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 13, 0) }),
-      ).resolves.toMatchObject({ workingMinutes: 300, status: 'ABSENT' });
-      await expect(
-        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 14, 30) }),
-      ).resolves.toMatchObject({ workingMinutes: 390, status: 'HALF_DAY' });
-      await expect(
-        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 19, 0) }),
-      ).resolves.toMatchObject({ workingMinutes: 660, status: 'PRESENT' });
-    });
-
-    it('scales the half day mark off an overnight shift true length', async () => {
-      // 480 span - 60 break = 420 full day, so half of it is 210.
-      await expect(
-        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 1, 0) }),
-      ).resolves.toMatchObject({ workingMinutes: 180, status: 'ABSENT' });
-      await expect(
-        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 3, 0) }),
       ).resolves.toMatchObject({ workingMinutes: 300, status: 'HALF_DAY' });
       await expect(
-        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 5, 0) }),
-      ).resolves.toMatchObject({ workingMinutes: 420, status: 'PRESENT' });
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 10, 59) }),
+      ).resolves.toMatchObject({ workingMinutes: 179, status: 'ABSENT' });
+      await expect(
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 11, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 180, status: 'HALF_DAY' });
+      await expect(
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 16, 59) }),
+      ).resolves.toMatchObject({ workingMinutes: 539, status: 'HALF_DAY' });
+      await expect(
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 17, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 540, status: 'PRESENT' });
     });
 
-    it('keeps the break slack a working day has, so slight lateness is not a half day', async () => {
-      // 540 span - 60 break = 480 full day: the historical mark. A 09:30 start
-      // is past the 15 minute grace, so this is a full day qualified as LATE —
-      // the point being that it is not docked to HALF_DAY.
+    it('scores an overnight shift off its true length across midnight', async () => {
+      // 480 span: 120 for a half day, 360 for a full one.
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(6, 23, 59) }),
+      ).resolves.toMatchObject({ workingMinutes: 119, status: 'ABSENT' });
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 0, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 120, status: 'HALF_DAY' });
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 3, 59) }),
+      ).resolves.toMatchObject({ workingMinutes: 359, status: 'HALF_DAY' });
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 4, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 360, status: 'PRESENT' });
+    });
+
+    it('does not dock a nearly full day, however the shift divides', async () => {
+      // 540 span, so the full day mark is 405 minutes. A 09:30 start is past
+      // the 15 minute grace, so that day is a full day qualified as LATE — the
+      // point being that it is not docked to HALF_DAY.
       await expect(
         importOne(dayShift, { punchIn: punchAt(6, 9, 30), punchOut: punchAt(6, 18, 15) }),
       ).resolves.toMatchObject({ workingMinutes: 525, status: 'LATE' });
       await expect(
-        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 17, 0) }),
-      ).resolves.toMatchObject({ workingMinutes: 480, status: 'PRESENT' });
-      await expect(
         importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 16, 59) }),
-      ).resolves.toMatchObject({ workingMinutes: 479, status: 'HALF_DAY' });
+      ).resolves.toMatchObject({ workingMinutes: 479, status: 'PRESENT' });
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 15, 45) }),
+      ).resolves.toMatchObject({ workingMinutes: 405, status: 'PRESENT' });
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 15, 44) }),
+      ).resolves.toMatchObject({ workingMinutes: 404, status: 'HALF_DAY' });
+    });
+
+    it('does not mark three hours of a 09:00-18:00 shift ABSENT', async () => {
+      // The reported bug, through the import path: 180 of 540 minutes is a
+      // third of the shift, which is attendance rather than an absence.
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 12, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 180, status: 'HALF_DAY' });
     });
 
     it('records a missing punch-out with no status guess and no overtime', async () => {

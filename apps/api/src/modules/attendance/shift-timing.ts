@@ -13,10 +13,6 @@
 export const DEFAULT_LATE_ARRIVAL_GRACE_MINS = 15;
 /** Applied when neither the attendance rule nor the shift configures one. */
 export const DEFAULT_EARLY_DEPARTURE_GRACE_MINS = 15;
-/** Last-resort full day when no shift, and therefore no schedule, resolves. */
-export const DEFAULT_MIN_WORKING_MINUTES = 480;
-/** Last-resort half day when no shift, and therefore no schedule, resolves. */
-export const DEFAULT_HALF_DAY_AFTER_MINUTES = 240;
 
 export interface ShiftTiming {
   startTime: string;
@@ -72,47 +68,6 @@ export function shiftDurationMinutes(shift: ScheduledShift): number | null {
   const end = minutesOfDay(shift.endTime);
   const duration = end > start ? end - start : end + 24 * 60 - start;
   return duration > 0 ? duration : null;
-}
-
-/**
- * Full-day and half-day marks for the resolved shift.
- *
- * Derived from how long the shift is actually scheduled for, so a 12 hour shift
- * is a full day at 12 hours and a half day at 6 — the fixed 480/240 marks
- * silently treated every shift as an 8 hour one.
- *
- * The unpaid break comes off the scheduled span first. The marks are compared
- * against the *gross* punch-in to punch-out span, so leaving the whole span in
- * would demand unbroken presence for every scheduled minute and drop a day to
- * HALF_DAY for a single minute of lateness. Subtracting the break restores the
- * slack a working day actually has: a 09:00-18:00 shift with a 60 minute break
- * lands back on the historical 480/240.
- *
- * Falls back to any explicitly configured values, then to the 8 hour defaults,
- * when the shift has no schedule to measure.
- */
-export function workingDayThresholds(
-  shift:
-    | (ScheduledShift & {
-        breakDurationMins?: number | null;
-        minWorkingMinutes?: number | null;
-        halfDayAfterMinutes?: number | null;
-      })
-    | null
-    | undefined,
-): { minWorkingMinutes: number; halfDayAfterMinutes: number } {
-  const scheduled = shiftDurationMinutes(shift);
-  if (scheduled != null) {
-    const net = scheduled - (shift?.breakDurationMins ?? 0);
-    // A break at least as long as the shift is a misconfiguration, not a reason
-    // to mark every punch a full day.
-    const minWorkingMinutes = net > 0 ? net : scheduled;
-    return { minWorkingMinutes, halfDayAfterMinutes: Math.floor(minWorkingMinutes / 2) };
-  }
-  return {
-    minWorkingMinutes: shift?.minWorkingMinutes ?? DEFAULT_MIN_WORKING_MINUTES,
-    halfDayAfterMinutes: shift?.halfDayAfterMinutes ?? DEFAULT_HALF_DAY_AFTER_MINUTES,
-  };
 }
 
 /**
