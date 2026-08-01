@@ -57,14 +57,21 @@ export function CheckInPanel() {
   );
 
   const checkIn = useMutation({
-    mutationFn: (f: LiveFix | null) =>
+    mutationFn: (payload: { fix: LiveFix | null; reason?: 'denied' | 'unavailable' }) =>
       api
         .post('/attendance/check-in', {
           deviceId: getDeviceId(),
           ...getDeviceInfo(),
-          ...(f
-            ? { geoLat: f.lat, geoLng: f.lng, geoAccuracy: f.accuracy, fixAt: f.timestamp }
-            : {}),
+          ...(payload.fix
+            ? {
+                geoLat: payload.fix.lat,
+                geoLng: payload.fix.lng,
+                geoAccuracy: payload.fix.accuracy,
+                fixAt: payload.fix.timestamp,
+              }
+            : payload.reason
+              ? { geoErrorReason: payload.reason }
+              : {}),
         })
         .then((r) => r.data),
     onSuccess: (record) => {
@@ -98,9 +105,9 @@ export function CheckInPanel() {
   useEffect(() => {
     if (!arming || checkIn.isPending) return;
     if (isPrecise && fix) {
-      checkIn.mutate(fix);
+      checkIn.mutate({ fix });
     } else if (status === 'denied' || status === 'unavailable') {
-      checkIn.mutate(null);
+      checkIn.mutate({ fix: null, reason: status });
     }
   }, [arming, isPrecise, fix, status, checkIn]);
 
@@ -157,7 +164,7 @@ export function CheckInPanel() {
               <XCircle className="h-3.5 w-3.5" /> Cancel
             </Button>
             {fix && !isPrecise && elapsedSec > 12 && !checkIn.isPending && (
-              <Button size="sm" variant="secondary" onClick={() => checkIn.mutate(fix)}>
+              <Button size="sm" variant="secondary" onClick={() => checkIn.mutate({ fix })}>
                 Use ±{Math.round(fix.accuracy)}m fix
               </Button>
             )}
