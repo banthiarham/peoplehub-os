@@ -14,7 +14,12 @@ import {
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
 import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
-import { earlyDeparture, isLateArrival } from './shift-timing';
+import {
+  earlyDeparture,
+  isLateArrival,
+  overtimeAfterShiftEnd,
+  workingDayThresholds,
+} from './shift-timing';
 import {
   AssignShiftDto,
   CheckInDto,
@@ -552,9 +557,46 @@ export class AttendanceService {
     if (!record?.punchIn) throw new BadRequestException('Check in first');
     const now = new Date();
     const workingMinutes = Math.round((now.getTime() - record.punchIn.getTime()) / 60000);
+
+    // Check-in can only ever guess at PRESENT/LATE, because how long the day
+    // turns out to be is not known until the punch-out. Reclassify against the
+    // finished span, or a ten minute day stays PRESENT purely because that is
+    // what the punch-in wrote.
+    const { shift, assignedLocationId } = await this.shifts.resolveAt(
+      user.tenantId,
+      employeeId,
+      today,
+    );
+    const locationId = assignedLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
+    const calculatedStatus = this.classifyAttendanceStatus({
+      workingMinutes,
+      shift,
+      tenantId: user.tenantId,
+      locationId,
+      date: today,
+    });
+    // The punch-in already decided lateness against the shift and rule; the
+    // punch-out only decides whether the day was long enough for it to matter.
+    const status = this.withLateArrival(
+      calculatedStatus,
+      record.status === AttendanceStatus.LATE,
+    );
+
     return this.prisma.attendanceRecord.update({
       where: { id: record.id },
-      data: { punchOut: now, workingMinutes },
+      data: {
+        punchOut: now,
+        workingMinutes,
+        // Every other write path derives overtime at write time; leaving it off
+        // here meant an interactive punch banked no overtime while the same two
+        // punches imported from a file did, and the summary, finalization
+        // preview and finalization all read the stored value.
+        overtimeMinutes: this.overtimeMinutes(record.punchIn, now, shift),
+        // Pinned to the shift the status and overtime were actually derived
+        // from, so the record cannot cite one shift and be measured by another.
+        shiftId: shift?.id ?? record.shiftId,
+        status,
+      },
     });
   }
 
@@ -702,6 +744,18 @@ export class AttendanceService {
     const unknownEmployeeCodes = new Set<string>();
     const errors: Array<{ row: number; employeeCode: string; date: string; error: string }> = [];
 
+    // Rows in one upload overwhelmingly share a shift, location and date, so
+    // the rule that governs their grace period is looked up once per distinct
+    // combination rather than once per row.
+    const ruleCache = new Map<string, Awaited<ReturnType<typeof this.attendanceRule>>>();
+    const ruleFor = async (shiftId: string | undefined, locationId: string | null, at: Date) => {
+      const key = `${shiftId ?? ''}|${locationId ?? ''}|${at.toISOString()}`;
+      if (!ruleCache.has(key)) {
+        ruleCache.set(key, await this.attendanceRule(tenantId, { shiftId, locationId, date: at }));
+      }
+      return ruleCache.get(key) ?? null;
+    };
+
     for (const [index, row] of dto.rows.entries()) {
       const employee = employeeByCode.get(row.employeeCode);
       if (!employee) {
@@ -743,13 +797,16 @@ export class AttendanceService {
         punchIn && punchOut
           ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000))
           : undefined;
-      const status = row.status ?? this.classifyAttendanceStatus({
-        workingMinutes,
-        shift,
-        tenantId,
-        locationId,
-        date,
-      });
+      // An explicit status in the file still wins outright. Otherwise the row
+      // is classified exactly as the punch path classifies the same two
+      // punches: length first, then lateness against the shift and the rule
+      // that governs it, via the same `isLateArrival`.
+      const status =
+        row.status ??
+        this.withLateArrival(
+          this.classifyAttendanceStatus({ workingMinutes, shift, tenantId, locationId, date }),
+          punchIn ? isLateArrival(punchIn, shift, await ruleFor(shift?.id, locationId, date)) : false,
+        );
       await this.prisma.attendanceRecord.upsert({
         where: { employeeId_date: { employeeId: employee.id, date } },
         create: {
@@ -760,7 +817,7 @@ export class AttendanceService {
           punchIn,
           punchOut,
           workingMinutes,
-          overtimeMinutes: this.overtimeMinutes(workingMinutes, shift),
+          overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
           punchSource: source,
           status,
           remarks: row.deviceId ? `${source} import: ${row.deviceId}` : `${source} import`,
@@ -771,7 +828,7 @@ export class AttendanceService {
           punchIn,
           punchOut,
           workingMinutes,
-          overtimeMinutes: this.overtimeMinutes(workingMinutes, shift),
+          overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
           punchSource: source,
           status,
           remarks: row.deviceId ? `${source} import: ${row.deviceId}` : `${source} import`,
@@ -826,7 +883,7 @@ export class AttendanceService {
         punchIn,
         punchOut,
         workingMinutes,
-        overtimeMinutes: this.overtimeMinutes(workingMinutes, shift),
+        overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
         status,
         punchSource: record.punchSource ?? 'MANUAL',
         remarks: record.remarks ?? 'Manual attendance correction',
@@ -847,34 +904,46 @@ export class AttendanceService {
     return { deleted: true };
   }
 
+  /**
+   * Folds a late arrival into a finished day's classification.
+   *
+   * Lateness only ever qualifies a day that was otherwise worked in full: a
+   * short or half day is already described by its own status, and saying LATE
+   * instead would hide the shortfall. Shared by the punch-out path and the row
+   * import so a day cannot be classified differently by how it arrived.
+   */
+  private withLateArrival(status: AttendanceStatus, arrivedLate: boolean): AttendanceStatus {
+    return status === AttendanceStatus.PRESENT && arrivedLate ? AttendanceStatus.LATE : status;
+  }
+
   private classifyAttendanceStatus(input: {
     workingMinutes?: number;
-    shift?: { halfDayAfterMinutes: number; minWorkingMinutes: number } | null;
+    shift?: {
+      halfDayAfterMinutes?: number | null;
+      minWorkingMinutes?: number | null;
+      breakDurationMins?: number | null;
+      startTime?: string | null;
+      endTime?: string | null;
+    } | null;
     tenantId?: string;
     locationId?: string | null;
     date?: Date;
   }): AttendanceStatus {
     if (input.workingMinutes == null) return 'MISSING_PUNCH';
-    const halfDayAfter = input.shift?.halfDayAfterMinutes ?? 240;
-    const minWorking = input.shift?.minWorkingMinutes ?? 480;
-    if (input.workingMinutes < halfDayAfter) return 'ABSENT';
-    if (input.workingMinutes < minWorking) return 'HALF_DAY';
+    // Scaled to how long the resolved shift actually runs, overnight included.
+    const { halfDayAfterMinutes, minWorkingMinutes } = workingDayThresholds(input.shift);
+    if (input.workingMinutes < halfDayAfterMinutes) return 'ABSENT';
+    if (input.workingMinutes < minWorkingMinutes) return 'HALF_DAY';
     return 'PRESENT';
   }
 
-  /**
-   * `workingMinutes` is the gross punch-in to punch-out span, so the shift's
-   * unpaid break has to come off before the overtime threshold is applied —
-   * otherwise a 09:00-18:00 shift with a 60m break bills 60m of overtime for
-   * simply working the shift.
-   */
+  /** Minutes clocked after the resolved shift ended. See `overtimeAfterShiftEnd`. */
   private overtimeMinutes(
-    workingMinutes?: number,
-    shift?: { overtimeAfterMinutes: number; breakDurationMins?: number } | null,
+    punchIn?: Date | null,
+    punchOut?: Date | null,
+    shift?: { startTime?: string | null; endTime?: string | null } | null,
   ): number | undefined {
-    if (workingMinutes == null || !shift) return undefined;
-    const workedMinutes = workingMinutes - (shift.breakDurationMins ?? 0);
-    return Math.max(0, workedMinutes - shift.overtimeAfterMinutes);
+    return overtimeAfterShiftEnd({ punchIn, punchOut, shift });
   }
 
   private async holidayDateSet(tenantId: string, start: Date, endInclusive: Date) {
@@ -1198,27 +1267,26 @@ export class AttendanceService {
       input.punchIn && input.punchOut
         ? Math.max(0, Math.round((input.punchOut.getTime() - input.punchIn.getTime()) / 60000))
         : undefined;
+    // Same derived values as every other write path, so a regularized day is
+    // not a hole in the overtime totals the summary and finalization read.
+    // The PRESENT status is deliberate and unchanged: a regularization is an
+    // approved assertion that the day was worked, not a derivation.
+    const { shift } = await this.shifts.resolveAt(tenantId, employeeId, input.date);
+    const overtimeMinutes = this.overtimeMinutes(input.punchIn, input.punchOut, shift);
+    const derived = {
+      shiftId: shift?.id,
+      punchIn: input.punchIn,
+      punchOut: input.punchOut,
+      workingMinutes,
+      overtimeMinutes,
+      status: AttendanceStatus.PRESENT,
+      punchSource: 'MANUAL',
+      remarks: `Regularization: ${input.reason}`,
+    };
     return this.prisma.attendanceRecord.upsert({
       where: { employeeId_date: { employeeId, date: input.date } },
-      create: {
-        tenantId,
-        employeeId,
-        date: input.date,
-        status: 'PRESENT',
-        punchIn: input.punchIn,
-        punchOut: input.punchOut,
-        workingMinutes,
-        punchSource: 'MANUAL',
-        remarks: `Regularization: ${input.reason}`,
-      },
-      update: {
-        punchIn: input.punchIn,
-        punchOut: input.punchOut,
-        workingMinutes,
-        status: 'PRESENT',
-        punchSource: 'MANUAL',
-        remarks: `Regularization: ${input.reason}`,
-      },
+      create: { tenantId, employeeId, date: input.date, ...derived },
+      update: derived,
     });
   }
 
@@ -1899,7 +1967,7 @@ export class AttendanceService {
     const byEmployee = new Map<string, { overtimeMinutes: number; allowance: number }>();
     for (const record of records) {
       const current = byEmployee.get(record.employeeId) ?? { overtimeMinutes: 0, allowance: 0 };
-      current.overtimeMinutes += record.overtimeMinutes ?? this.overtimeMinutes(record.workingMinutes ?? undefined, record.shift) ?? 0;
+      current.overtimeMinutes += record.overtimeMinutes ?? this.overtimeMinutes(record.punchIn, record.punchOut, record.shift) ?? 0;
       if (record.shift?.shiftAllowanceAmount && ['PRESENT', 'LATE', 'HALF_DAY'].includes(record.status)) {
         current.allowance += record.shift.shiftAllowanceAmount;
       }

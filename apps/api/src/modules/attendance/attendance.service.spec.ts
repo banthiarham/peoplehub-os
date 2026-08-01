@@ -247,6 +247,8 @@ describe('AttendanceService', () => {
       shift: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'shift-1',
+          startTime: '09:00',
+          endTime: '18:00',
           overtimeAfterMinutes: 480,
           halfDayAfterMinutes: 240,
           minWorkingMinutes: 480,
@@ -258,6 +260,7 @@ describe('AttendanceService', () => {
       attendanceCaptureSetting: {
         findFirst: jest.fn().mockResolvedValue(null),
       },
+      attendanceRule: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     const service = newAttendanceService(prisma);
 
@@ -267,8 +270,8 @@ describe('AttendanceService', () => {
           {
             employeeCode: 'PH001',
             date: '2026-07-05',
-            punchIn: '2026-07-05T09:30:00.000Z',
-            punchOut: '2026-07-05T18:15:00.000Z',
+            punchIn: new Date(2026, 6, 5, 9, 30).toISOString(),
+            punchOut: new Date(2026, 6, 5, 18, 15).toISOString(),
             deviceId: 'bio-1',
           },
           { employeeCode: 'MISSING', date: '2026-07-05' },
@@ -288,7 +291,8 @@ describe('AttendanceService', () => {
         shiftId: 'shift-1',
         punchSource: 'BIOMETRIC',
         workingMinutes: 525,
-        overtimeMinutes: 45,
+        // 15 minutes past the 18:00 shift end.
+        overtimeMinutes: 15,
         isFinalized: true,
       }),
     }));
@@ -311,6 +315,7 @@ describe('AttendanceService', () => {
       },
       attendanceRecord: { upsert: jest.fn().mockResolvedValue({}) },
       attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+      attendanceRule: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     const service = newAttendanceService(prisma);
 
@@ -332,92 +337,533 @@ describe('AttendanceService', () => {
     }));
   });
 
-  it('bills no overtime for a full 09:00-18:00 shift with a 60 minute break', async () => {
-    const prisma = {
-      employee: {
-        findMany: jest.fn().mockResolvedValue([{ id: 'emp-1', employeeCode: 'PH001', locationId: null }]),
-        findFirst: jest.fn().mockResolvedValue({ locationId: null }),
-      },
-      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
-      shift: {
-        findFirst: jest.fn().mockResolvedValue({
-          id: 'shift-1',
-          overtimeAfterMinutes: 480,
-          breakDurationMins: 60,
-          halfDayAfterMinutes: 240,
-          minWorkingMinutes: 480,
-        }),
-      },
-      attendanceRecord: { upsert: jest.fn().mockResolvedValue({}) },
-      attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+  describe('check-out reclassifies the finished day', () => {
+    const user = { tenantId: 'tenant-1', employeeId: 'emp-1' } as never;
+    const device = { deviceId: 'device-1' } as never;
+    /** 09:00-18:00 less a 60 minute break: 480 full day, 240 half day. */
+    const shift = {
+      id: 'shift-1',
+      startTime: '09:00',
+      endTime: '18:00',
+      gracePeriodMins: 15,
+      earlyLeavingGraceMins: 15,
+      breakDurationMins: 60,
+      minWorkingMinutes: 480,
+      halfDayAfterMinutes: 240,
+      weeklyOffDays: [0, 6],
     };
-    const service = newAttendanceService(prisma);
+    /** Wall-clock on Wednesday 15 July 2026. */
+    const at = (hour: number, minute: number) => new Date(2026, 6, 15, hour, minute, 0, 0);
 
-    await service.importAttendanceRows(
-      'tenant-1',
-      {
-        rows: [
+    /**
+     * Persists what the punch path writes, so check-out reads back the row
+     * check-in created and the ledger reads back the row check-out finished.
+     * Stubbing each call in isolation is what let a stale status survive.
+     */
+    function punchHarness(options?: { rule?: Record<string, any> | null }) {
+      const records = new Map<string, Record<string, any>>();
+      const devices = new Map<string, Record<string, any>>();
+      let seq = 0;
+      const key = (employeeId: string, date: Date) => `${employeeId}|${date.toISOString()}`;
+      return {
+        employee: {
+          findFirst: jest.fn().mockResolvedValue({ locationId: null, workMode: 'REMOTE' }),
+          findMany: jest
+            .fn()
+            .mockResolvedValue([{ id: 'emp-1', employeeCode: 'PH001', locationId: null }]),
+        },
+        shiftAssignment: {
+          findFirst: jest.fn().mockResolvedValue(null),
+          findMany: jest.fn().mockResolvedValue([]),
+        },
+        shift: { findFirst: jest.fn().mockResolvedValue(shift) },
+        attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+        attendanceRule: {
+          findFirst: jest.fn().mockResolvedValue(options?.rule ?? null),
+          findMany: jest.fn().mockResolvedValue(options?.rule ? [options.rule] : []),
+        },
+        holiday: { findMany: jest.fn().mockResolvedValue([]) },
+        leaveRequest: { findMany: jest.fn().mockResolvedValue([]) },
+        employeeDevice: {
+          findUnique: jest.fn(({ where }: { where: Record<string, any> }) =>
+            Promise.resolve(where.employeeId ? (devices.get(where.employeeId) ?? null) : null),
+          ),
+          create: jest.fn(({ data }: { data: Record<string, any> }) => {
+            devices.set(data.employeeId, { ...data });
+            return Promise.resolve(data);
+          }),
+          update: jest.fn(({ where, data }: { where: any; data: any }) => {
+            const bound = { ...devices.get(where.employeeId), ...data };
+            devices.set(where.employeeId, bound);
+            return Promise.resolve(bound);
+          }),
+        },
+        attendanceRecord: {
+          findUnique: jest.fn(({ where }: { where: any }) =>
+            Promise.resolve(
+              records.get(key(where.employeeId_date.employeeId, where.employeeId_date.date)) ?? null,
+            ),
+          ),
+          upsert: jest.fn(({ where, create, update }: { where: any; create: any; update: any }) => {
+            const k = key(where.employeeId_date.employeeId, where.employeeId_date.date);
+            const existing = records.get(k);
+            const row = existing ? { ...existing, ...update } : { id: `rec-${++seq}`, ...create };
+            records.set(k, row);
+            return Promise.resolve(row);
+          }),
+          update: jest.fn(({ where, data }: { where: any; data: any }) => {
+            for (const [k, row] of records) {
+              if (row.id === where.id) {
+                const next = { ...row, ...data };
+                records.set(k, next);
+                return Promise.resolve(next);
+              }
+            }
+            return Promise.resolve(null);
+          }),
+          findMany: jest.fn(() => Promise.resolve([...records.values()])),
+        },
+      };
+    }
+
+    /** The real interactive flow: punch in, wait, punch out. */
+    async function workDay(
+      service: AttendanceService,
+      punchIn: Date,
+      punchOut: Date,
+    ): Promise<Record<string, any>> {
+      jest.setSystemTime(punchIn);
+      await service.checkIn(user, device);
+      jest.setSystemTime(punchOut);
+      return (await service.checkOut(user, device)) as never;
+    }
+
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('marks a ten minute day ABSENT instead of leaving the check-in PRESENT', async () => {
+      const prisma = punchHarness();
+      const service = newAttendanceService(prisma);
+
+      jest.setSystemTime(at(9, 0));
+      const afterCheckIn = (await service.checkIn(user, device)) as never as { status: string };
+      // The punch-in can only guess, and it guesses PRESENT — the bug was that
+      // nothing ever revisited that guess.
+      expect(afterCheckIn.status).toBe('PRESENT');
+
+      jest.setSystemTime(at(9, 10));
+      const record = (await service.checkOut(user, device)) as never as {
+        status: string;
+        workingMinutes: number;
+      };
+
+      expect(record.workingMinutes).toBe(10);
+      expect(record.status).toBe('ABSENT');
+    });
+
+    it('marks a ten minute day ABSENT even when the check-in was late', async () => {
+      const service = newAttendanceService(punchHarness());
+      const record = await workDay(service, at(9, 30), at(9, 40));
+      expect(record).toMatchObject({ workingMinutes: 10, status: 'ABSENT' });
+    });
+
+    it('marks a 300 minute day HALF_DAY on time and late alike', async () => {
+      const onTime = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(14, 0));
+      expect(onTime).toMatchObject({ workingMinutes: 300, status: 'HALF_DAY' });
+
+      const late = await workDay(newAttendanceService(punchHarness()), at(9, 30), at(14, 30));
+      expect(late).toMatchObject({ workingMinutes: 300, status: 'HALF_DAY' });
+    });
+
+    it('keeps PRESENT for a full day started on time', async () => {
+      const record = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(17, 0));
+      expect(record).toMatchObject({ workingMinutes: 480, status: 'PRESENT' });
+    });
+
+    it('preserves LATE for a full day started late', async () => {
+      const record = await workDay(newAttendanceService(punchHarness()), at(9, 30), at(18, 30));
+      expect(record).toMatchObject({ workingMinutes: 540, status: 'LATE' });
+    });
+
+    describe('derived values match every other write path', () => {
+      /** Only the values the summary, preview and finalization read back. */
+      const derived = (row: Record<string, any>) => ({
+        shiftId: row.shiftId,
+        workingMinutes: row.workingMinutes,
+        overtimeMinutes: row.overtimeMinutes,
+        status: row.status,
+      });
+
+      it('banks overtime for a punch-out past the shift end', async () => {
+        const record = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(19, 30));
+        // 18:00 shift end, so 90 minutes past it.
+        expect(derived(record)).toEqual({
+          shiftId: 'shift-1',
+          workingMinutes: 630,
+          overtimeMinutes: 90,
+          status: 'PRESENT',
+        });
+      });
+
+      it('banks no overtime for clocking off at or before the shift end', async () => {
+        const atEnd = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(18, 0));
+        expect(atEnd.overtimeMinutes).toBe(0);
+        const early = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(17, 30));
+        expect(early.overtimeMinutes).toBe(0);
+      });
+
+      it('writes the same derived values as importing the identical punches', async () => {
+        // The consistency this whole change is about: one attendance day must
+        // not depend on whether it arrived by punch or by file.
+        const punched = await workDay(newAttendanceService(punchHarness()), at(9, 0), at(19, 30));
+
+        const importPrisma = punchHarness();
+        await newAttendanceService(importPrisma).importAttendanceRows(
+          'tenant-1',
           {
-            employeeCode: 'PH001',
-            date: '2026-07-06',
-            punchIn: '2026-07-06T09:00:00.000Z',
-            punchOut: '2026-07-06T18:00:00.000Z',
+            rows: [
+              {
+                employeeCode: 'PH001',
+                date: '2026-07-15',
+                punchIn: at(9, 0).toISOString(),
+                punchOut: at(19, 30).toISOString(),
+              },
+            ],
           },
-        ],
-      },
-      'MANUAL',
-    );
+          'MANUAL',
+        );
+        const imported = importPrisma.attendanceRecord.upsert.mock.calls[0][0].create;
 
-    // 540 gross - 60 break = 480 worked, exactly the 480 overtime threshold.
-    expect(prisma.attendanceRecord.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        create: expect.objectContaining({ workingMinutes: 540, overtimeMinutes: 0 }),
-      }),
-    );
+        expect(derived(punched)).toEqual(derived(imported));
+      });
+
+      it('persists the shift the status and overtime were derived from', async () => {
+        const prisma = punchHarness();
+        const service = newAttendanceService(prisma);
+        await workDay(service, at(9, 0), at(19, 30));
+        const [{ data }] = prisma.attendanceRecord.update.mock.calls.at(-1) as [{ data: any }];
+        expect(data.shiftId).toBe('shift-1');
+      });
+
+      it('surfaces interactive overtime in the monthly summary', async () => {
+        const service = newAttendanceService(punchHarness());
+        await workDay(service, at(9, 0), at(19, 30));
+
+        const ledger = await service.monthlyLedgerFor('tenant-1', 'emp-1', '2026-07');
+
+        // Before this, a punched day contributed nothing to the overtime the
+        // summary, finalization preview and finalization all read.
+        expect(ledger.counts.overtimeMinutes).toBe(90);
+        const day = ledger.days.find((d) => d.date.toISOString().slice(0, 10) === '2026-07-15');
+        expect(day).toMatchObject({ overtimeMinutes: 90, status: 'PRESENT' });
+      });
+
+      /**
+       * Imports the same two punches the interactive flow used, with no status
+       * column, and returns what the row import would store.
+       */
+      async function importPunches(
+        punchIn: Date,
+        punchOut: Date | null,
+        options?: { rule?: Record<string, any> | null },
+      ): Promise<Record<string, any>> {
+        const prisma = punchHarness(options);
+        await newAttendanceService(prisma).importAttendanceRows(
+          'tenant-1',
+          {
+            rows: [
+              {
+                employeeCode: 'PH001',
+                date: '2026-07-15',
+                punchIn: punchIn.toISOString(),
+                ...(punchOut ? { punchOut: punchOut.toISOString() } : {}),
+              },
+            ],
+          },
+          'MANUAL',
+        );
+        return prisma.attendanceRecord.upsert.mock.calls[0][0].create;
+      }
+
+      // Shift starts 09:00 with a 15 minute grace: 09:15 is on time, 09:16 late.
+      const parity: Array<[string, Date, Date, string]> = [
+        ['a full day started on time', at(9, 0), at(17, 0), 'PRESENT'],
+        ['a full day started exactly on the grace boundary', at(9, 15), at(17, 15), 'PRESENT'],
+        ['a full day started one minute past the grace', at(9, 16), at(17, 16), 'LATE'],
+        ['a long day started late', at(9, 30), at(18, 30), 'LATE'],
+        ['a half day started on time', at(9, 0), at(14, 0), 'HALF_DAY'],
+        ['a half day started late', at(9, 30), at(14, 30), 'HALF_DAY'],
+        ['a ten minute day started late', at(9, 30), at(9, 40), 'ABSENT'],
+      ];
+
+      it.each(parity)(
+        'imports %s with the same status the punch path produces',
+        async (_label, punchIn, punchOut, expected) => {
+          const punched = await workDay(newAttendanceService(punchHarness()), punchIn, punchOut);
+          const imported = await importPunches(punchIn, punchOut);
+
+          expect(imported.status).toBe(expected);
+          expect(punched.status).toBe(expected);
+        },
+      );
+
+      it('applies the attendance rule grace to an import exactly as to a punch', async () => {
+        // A rule with no grace makes 09:05 late; the shift's own 15 minutes would not.
+        const rule = { lateMarkAfterMins: 0, earlyLeavingGraceMins: 15 };
+        const punched = await workDay(
+          newAttendanceService(punchHarness({ rule })),
+          at(9, 5),
+          at(17, 5),
+        );
+        const imported = await importPunches(at(9, 5), at(17, 5), { rule });
+
+        expect(punched.status).toBe('LATE');
+        expect(imported.status).toBe('LATE');
+      });
+
+      it('leaves a status supplied in the file untouched', async () => {
+        const prisma = punchHarness();
+        await newAttendanceService(prisma).importAttendanceRows(
+          'tenant-1',
+          {
+            rows: [
+              {
+                employeeCode: 'PH001',
+                date: '2026-07-15',
+                punchIn: at(9, 30).toISOString(),
+                punchOut: at(18, 30).toISOString(),
+                status: 'PRESENT' as never,
+              },
+            ],
+          },
+          'MANUAL',
+        );
+        expect(prisma.attendanceRecord.upsert.mock.calls[0][0].create.status).toBe('PRESENT');
+      });
+
+      it('still reports a punch-in with no punch-out as MISSING_PUNCH, however late', async () => {
+        const imported = await importPunches(at(11, 0), null);
+        expect(imported).toMatchObject({ status: 'MISSING_PUNCH', workingMinutes: undefined });
+      });
+
+      it('derives a different status per row for a file with no status column', async () => {
+        // What a CSV upload sends once the browser stops defaulting every blank
+        // status to PRESENT: no `status` key at all on any row.
+        const prisma = punchHarness();
+        await newAttendanceService(prisma).importAttendanceRows(
+          'tenant-1',
+          {
+            rows: [
+              { employeeCode: 'PH001', date: '2026-07-15', punchIn: at(9, 0).toISOString(), punchOut: at(17, 0).toISOString() },
+              { employeeCode: 'PH001', date: '2026-07-16', punchIn: at(9, 30).toISOString(), punchOut: at(18, 30).toISOString() },
+              { employeeCode: 'PH001', date: '2026-07-17', punchIn: at(9, 0).toISOString(), punchOut: at(14, 0).toISOString() },
+              { employeeCode: 'PH001', date: '2026-07-18', punchIn: at(9, 0).toISOString(), punchOut: at(9, 10).toISOString() },
+              { employeeCode: 'PH001', date: '2026-07-19', punchIn: at(9, 0).toISOString() },
+            ] as never,
+          },
+          'MANUAL',
+        );
+
+        const statuses = prisma.attendanceRecord.upsert.mock.calls.map(
+          ([args]: [{ create: { status: string } }]) => args.create.status,
+        );
+        expect(statuses).toEqual(['PRESENT', 'LATE', 'HALF_DAY', 'ABSENT', 'MISSING_PUNCH']);
+      });
+
+      it('completes a regularized day with its shift and overtime', async () => {
+        const prisma = punchHarness();
+        const service = newAttendanceService(prisma);
+
+        await service.applyRegularization('tenant-1', 'emp-1', {
+          date: new Date(Date.UTC(2026, 6, 15)),
+          punchIn: at(9, 0),
+          punchOut: at(19, 30),
+          reason: 'Forgot to punch out',
+        });
+
+        const [{ create }] = prisma.attendanceRecord.upsert.mock.calls[0] as [{ create: any }];
+        expect(create).toMatchObject({
+          shiftId: 'shift-1',
+          workingMinutes: 630,
+          overtimeMinutes: 90,
+          // Unchanged: a regularization asserts the day was worked.
+          status: 'PRESENT',
+        });
+      });
+    });
+
+    it('has the monthly ledger count the ten minute day as an absence', async () => {
+      const prisma = punchHarness();
+      const service = newAttendanceService(prisma);
+      await workDay(service, at(9, 0), at(9, 10));
+
+      // Still 15 July, so the ledger window clamps to today.
+      const ledger = await service.monthlyLedgerFor('tenant-1', 'emp-1', '2026-07');
+
+      const day = ledger.days.find((d) => d.date.toISOString().slice(0, 10) === '2026-07-15');
+      expect(day).toMatchObject({ status: 'ABSENT', source: 'RECORD', workingMinutes: 10 });
+      // 01-15 July less four weekend days is 11 attendable days, none attended.
+      expect(ledger.counts).toMatchObject({
+        expectedWorkingDays: 11,
+        present: 0,
+        halfDay: 0,
+        absent: 11,
+        attendancePercentage: 0,
+      });
+    });
   });
 
-  it('bills overtime only for time worked beyond the shift once the break is removed', async () => {
-    const prisma = {
-      employee: {
-        findMany: jest.fn().mockResolvedValue([{ id: 'emp-1', employeeCode: 'PH001', locationId: null }]),
-        findFirst: jest.fn().mockResolvedValue({ locationId: null }),
-      },
-      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
-      shift: {
-        findFirst: jest.fn().mockResolvedValue({
-          id: 'shift-1',
-          overtimeAfterMinutes: 480,
-          breakDurationMins: 60,
-          halfDayAfterMinutes: 240,
-          minWorkingMinutes: 480,
-        }),
-      },
-      attendanceRecord: { upsert: jest.fn().mockResolvedValue({}) },
-      attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+  describe('shift-relative half day and overtime', () => {
+    /** Shift times are wall-clock, so punches are built in the server's zone. */
+    const punchAt = (day: number, hour: number, minute: number) =>
+      new Date(2026, 6, day, hour, minute, 0, 0).toISOString();
+
+    function importPrisma(shift: Record<string, unknown> | null) {
+      return {
+        employee: {
+          findMany: jest
+            .fn()
+            .mockResolvedValue([{ id: 'emp-1', employeeCode: 'PH001', locationId: null }]),
+          findFirst: jest.fn().mockResolvedValue({ locationId: null }),
+        },
+        shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+        shift: { findFirst: jest.fn().mockResolvedValue(shift) },
+        attendanceRecord: { upsert: jest.fn().mockResolvedValue({}) },
+        attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+        attendanceRule: { findFirst: jest.fn().mockResolvedValue(null) },
+      };
+    }
+
+    /**
+     * `breakDurationMins` is spelled out on every fixture rather than inherited,
+     * because it is what makes each expected threshold below add up:
+     * `minWorking = span - break`, `halfDay = floor(minWorking / 2)`.
+     *
+     * `overtimeAfterMinutes`, `halfDayAfterMinutes` and `minWorkingMinutes` are
+     * carried deliberately and must have no effect on either calculation now.
+     */
+    const dayShift = {
+      id: 'shift-day',
+      startTime: '09:00',
+      endTime: '18:00',
+      breakDurationMins: 60, // 540 span - 60 = 480 full day, 240 half day
+      overtimeAfterMinutes: 480,
+      halfDayAfterMinutes: 240,
+      minWorkingMinutes: 480,
     };
-    const service = newAttendanceService(prisma);
+    const nightShift = {
+      ...dayShift,
+      id: 'shift-night',
+      startTime: '22:00',
+      endTime: '06:00',
+      breakDurationMins: 60, // 480 span - 60 = 420 full day, 210 half day
+    };
+    const splitShift = {
+      ...dayShift,
+      id: 'shift-split',
+      startTime: '08:00',
+      endTime: '20:00',
+      breakDurationMins: 60, // 720 span - 60 = 660 full day, 330 half day
+    };
 
-    await service.importAttendanceRows(
-      'tenant-1',
-      {
-        rows: [
-          {
-            employeeCode: 'PH001',
-            date: '2026-07-06',
-            punchIn: '2026-07-06T09:00:00.000Z',
-            punchOut: '2026-07-06T19:30:00.000Z',
-          },
-        ],
-      },
-      'MANUAL',
-    );
+    async function importOne(
+      shift: Record<string, unknown> | null,
+      row: { punchIn?: string; punchOut?: string; date?: string },
+    ) {
+      const prisma = importPrisma(shift);
+      const service = newAttendanceService(prisma);
+      await service.importAttendanceRows(
+        'tenant-1',
+        { rows: [{ employeeCode: 'PH001', date: row.date ?? '2026-07-06', ...row }] },
+        'MANUAL',
+      );
+      return prisma.attendanceRecord.upsert.mock.calls[0][0].create;
+    }
 
-    // 630 gross - 60 break = 570 worked, 90 past the 480 threshold.
-    expect(prisma.attendanceRecord.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        create: expect.objectContaining({ workingMinutes: 630, overtimeMinutes: 90 }),
-      }),
-    );
+    it('bills nothing for clocking off at the shift end, break and threshold ignored', async () => {
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 18, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 540, overtimeMinutes: 0, status: 'PRESENT' });
+    });
+
+    it('bills nothing for clocking off before the shift end', async () => {
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 17, 30) }),
+      ).resolves.toMatchObject({ overtimeMinutes: 0 });
+    });
+
+    it('bills every minute past the shift end', async () => {
+      // Previously 630 gross - 60 break - 480 threshold = 90; now 90 past 18:00.
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 19, 30) }),
+      ).resolves.toMatchObject({ workingMinutes: 630, overtimeMinutes: 90 });
+    });
+
+    it('bills an overnight shift from the morning it ends', async () => {
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 7, 30) }),
+      ).resolves.toMatchObject({ workingMinutes: 570, overtimeMinutes: 90 });
+    });
+
+    it('scales the half day mark to the shift length instead of a fixed 240', async () => {
+      // 720 span - 60 break = 660 full day, so half of it is 330 — not the 240
+      // every shift used to be measured against.
+      await expect(
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 13, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 300, status: 'ABSENT' });
+      await expect(
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 14, 30) }),
+      ).resolves.toMatchObject({ workingMinutes: 390, status: 'HALF_DAY' });
+      await expect(
+        importOne(splitShift, { punchIn: punchAt(6, 8, 0), punchOut: punchAt(6, 19, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 660, status: 'PRESENT' });
+    });
+
+    it('scales the half day mark off an overnight shift true length', async () => {
+      // 480 span - 60 break = 420 full day, so half of it is 210.
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 1, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 180, status: 'ABSENT' });
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 3, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 300, status: 'HALF_DAY' });
+      await expect(
+        importOne(nightShift, { punchIn: punchAt(6, 22, 0), punchOut: punchAt(7, 5, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 420, status: 'PRESENT' });
+    });
+
+    it('keeps the break slack a working day has, so slight lateness is not a half day', async () => {
+      // 540 span - 60 break = 480 full day: the historical mark. A 09:30 start
+      // is past the 15 minute grace, so this is a full day qualified as LATE —
+      // the point being that it is not docked to HALF_DAY.
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 30), punchOut: punchAt(6, 18, 15) }),
+      ).resolves.toMatchObject({ workingMinutes: 525, status: 'LATE' });
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 17, 0) }),
+      ).resolves.toMatchObject({ workingMinutes: 480, status: 'PRESENT' });
+      await expect(
+        importOne(dayShift, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 16, 59) }),
+      ).resolves.toMatchObject({ workingMinutes: 479, status: 'HALF_DAY' });
+    });
+
+    it('records a missing punch-out with no status guess and no overtime', async () => {
+      await expect(importOne(dayShift, { punchIn: punchAt(6, 9, 0) })).resolves.toMatchObject({
+        status: 'MISSING_PUNCH',
+        workingMinutes: undefined,
+        overtimeMinutes: undefined,
+      });
+    });
+
+    it('falls back to the eight hour marks when no shift resolves', async () => {
+      await expect(
+        importOne(null, { punchIn: punchAt(6, 9, 0), punchOut: punchAt(6, 17, 0) }),
+      ).resolves.toMatchObject({
+        workingMinutes: 480,
+        status: 'PRESENT',
+        overtimeMinutes: undefined,
+      });
+    });
   });
 
   it('blocks imports when the capture mode is disabled', async () => {
@@ -469,6 +915,8 @@ describe('AttendanceService', () => {
       shift: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'shift-1',
+          startTime: '09:00',
+          endTime: '18:00',
           overtimeAfterMinutes: 480,
           halfDayAfterMinutes: 240,
           minWorkingMinutes: 480,
@@ -477,18 +925,22 @@ describe('AttendanceService', () => {
     };
     const service = newAttendanceService(prisma);
 
+    // Wall-clock punches: the shift end they are measured against is local.
+    const punchIn = new Date(2026, 6, 5, 9, 30, 0, 0);
+    const punchOut = new Date(2026, 6, 5, 18, 30, 0, 0);
     await service.updateRecord('tenant-1', 'record-1', {
-      punchIn: '2026-07-05T09:30:00.000Z',
-      punchOut: '2026-07-05T18:30:00.000Z',
+      punchIn: punchIn.toISOString(),
+      punchOut: punchOut.toISOString(),
     });
 
     expect(prisma.attendanceRecord.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'record-1' },
       data: expect.objectContaining({
-        punchIn: new Date('2026-07-05T09:30:00.000Z'),
-        punchOut: new Date('2026-07-05T18:30:00.000Z'),
+        punchIn,
+        punchOut,
         workingMinutes: 540,
-        overtimeMinutes: 60,
+        // 30 minutes past the 18:00 shift end.
+        overtimeMinutes: 30,
         status: 'PRESENT',
       }),
     }));
@@ -1962,6 +2414,7 @@ describe('AttendanceService', () => {
         shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', overtimeAfterMinutes: 480 }) },
         attendanceRecord: { upsert: jest.fn().mockResolvedValue({}) },
         attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+        attendanceRule: { findFirst: jest.fn().mockResolvedValue(null) },
       };
     }
 
