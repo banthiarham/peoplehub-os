@@ -50,6 +50,10 @@ services:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 3001
+      # Attendance shift boundaries are wall-clock and evaluated in the process's
+      # local zone. Kept here as well as in the Dockerfile so an already-built
+      # image cannot fall back to UTC. See apps/api/Dockerfile.
+      TZ: ${TZ:-Asia/Kolkata}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
