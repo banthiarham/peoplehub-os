@@ -30,6 +30,16 @@ describe('WorkflowsService', () => {
     };
     const tx = {
       attendanceRecord: { upsert: jest.fn() },
+      // An approved regularization mirrors its pair into the punch log, so the
+      // day reads the same in punch history as it does in the record.
+      employee: { findUnique: jest.fn().mockResolvedValue({ locationId: 'loc-1' }) },
+      attendancePunchEvent: {
+        deleteMany: jest.fn(),
+        createMany: jest.fn(),
+        // No punches of the employee's own on that day, so the approved pair is
+        // materialised rather than deferring to a real punch log.
+        count: jest.fn().mockResolvedValue(0),
+      },
       approvalRequestHistory: { create: jest.fn() },
       approvalRequest: { update: jest.fn().mockResolvedValue({ ...request, status: 'APPROVED' }) },
     };
@@ -56,6 +66,23 @@ describe('WorkflowsService', () => {
         punchSource: 'MANUAL',
       }),
     });
+    expect(tx.attendancePunchEvent.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [
+          expect.objectContaining({
+            direction: 'IN',
+            eventAt: new Date('2026-07-05T09:00:00.000Z'),
+            locationId: 'loc-1',
+            isSystemGenerated: true,
+          }),
+          expect.objectContaining({
+            direction: 'OUT',
+            eventAt: new Date('2026-07-05T18:00:00.000Z'),
+            isSystemGenerated: true,
+          }),
+        ],
+      }),
+    );
     expect(tx.approvalRequestHistory.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({

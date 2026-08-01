@@ -218,7 +218,10 @@ export class EmployeesService {
       existingUser = found ? { id: found.id, email: found.email } : null;
     }
     const employeeCode = dto.employeeCode ?? (await this.nextEmployeeCode(tenantId));
-    const { createUser, ...rest } = dto;
+    // `authorizedLocationIds` is a join table, not an Employee column. It has to
+    // come out before `toEmployeeData`, which spreads whatever it is given
+    // straight into Prisma.
+    const { createUser, authorizedLocationIds, ...rest } = dto;
     const data = this.toEmployeeData(rest);
     let onboardingCredentials: { email: string; temporaryPassword: string } | undefined;
     const employee = await this.prisma.$transaction(async (tx) => {
@@ -230,6 +233,13 @@ export class EmployeesService {
           status: dto.status ?? 'ACTIVE',
         },
       });
+      await this.syncAuthorizedLocations(
+        tx,
+        tenantId,
+        created.id,
+        created.locationId,
+        authorizedLocationIds ?? [],
+      );
       if (createUser && dto.workEmail) {
         if (existingUser) {
           await tx.employee.update({ where: { id: created.id }, data: { userId: existingUser.id } });
@@ -288,7 +298,10 @@ export class EmployeesService {
 
   async update(user: AuthUser, id: string, dto: UpdateEmployeeDto) {
     const existing = await this.getRaw(user.tenantId, id);
-    const { createUser: _createUser, ...rest } = dto;
+    // Held back from `rest` for the same reason as in `create`: it is a join
+    // table, and letting it reach `toEmployeeData` would send an unknown
+    // argument to Prisma and log a bogus profile-change row for it.
+    const { createUser: _createUser, authorizedLocationIds, ...rest } = dto;
     const entries = Object.entries(rest).filter(([, value]) => value !== undefined);
     const sensitive = entries.filter(([key]) => sensitiveFields.has(key));
     const normal = Object.fromEntries(entries.filter(([key]) => !sensitiveFields.has(key))) as UpdateEmployeeDto;
@@ -313,6 +326,35 @@ export class EmployeesService {
     const updated = changedEntries.length
       ? await this.prisma.employee.update({ where: { id }, data: payload })
       : existing;
+
+    // An explicit list replaces the set. Otherwise the set is left alone, but a
+    // changed primary location still has to be re-flagged and kept authorized —
+    // moving someone's base office must not leave them punching against the old
+    // one's geofence.
+    if (authorizedLocationIds !== undefined) {
+      await this.syncAuthorizedLocations(
+        this.prisma,
+        user.tenantId,
+        id,
+        updated.locationId,
+        authorizedLocationIds,
+      );
+    } else if (updated.locationId !== existing.locationId) {
+      const current = await this.prisma.employeeLocation.findMany({
+        where: { employeeId: id, isPrimary: false },
+        select: { locationId: true },
+      });
+      // Only the deliberately added extras carry over. The former primary is
+      // dropped with the transfer, or moving someone between offices would
+      // quietly leave them able to punch at the one they left.
+      await this.syncAuthorizedLocations(
+        this.prisma,
+        user.tenantId,
+        id,
+        updated.locationId,
+        current.map((row) => row.locationId),
+      );
+    }
 
     if (changedEntries.length > 0) {
       await this.createProfileChanges(user.tenantId, id, user.userId, existing, changedEntries, true);
@@ -505,6 +547,10 @@ export class EmployeesService {
       where: { id, tenantId },
       include: {
         ...employeeListInclude,
+        authorizedLocations: {
+          include: { location: { select: { id: true, name: true, city: true } } },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        },
         dottedManager: { select: { id: true, firstName: true, lastName: true } },
         directReports: {
           select: {
@@ -617,6 +663,50 @@ export class EmployeesService {
         })),
     });
     await this.audit(tenantId, actorUserId, approved ? 'employee.profile_changed' : 'employee.profile_change_pending', 'Employee', employeeId, null, changes);
+  }
+
+  /**
+   * Replaces the set of locations an employee may punch attendance at.
+   *
+   * The primary location is always included whether or not the caller listed
+   * it, so a partial list can never lock someone out of their own office, and
+   * every id is checked against the tenant first so a caller cannot authorize
+   * another workspace's location.
+   *
+   * Purely additive to attendance: an employee whose set is just their primary
+   * location resolves exactly as they did before this table existed.
+   */
+  private async syncAuthorizedLocations(
+    client: Pick<Prisma.TransactionClient, 'location' | 'employeeLocation'>,
+    tenantId: string,
+    employeeId: string,
+    primaryLocationId: string | null,
+    requested: string[],
+  ) {
+    const wanted = [
+      ...new Set([...(primaryLocationId ? [primaryLocationId] : []), ...requested.filter(Boolean)]),
+    ];
+    if (wanted.length) {
+      const valid = await client.location.findMany({
+        where: { id: { in: wanted }, tenantId },
+        select: { id: true },
+      });
+      if (valid.length !== wanted.length) {
+        throw new BadRequestException('One or more locations do not belong to this workspace');
+      }
+    }
+    await client.employeeLocation.deleteMany({
+      // The sentinel keeps an empty `wanted` from becoming `NOT IN ()`; with no
+      // locations at all every row for the employee should go.
+      where: { employeeId, locationId: { notIn: wanted.length ? wanted : ['__none__'] } },
+    });
+    for (const locationId of wanted) {
+      await client.employeeLocation.upsert({
+        where: { employeeId_locationId: { employeeId, locationId } },
+        create: { employeeId, locationId, isPrimary: locationId === primaryLocationId },
+        update: { isPrimary: locationId === primaryLocationId },
+      });
+    }
   }
 
   private toEmployeeData(dto: Partial<CreateEmployeeDto | UpdateEmployeeDto>): Prisma.EmployeeUncheckedCreateInput {

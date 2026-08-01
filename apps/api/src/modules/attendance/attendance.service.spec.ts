@@ -7,10 +7,116 @@ import { ShiftResolutionService } from './shift-resolution.service';
  * separately would let the tests drift from production behaviour.
  */
 function newAttendanceService(prisma: unknown): AttendanceService {
-  return new AttendanceService(
-    prisma as never,
-    new ShiftResolutionService(prisma as never),
-  );
+  const client = withPunchEvents(prisma as Record<string, any>);
+  return new AttendanceService(client as never, new ShiftResolutionService(client as never));
+}
+
+/**
+ * In-memory `attendance_punch_events` table.
+ *
+ * Every punch now appends an event and the daily record is rebuilt from the
+ * day's events, so a double that only stubs `attendanceRecord` would exercise
+ * none of the path under test. Filtering mirrors the real `where` clauses the
+ * service issues rather than accepting anything, so a query that stops matching
+ * fails the test instead of silently returning the whole table.
+ */
+function punchEventTable() {
+  const rows: Array<Record<string, any>> = [];
+  let seq = 0;
+  const dayKey = (row: Record<string, any>) =>
+    `${row.employeeId}|${row.attendanceDate.toISOString().slice(0, 10)}`;
+  const matches = (row: Record<string, any>, where: Record<string, any> = {}): boolean => {
+    // `expandPunchDays` selects a page of days with an OR of (employee, day).
+    if (Array.isArray(where.OR)) return where.OR.some((clause: any) => matches(row, clause));
+    const date = where.attendanceDate;
+    return (
+      (where.employeeId === undefined || row.employeeId === where.employeeId) &&
+      (where.tenantId === undefined || row.tenantId === where.tenantId) &&
+      (where.locationId === undefined || row.locationId === where.locationId) &&
+      (where.isSystemGenerated === undefined ||
+        Boolean(row.isSystemGenerated) === where.isSystemGenerated) &&
+      (date === undefined ||
+        (date instanceof Date
+          ? row.attendanceDate?.getTime?.() === date.getTime()
+          : (date.gte === undefined || row.attendanceDate >= date.gte) &&
+            (date.lte === undefined || row.attendanceDate <= date.lte)))
+    );
+  };
+  return {
+    rows,
+    model: {
+      findMany: jest.fn(({ where }: any = {}) =>
+        Promise.resolve(
+          rows
+            .filter((row) => matches(row, where))
+            .sort((a, b) => a.eventAt.getTime() - b.eventAt.getTime()),
+        ),
+      ),
+      /** Only the `by: [employeeId, attendanceDate, locationId]` shape the report uses. */
+      groupBy: jest.fn(({ where }: any = {}) => {
+        const buckets = new Map<string, any>();
+        for (const row of rows.filter((candidate) => matches(candidate, where))) {
+          const key = `${dayKey(row)}|${row.locationId ?? ''}`;
+          const bucket = buckets.get(key) ?? {
+            employeeId: row.employeeId,
+            attendanceDate: row.attendanceDate,
+            locationId: row.locationId ?? null,
+            _count: { _all: 0 },
+          };
+          bucket._count._all += 1;
+          buckets.set(key, bucket);
+        }
+        return Promise.resolve([...buckets.values()]);
+      }),
+      create: jest.fn(({ data }: any) => {
+        const row = { id: `punch-${++seq}`, isSystemGenerated: false, ...data };
+        rows.push(row);
+        return Promise.resolve(row);
+      }),
+      createMany: jest.fn(({ data }: any) => {
+        for (const item of data) rows.push({ id: `punch-${++seq}`, ...item });
+        return Promise.resolve({ count: data.length });
+      }),
+      deleteMany: jest.fn(({ where }: any = {}) => {
+        let count = 0;
+        for (let index = rows.length - 1; index >= 0; index -= 1) {
+          if (matches(rows[index], where)) {
+            rows.splice(index, 1);
+            count += 1;
+          }
+        }
+        return Promise.resolve({ count });
+      }),
+      count: jest.fn(({ where }: any = {}) =>
+        Promise.resolve(rows.filter((row) => matches(row, where)).length),
+      ),
+    },
+  };
+}
+
+/**
+ * Backfills a prisma double with the pieces the punch path needs — the event
+ * table, a pass-through `$transaction`, and the location lookup that
+ * multi-location punch resolution uses — without disturbing anything a test
+ * has already stubbed for itself.
+ */
+function withPunchEvents(prisma: Record<string, any>): Record<string, any> {
+  if (!prisma.attendancePunchEvent) {
+    const table = punchEventTable();
+    prisma.attendancePunchEvent = table.model;
+    prisma.punchEventRows = table.rows;
+  }
+  if (!prisma.$transaction) {
+    prisma.$transaction = jest.fn((run: any) =>
+      typeof run === 'function' ? run(prisma) : Promise.all(run),
+    );
+  }
+  prisma.location = {
+    findMany: jest.fn().mockResolvedValue([]),
+    findFirst: jest.fn().mockResolvedValue(null),
+    ...(prisma.location ?? {}),
+  };
+  return prisma;
 }
 
 type ExistingRecordFixture = {
@@ -360,17 +466,47 @@ describe('AttendanceService', () => {
      * check-in created and the ledger reads back the row check-out finished.
      * Stubbing each call in isolation is what let a stale status survive.
      */
-    function punchHarness(options?: { rule?: Record<string, any> | null }) {
+    function punchHarness(options?: {
+      rule?: Record<string, any> | null;
+      /** The employee's base location, and any extra location they may punch at. */
+      locationId?: string | null;
+      authorizedLocationIds?: string[];
+      /** Locations with geofences, for resolving which one a fix falls inside. */
+      locations?: Array<{
+        id: string;
+        geoLat: number | null;
+        geoLng: number | null;
+        attendanceRadius: number | null;
+      }>;
+    }) {
       const records = new Map<string, Record<string, any>>();
       const devices = new Map<string, Record<string, any>>();
       let seq = 0;
       const key = (employeeId: string, date: Date) => `${employeeId}|${date.toISOString()}`;
-      return {
+      const baseLocationId = options?.locationId ?? null;
+      // Declared here rather than left to `withPunchEvents` so the returned
+      // shape carries `punchEventRows` for the assertions below.
+      const punches = punchEventTable();
+      const base = {
+        attendancePunchEvent: punches.model,
+        punchEventRows: punches.rows,
+        location: {
+          findMany: jest.fn().mockResolvedValue(options?.locations ?? []),
+          findFirst: jest.fn().mockResolvedValue(null),
+        },
         employee: {
-          findFirst: jest.fn().mockResolvedValue({ locationId: null, workMode: 'REMOTE' }),
+          findFirst: jest.fn().mockResolvedValue({
+            locationId: baseLocationId,
+            workMode: 'REMOTE',
+            authorizedLocations: (options?.authorizedLocationIds ?? []).map((locationId) => ({
+              locationId,
+            })),
+          }),
           findMany: jest
             .fn()
-            .mockResolvedValue([{ id: 'emp-1', employeeCode: 'PH001', locationId: null }]),
+            .mockResolvedValue([
+              { id: 'emp-1', employeeCode: 'PH001', locationId: baseLocationId },
+            ]),
         },
         shiftAssignment: {
           findFirst: jest.fn().mockResolvedValue(null),
@@ -422,8 +558,28 @@ describe('AttendanceService', () => {
             return Promise.resolve(null);
           }),
           findMany: jest.fn(() => Promise.resolve([...records.values()])),
+          // Declared so the record edit and delete paths are typed here too;
+          // those tests substitute their own fixtures.
+          findFirst: jest.fn(() => Promise.resolve(null as Record<string, any> | null)),
+          delete: jest.fn(({ where }: { where: any }) => {
+            for (const [k, row] of records) {
+              if (row.id === where.id) {
+                records.delete(k);
+                return Promise.resolve(row);
+              }
+            }
+            return Promise.resolve(null);
+          }),
         },
       };
+      // Pass-through transaction over the same double, declared here rather
+      // than backfilled by `withPunchEvents` so the record edit and delete
+      // paths — which write inside one — can assert that they used it.
+      const prisma = base as typeof base & { $transaction: jest.Mock };
+      prisma.$transaction = jest.fn((run: any) =>
+        typeof run === 'function' ? run(prisma) : Promise.all(run),
+      );
+      return prisma;
     }
 
     /** The real interactive flow: punch in, wait, punch out. */
@@ -541,8 +697,10 @@ describe('AttendanceService', () => {
         const prisma = punchHarness();
         const service = newAttendanceService(prisma);
         await workDay(service, at(9, 0), at(19, 30));
-        const [{ data }] = prisma.attendanceRecord.update.mock.calls.at(-1) as [{ data: any }];
-        expect(data.shiftId).toBe('shift-1');
+        // The record is now rebuilt from the day's punches, so the punch-out
+        // lands in the same upsert the punch-in used rather than a bare update.
+        const [{ update }] = prisma.attendanceRecord.upsert.mock.calls.at(-1) as [{ update: any }];
+        expect(update.shiftId).toBe('shift-1');
       });
 
       it('surfaces interactive overtime in the monthly summary', async () => {
@@ -709,6 +867,568 @@ describe('AttendanceService', () => {
         halfDay: 0,
         absent: 11,
         attendancePercentage: 0,
+      });
+    });
+
+    describe('multiple punches across locations in one day', () => {
+      /** Base at A, also authorized for B. */
+      const multiSite = () =>
+        punchHarness({ locationId: 'loc-a', authorizedLocationIds: ['loc-a', 'loc-b'] });
+      /** `device` is declared `as never`, so it cannot be spread. */
+      const punch = (extra: Record<string, unknown> = {}) =>
+        ({ deviceId: 'device-1', ...extra }) as never;
+
+      it('takes the first check-in and last check-out as the day, across locations', async () => {
+        const prisma = multiSite();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(13, 0));
+        await service.checkOut(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(14, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-b' }));
+        jest.setSystemTime(at(18, 0));
+        const record = (await service.checkOut(
+          user,
+          punch({ locationId: 'loc-b' }),
+        )) as never as Record<string, any>;
+
+        expect(record.punchIn).toEqual(at(9, 0));
+        expect(record.punchOut).toEqual(at(18, 0));
+        // Gross spans the whole day including the hour of travel, which is what
+        // `workingMinutes` has always meant and what payroll still reads.
+        expect(record.workingMinutes).toBe(540);
+        // Net counts only the two stretches actually on site.
+        expect(record.netMinutes).toBe(480);
+        expect(record.status).toBe('PRESENT');
+      });
+
+      it('records the location of every punch, not just the first', async () => {
+        const prisma = multiSite();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(13, 0));
+        await service.checkOut(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(14, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-b' }));
+
+        expect(
+          prisma.punchEventRows.map((row: any) => [row.direction, row.locationId]),
+        ).toEqual([
+          ['IN', 'loc-a'],
+          ['OUT', 'loc-a'],
+          ['IN', 'loc-b'],
+        ]);
+      });
+
+      it('rejects a second check-in while still checked in', async () => {
+        const service = newAttendanceService(multiSite());
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, device);
+        jest.setSystemTime(at(10, 0));
+        await expect(service.checkIn(user, device)).rejects.toThrow(/already checked in/i);
+      });
+
+      it('rejects a check-out when the employee is not checked in', async () => {
+        const service = newAttendanceService(multiSite());
+        jest.setSystemTime(at(9, 0));
+        await expect(service.checkOut(user, device)).rejects.toThrow('Check in first');
+      });
+
+      it('rejects a punch at a location the employee is not authorized for', async () => {
+        const service = newAttendanceService(multiSite());
+        jest.setSystemTime(at(9, 0));
+        await expect(
+          service.checkIn(user, punch({ locationId: 'loc-z' })),
+        ).rejects.toThrow(/not authorized to punch at this location/i);
+      });
+
+      it('pins the punch to the employee location when no extra location is authorized', async () => {
+        // The pre-existing single-location case: nothing is resolved, and the
+        // punch lands on exactly the location the day is measured against.
+        const prisma = punchHarness({ locationId: 'loc-a' });
+        const service = newAttendanceService(prisma);
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, device);
+
+        expect(prisma.punchEventRows).toHaveLength(1);
+        expect(prisma.punchEventRows[0]).toMatchObject({
+          direction: 'IN',
+          locationId: 'loc-a',
+        });
+        expect(prisma.location.findMany).not.toHaveBeenCalled();
+      });
+
+      it('resolves the punch to whichever authorized geofence the fix falls inside', async () => {
+        const prisma = punchHarness({
+          locationId: 'loc-a',
+          authorizedLocationIds: ['loc-a', 'loc-b'],
+          locations: [
+            { id: 'loc-a', geoLat: 12.9, geoLng: 77.6, attendanceRadius: 100 },
+            { id: 'loc-b', geoLat: 19.07, geoLng: 72.87, attendanceRadius: 100 },
+          ],
+        });
+        const service = newAttendanceService(prisma);
+        jest.setSystemTime(at(9, 0));
+        // Standing at B, with no explicit location in the payload.
+        await service.checkIn(user, punch({ geoLat: 19.07, geoLng: 72.87, geoAccuracy: 10 }));
+
+        expect(prisma.punchEventRows[0]).toMatchObject({ locationId: 'loc-b' });
+      });
+
+      it('checks out at the location the employee checked in at, not their primary', async () => {
+        // The portal sends only the device id on check-out, so nothing in the
+        // payload names a location. Falling back to the scheduled location
+        // recorded the punch-out at an office the employee was never in.
+        const prisma = multiSite();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(13, 0));
+        await service.checkOut(user, device);
+        jest.setSystemTime(at(14, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-b' }));
+        jest.setSystemTime(at(18, 0));
+        await service.checkOut(user, device);
+
+        expect(
+          prisma.punchEventRows.map((row: any) => [row.direction, row.locationId]),
+        ).toEqual([
+          ['IN', 'loc-a'],
+          ['OUT', 'loc-a'],
+          ['IN', 'loc-b'],
+          // loc-b, where they actually were — not loc-a, the primary.
+          ['OUT', 'loc-b'],
+        ]);
+      });
+
+      it('still lets an explicit location on the check-out win', async () => {
+        // Checked in at A, walked to B, punched out there.
+        const prisma = multiSite();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(18, 0));
+        await service.checkOut(user, punch({ locationId: 'loc-b' }));
+
+        expect(prisma.punchEventRows[1]).toMatchObject({ direction: 'OUT', locationId: 'loc-b' });
+      });
+
+      it('refuses to punch a day that has already been finalized', async () => {
+        const prisma = multiSite();
+        const service = newAttendanceService(prisma);
+        prisma.attendanceRecord.findUnique.mockResolvedValueOnce({ isFinalized: true });
+
+        jest.setSystemTime(at(9, 0));
+        await expect(service.checkIn(user, device)).rejects.toThrow(/finalized/i);
+      });
+    });
+
+    describe('punch history mirrors the non-interactive write paths', () => {
+      it('writes a punch pair for an imported row', async () => {
+        const prisma = punchHarness({ locationId: 'loc-a' });
+        await newAttendanceService(prisma).importAttendanceRows(
+          'tenant-1',
+          {
+            rows: [
+              {
+                employeeCode: 'PH001',
+                date: '2026-07-15',
+                punchIn: at(9, 0).toISOString(),
+                punchOut: at(18, 0).toISOString(),
+              },
+            ],
+          },
+          'BIOMETRIC',
+        );
+
+        expect(prisma.punchEventRows.map((row: any) => row.direction)).toEqual(['IN', 'OUT']);
+        expect(prisma.punchEventRows[0]).toMatchObject({
+          locationId: 'loc-a',
+          isSystemGenerated: true,
+          source: 'BIOMETRIC',
+        });
+      });
+
+      it('does not stack a second copy of every punch when a file is re-imported', async () => {
+        const prisma = punchHarness({ locationId: 'loc-a' });
+        const service = newAttendanceService(prisma);
+        const upload = {
+          rows: [
+            {
+              employeeCode: 'PH001',
+              date: '2026-07-15',
+              punchIn: at(9, 0).toISOString(),
+              punchOut: at(18, 0).toISOString(),
+            },
+          ],
+        };
+
+        await service.importAttendanceRows('tenant-1', upload, 'BIOMETRIC');
+        await service.importAttendanceRows('tenant-1', upload, 'BIOMETRIC');
+
+        expect(prisma.punchEventRows).toHaveLength(2);
+      });
+
+      it('leaves punched events alone and adds no derived pair when HR corrects the day', async () => {
+        const prisma = punchHarness({ locationId: 'loc-a' });
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, device);
+        jest.setSystemTime(at(17, 0));
+        await service.checkOut(user, device);
+
+        await service.applyRegularization('tenant-1', 'emp-1', {
+          date: new Date(Date.UTC(2026, 6, 15)),
+          punchIn: at(9, 0),
+          punchOut: at(19, 30),
+          reason: 'Forgot to punch out',
+        });
+
+        // The employee's own punches are the evidence the correction was made
+        // against, so they survive it untouched...
+        expect(prisma.punchEventRows.map((row: any) => row.eventAt)).toEqual([at(9, 0), at(17, 0)]);
+        // ...and no synthetic pair is laid on top of them, which would double
+        // the day's punch count and misreport it as a multi-punch day.
+        expect(prisma.punchEventRows.some((row: any) => row.isSystemGenerated)).toBe(false);
+      });
+    });
+
+    describe('record edits and deletes keep punch history honest', () => {
+      const day = new Date(Date.UTC(2026, 6, 15));
+
+      /** Seeds a day of punches and returns the harness holding them. */
+      function seeded(
+        punches: Array<[('IN' | 'OUT'), Date, string | null, boolean]>,
+        options?: { locationId?: string | null },
+      ) {
+        const prisma = punchHarness({ locationId: options?.locationId ?? 'loc-a' });
+        punches.forEach(([direction, eventAt, locationId, isSystemGenerated], index) => {
+          prisma.punchEventRows.push({
+            id: `seed-${index}`,
+            tenantId: 'tenant-1',
+            employeeId: 'emp-1',
+            attendanceDate: day,
+            eventAt,
+            direction,
+            locationId,
+            source: isSystemGenerated ? 'MANUAL' : 'WEB',
+            isSystemGenerated,
+          });
+        });
+        prisma.attendanceRecord.findFirst = jest.fn().mockResolvedValue({
+          id: 'record-1',
+          tenantId: 'tenant-1',
+          employeeId: 'emp-1',
+          date: day,
+          status: 'PRESENT',
+          punchIn: at(9, 0),
+          punchOut: at(18, 0),
+          punchSource: 'MANUAL',
+          remarks: null,
+          isFinalized: false,
+          employee: { id: 'emp-1', locationId: 'loc-a' },
+        });
+        prisma.attendanceRecord.delete = jest.fn().mockResolvedValue({ id: 'record-1' });
+        prisma.attendanceRecord.update = jest.fn().mockResolvedValue({ id: 'record-1' });
+        return prisma;
+      }
+
+      it('drops the derived events when the record they came from is deleted', async () => {
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', true],
+          ['OUT', at(18, 0), 'loc-b', true],
+        ]);
+
+        await newAttendanceService(prisma).deleteRecord('tenant-1', 'record-1');
+
+        expect(prisma.attendanceRecord.delete).toHaveBeenCalled();
+        expect(prisma.punchEventRows).toHaveLength(0);
+      });
+
+      it('keeps the employee’s own punches when their record is deleted', async () => {
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', false],
+          ['OUT', at(13, 0), 'loc-b', false],
+          ['IN', at(14, 0), 'loc-a', true],
+        ]);
+
+        await newAttendanceService(prisma).deleteRecord('tenant-1', 'record-1');
+
+        // Only what the record itself produced goes; punch evidence survives.
+        expect(prisma.punchEventRows.map((row: any) => [row.direction, row.eventAt])).toEqual([
+          ['IN', at(9, 0)],
+          ['OUT', at(13, 0)],
+        ]);
+      });
+
+      it('deletes the record and its events in one transaction', async () => {
+        const prisma = seeded([['IN', at(9, 0), 'loc-a', true]]);
+        await newAttendanceService(prisma).deleteRecord('tenant-1', 'record-1');
+        expect(prisma.$transaction).toHaveBeenCalled();
+      });
+
+      it('rebuilds the derived pair in place rather than duplicating it', async () => {
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', true],
+          ['OUT', at(18, 0), 'loc-b', true],
+        ]);
+
+        await newAttendanceService(prisma).updateRecord('tenant-1', 'record-1', {
+          punchOut: at(19, 30).toISOString(),
+        });
+
+        expect(prisma.punchEventRows).toHaveLength(2);
+        expect(prisma.punchEventRows.map((row: any) => [row.direction, row.eventAt])).toEqual([
+          ['IN', at(9, 0)],
+          ['OUT', at(19, 30)],
+        ]);
+      });
+
+      it('keeps a corrected day at the location its punches were actually at', async () => {
+        // The bug this guards: reaching for the employee's base location moved
+        // a day worked at a second site back to their home office on every edit.
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', true],
+          ['OUT', at(18, 0), 'loc-b', true],
+        ]);
+
+        await newAttendanceService(prisma).updateRecord('tenant-1', 'record-1', {
+          punchOut: at(19, 30).toISOString(),
+        });
+
+        expect(prisma.punchEventRows.every((row: any) => row.locationId === 'loc-b')).toBe(true);
+      });
+
+      it('moves the derived pair to the corrected location when one is given', async () => {
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', true],
+          ['OUT', at(18, 0), 'loc-b', true],
+        ]);
+        prisma.location.findFirst = jest.fn().mockResolvedValue({ id: 'loc-c' });
+
+        await newAttendanceService(prisma).updateRecord('tenant-1', 'record-1', {
+          locationId: 'loc-c',
+        });
+
+        expect(prisma.punchEventRows.every((row: any) => row.locationId === 'loc-c')).toBe(true);
+      });
+
+      it('adds no derived pair to a day the employee actually punched', async () => {
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', false],
+          ['OUT', at(13, 0), 'loc-b', false],
+          ['IN', at(14, 0), 'loc-b', false],
+          ['OUT', at(18, 0), 'loc-b', false],
+        ]);
+
+        await newAttendanceService(prisma).updateRecord('tenant-1', 'record-1', {
+          punchOut: at(19, 30).toISOString(),
+        });
+
+        // Four punches, still four — the correction does not inflate the day.
+        expect(prisma.punchEventRows).toHaveLength(4);
+        expect(prisma.punchEventRows.some((row: any) => row.isSystemGenerated)).toBe(false);
+      });
+
+      it('clears the old day’s derived events when a record is moved', async () => {
+        const prisma = seeded([
+          ['IN', at(9, 0), 'loc-b', true],
+          ['OUT', at(18, 0), 'loc-b', true],
+        ]);
+        prisma.attendanceRecord.findUnique = jest.fn().mockResolvedValue(null);
+
+        await newAttendanceService(prisma).updateRecord('tenant-1', 'record-1', {
+          date: '2026-07-16',
+        });
+
+        const moved = new Date(Date.UTC(2026, 6, 16));
+        // Nothing left on the day it came from, the pair rebuilt on the new one.
+        expect(
+          prisma.punchEventRows.every(
+            (row: any) => row.attendanceDate.getTime() === moved.getTime(),
+          ),
+        ).toBe(true);
+        expect(prisma.punchEventRows).toHaveLength(2);
+      });
+
+      it('refuses to move a record onto a day the employee already has one for', async () => {
+        const prisma = seeded([['IN', at(9, 0), 'loc-a', true]]);
+        prisma.attendanceRecord.findUnique = jest
+          .fn()
+          .mockResolvedValue({ id: 'record-other' });
+
+        await expect(
+          newAttendanceService(prisma).updateRecord('tenant-1', 'record-1', {
+            date: '2026-07-16',
+          }),
+        ).rejects.toThrow(/already has an attendance record/i);
+      });
+    });
+
+    describe('punch history report', () => {
+      const day = (offset: number) => new Date(Date.UTC(2026, 6, 15 - offset));
+
+      /**
+       * Seeds punches directly so a range of days with different shapes can be
+       * built without driving four punches through the service for each one.
+       */
+      function historyHarness() {
+        const prisma = punchHarness();
+        let seq = 0;
+        const seed = (
+          employeeId: string,
+          attendanceDate: Date,
+          punches: Array<[('IN' | 'OUT'), number, string | null]>,
+        ) => {
+          for (const [direction, hour, locationId] of punches) {
+            prisma.punchEventRows.push({
+              id: `seed-${(seq += 1)}`,
+              tenantId: 'tenant-1',
+              employeeId,
+              attendanceDate,
+              eventAt: new Date(2026, 6, 15, hour, 0, 0, 0),
+              direction,
+              locationId,
+              source: 'WEB',
+              isSystemGenerated: false,
+            });
+          }
+        };
+        return { prisma, seed };
+      }
+
+      it('hides ordinary single check-in/check-out days by default', async () => {
+        const { prisma, seed } = historyHarness();
+        // Ordinary day — already visible under the attendance record view.
+        seed('emp-1', day(0), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 18, 'loc-a'],
+        ]);
+        // Two pairs at one location.
+        seed('emp-2', day(1), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 13, 'loc-a'],
+          ['IN', 14, 'loc-a'],
+          ['OUT', 18, 'loc-a'],
+        ]);
+        // One pair, but the location changed mid-day.
+        seed('emp-3', day(2), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 18, 'loc-b'],
+        ]);
+
+        const result = await newAttendanceService(prisma).listPunchEvents('tenant-1', {});
+
+        expect(result.meta).toMatchObject({ total: 2, scope: 'MULTI' });
+        expect(result.data.map((row) => row.employeeId)).toEqual(['emp-2', 'emp-3']);
+      });
+
+      it('returns every day with punches when the scope is ALL', async () => {
+        const { prisma, seed } = historyHarness();
+        seed('emp-1', day(0), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 18, 'loc-a'],
+        ]);
+        seed('emp-2', day(1), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 13, 'loc-a'],
+          ['IN', 14, 'loc-b'],
+          ['OUT', 18, 'loc-b'],
+        ]);
+
+        const result = await newAttendanceService(prisma).listPunchEvents('tenant-1', {
+          scope: 'ALL',
+        });
+
+        expect(result.meta).toMatchObject({ total: 2, scope: 'ALL' });
+        expect(result.data.map((row) => row.employeeId)).toEqual(['emp-1', 'emp-2']);
+      });
+
+      it('groups a day into one row carrying all of its punches', async () => {
+        const { prisma, seed } = historyHarness();
+        seed('emp-1', day(0), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 13, 'loc-a'],
+          ['IN', 14, 'loc-b'],
+          ['OUT', 18, 'loc-b'],
+        ]);
+
+        const [row] = (await newAttendanceService(prisma).listPunchEvents('tenant-1', {})).data;
+
+        expect(row).toMatchObject({ employeeId: 'emp-1', punchCount: 4, isOpen: false });
+        expect(row.events.map((event: any) => [event.direction, event.locationId])).toEqual([
+          ['IN', 'loc-a'],
+          ['OUT', 'loc-a'],
+          ['IN', 'loc-b'],
+          ['OUT', 'loc-b'],
+        ]);
+        // 09:00 to 18:00 gross, less the hour between the two stretches.
+        expect(row.grossMinutes).toBe(540);
+        expect(row.netMinutes).toBe(480);
+      });
+
+      it('paginates by day, never splitting a day across pages', async () => {
+        const { prisma, seed } = historyHarness();
+        for (let index = 0; index < 5; index += 1) {
+          seed(`emp-${index}`, day(index), [
+            ['IN', 9, 'loc-a'],
+            ['OUT', 13, 'loc-a'],
+            ['IN', 14, 'loc-a'],
+            ['OUT', 18, 'loc-a'],
+          ]);
+        }
+        const service = newAttendanceService(prisma);
+
+        const first = await service.listPunchEvents('tenant-1', { page: 1, pageSize: 2 });
+        const second = await service.listPunchEvents('tenant-1', { page: 2, pageSize: 2 });
+        const last = await service.listPunchEvents('tenant-1', { page: 3, pageSize: 2 });
+
+        expect(first.meta).toMatchObject({ total: 5, totalPages: 3, page: 1 });
+        // Newest day first, and every row carries its day whole.
+        expect(first.data.map((row) => row.employeeId)).toEqual(['emp-0', 'emp-1']);
+        expect(second.data.map((row) => row.employeeId)).toEqual(['emp-2', 'emp-3']);
+        expect(last.data.map((row) => row.employeeId)).toEqual(['emp-4']);
+        for (const row of [...first.data, ...second.data, ...last.data]) {
+          expect(row.events).toHaveLength(4);
+        }
+      });
+
+      it('filters to one employee and date range before deciding which days qualify', async () => {
+        const { prisma, seed } = historyHarness();
+        seed('emp-1', day(0), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 13, 'loc-a'],
+          ['IN', 14, 'loc-b'],
+          ['OUT', 18, 'loc-b'],
+        ]);
+        seed('emp-2', day(0), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 13, 'loc-a'],
+          ['IN', 14, 'loc-b'],
+          ['OUT', 18, 'loc-b'],
+        ]);
+        seed('emp-1', day(9), [
+          ['IN', 9, 'loc-a'],
+          ['OUT', 13, 'loc-a'],
+          ['IN', 14, 'loc-b'],
+          ['OUT', 18, 'loc-b'],
+        ]);
+
+        const result = await newAttendanceService(prisma).listPunchEvents('tenant-1', {
+          employeeId: 'emp-1',
+          from: '2026-07-14',
+          to: '2026-07-15',
+        });
+
+        expect(result.meta.total).toBe(1);
+        expect(result.data[0]).toMatchObject({ employeeId: 'emp-1', date: day(0) });
       });
     });
   });
@@ -912,6 +1632,9 @@ describe('AttendanceService', () => {
         update: jest.fn().mockResolvedValue({ id: 'record-1' }),
       },
       shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      // Reached only when the day has no punches at all, which is this fixture:
+      // the derived pair then falls back to the scheduled location.
+      employee: { findFirst: jest.fn().mockResolvedValue({ locationId: 'loc-a' }) },
       shift: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'shift-1',
