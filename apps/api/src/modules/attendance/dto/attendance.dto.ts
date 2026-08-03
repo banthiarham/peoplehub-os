@@ -69,6 +69,12 @@ export class CheckInDto {
   @IsOptional()
   @IsString()
   locationId?: string;
+      'Browser-reported reason no GPS fix was available, sent instead of geoLat/geoLng so a geofence rejection is traceable server-side',
+    enum: ['denied', 'unavailable'],
+  })
+  @IsOptional()
+  @IsIn(['denied', 'unavailable'])
+  geoErrorReason?: 'denied' | 'unavailable';
 }
 
 export class QrPunchDto extends CheckInDto {

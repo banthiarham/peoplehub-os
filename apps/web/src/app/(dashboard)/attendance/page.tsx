@@ -420,14 +420,16 @@ export default function AttendancePage() {
 
   const checkIn = useMutation({
     mutationFn: async () => {
-      const fix = await captureFreshFix();
+      const { fix, reason } = await captureFreshFix();
       return api
         .post('/attendance/check-in', {
           deviceId: getDeviceId(),
           ...getDeviceInfo(),
           ...(fix
             ? { geoLat: fix.lat, geoLng: fix.lng, geoAccuracy: fix.accuracy, fixAt: fix.timestamp }
-            : {}),
+            : reason
+              ? { geoErrorReason: reason }
+              : {}),
         })
         .then((r) => ({ record: r.data, coords: fix }));
     },

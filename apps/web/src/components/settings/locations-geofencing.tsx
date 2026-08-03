@@ -116,7 +116,7 @@ export function LocationsGeofencing() {
 
   const useMyLocation = async () => {
     setLocating(true);
-    const fix = await captureFreshFix();
+    const { fix } = await captureFreshFix();
     setLocating(false);
     if (!fix) {
       toast('Could not get a GPS fix — allow location access and try again', 'error');

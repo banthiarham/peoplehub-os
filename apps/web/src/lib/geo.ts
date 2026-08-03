@@ -79,19 +79,30 @@ export function useLiveLocation(active: boolean): {
   return { fix, status, isPrecise, ageMs };
 }
 
+export interface FreshFixResult {
+  fix: LiveFix | null;
+  /** Why no fix arrived, when `fix` is null — for server-side traceability. */
+  reason?: 'denied' | 'unavailable';
+}
+
 /**
  * One-shot precise capture for flows without live UI: streams fixes until one
  * reaches the target accuracy, or the deadline passes (then the best fresh
- * fix so far is returned; null if nothing usable arrived).
+ * fix so far is returned; null if nothing usable arrived). When nothing
+ * arrives, `reason` carries why, so a caller can report it to the server
+ * instead of the failure being untraceable after the fact.
  */
-export function captureFreshFix(maxWaitMs = 12_000): Promise<LiveFix | null> {
+export function captureFreshFix(maxWaitMs = 12_000): Promise<FreshFixResult> {
   return new Promise((resolve) => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) return resolve(null);
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      return resolve({ fix: null, reason: 'unavailable' });
+    }
     let best: LiveFix | null = null;
+    let reason: 'denied' | 'unavailable' | undefined;
     const finish = () => {
       clearTimeout(deadline);
       navigator.geolocation.clearWatch(watchId);
-      resolve(best);
+      resolve({ fix: best, reason: best ? undefined : reason });
     };
     const deadline = setTimeout(finish, maxWaitMs);
     const watchId = navigator.geolocation.watchPosition(
@@ -105,7 +116,10 @@ export function captureFreshFix(maxWaitMs = 12_000): Promise<LiveFix | null> {
         if (!best || f.accuracy <= best.accuracy) best = f;
         if (f.accuracy <= TARGET_ACCURACY_M) finish();
       },
-      () => finish(),
+      (err) => {
+        reason = err.code === err.PERMISSION_DENIED ? 'denied' : 'unavailable';
+        finish();
+      },
       { enableHighAccuracy: true, maximumAge: 0, timeout: maxWaitMs },
     );
   });

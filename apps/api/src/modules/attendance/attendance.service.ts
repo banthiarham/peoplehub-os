@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -181,6 +182,8 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
 
 @Injectable()
 export class AttendanceService {
+  private readonly logger = new Logger(AttendanceService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly shifts: ShiftResolutionService,
@@ -802,6 +805,14 @@ export class AttendanceService {
       return;
     }
     if (dto.geoLat == null || dto.geoLng == null) {
+      // The browser never reports *why* a fix is missing to anywhere but the
+      // client — without this, an incident like "check-in blocked" is
+      // undiagnosable after the fact. geoErrorReason carries that context so
+      // it's at least visible in the logs, even though the client-facing
+      // message stays the same.
+      this.logger.warn(
+        `Check-in blocked at ${loc.name} for employee ${employeeId}: no GPS fix (browser reason: ${dto.geoErrorReason ?? 'not reported'})`,
+      );
       throw new BadRequestException(
         `Location is required to check in at ${loc.name} — allow location access and try again`,
       );
