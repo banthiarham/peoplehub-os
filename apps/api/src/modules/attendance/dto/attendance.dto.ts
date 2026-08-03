@@ -69,6 +69,9 @@ export class CheckInDto {
   @IsOptional()
   @IsString()
   locationId?: string;
+
+  @ApiPropertyOptional({
+    description:
       'Browser-reported reason no GPS fix was available, sent instead of geoLat/geoLng so a geofence rejection is traceable server-side',
     enum: ['denied', 'unavailable'],
   })
