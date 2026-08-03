@@ -30,11 +30,14 @@ export function InstallPrompt({ className }: { className?: string }) {
       role="region"
       aria-label={`Install ${BRAND.name}`}
       className={cn(
-        'fixed z-40 animate-slide-down-fade rounded-2xl border border-line bg-card p-4 shadow-lg motion-reduce:animate-none',
+        // z-10 keeps this under the sticky top bar's z-20 stacking context, so the
+        // notifications popover, profile menu and mobile nav — which all drop down from
+        // inside that header into this same corner — stay above the banner.
+        'fixed z-10 animate-slide-down-fade rounded-2xl border border-line bg-card p-4 shadow-lg motion-reduce:animate-none md:px-3.5 md:py-3',
         className,
       )}
     >
-      <div className="flex items-start gap-3">
+      <div className="flex items-start gap-3 md:gap-2.5">
         {/* Decorative: the adjacent heading already names the app. */}
         <img
           src="/icons/pwa/icon-192x192.png"
@@ -42,7 +45,7 @@ export function InstallPrompt({ className }: { className?: string }) {
           aria-hidden="true"
           width={40}
           height={40}
-          className="h-10 w-10 shrink-0 rounded-xl border border-line/70"
+          className="h-10 w-10 shrink-0 rounded-xl border border-line/70 md:h-9 md:w-9"
         />
 
         <div className="min-w-0 flex-1">
@@ -62,7 +65,7 @@ export function InstallPrompt({ className }: { className?: string }) {
             </p>
           )}
 
-          <div className="mt-3 flex items-center gap-2">
+          <div className="mt-3 flex items-center gap-2 md:mt-2.5">
             {hasNativePrompt && (
               <Button size="sm" onClick={() => void promptInstall()}>
                 Install

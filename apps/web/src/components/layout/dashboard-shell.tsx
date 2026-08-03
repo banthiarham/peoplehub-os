@@ -33,8 +33,10 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           <Topbar />
           <main className="mx-auto max-w-[1640px] px-4 py-5 sm:px-6 lg:px-8">{children}</main>
         </div>
-        {/* 4.5rem clears the 4rem sticky top bar with an 8px gap. */}
-        <InstallPrompt className="inset-x-4 top-[4.5rem] mx-auto max-w-[460px]" />
+        {/* 4.5rem clears the 4rem sticky top bar with an 8px gap — at every width,
+            because the top bar is present on mobile too. Full-bleed with 16px margins
+            on phones, a compact right-aligned card from md up. */}
+        <InstallPrompt className="inset-x-4 top-[4.5rem] md:left-auto md:right-6 md:w-[380px]" />
       </div>
     </CommandPaletteProvider>
   );
