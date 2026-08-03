@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LogOut, Menu, Search, X } from 'lucide-react';
+import { Download, LogOut, Menu, Search, X } from 'lucide-react';
 import { signOut, useSession } from 'next-auth/react';
 import { useState } from 'react';
 import { Avatar } from '@/components/ui/avatar';
@@ -10,10 +10,15 @@ import { NAV_SECTIONS } from '@/config/nav';
 import { BRAND } from '@/config/brand';
 import { useCommandPalette } from '@/components/command-palette';
 import { NotificationsMenu } from '@/components/layout/notifications-menu';
+import { useInstallPrompt } from '@/components/pwa/use-install-prompt';
 import { cn } from '@/lib/utils';
 
 export function Topbar() {
   const { data: session } = useSession();
+  // Keeps installing reachable after the banner has been dismissed. Limited to browsers
+  // that expose the real prompt — the manual-instruction browsers are served by the
+  // banner, which returns on its own once the dismissal window lapses.
+  const { hasNativePrompt, promptInstall } = useInstallPrompt();
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const pathname = usePathname();
@@ -73,6 +78,17 @@ export function Topbar() {
             {menuOpen && (
               <div className="absolute right-0 top-full mt-2 w-56 rounded-2xl border border-line bg-white p-1 shadow-xl">
                 <p className="truncate px-3 py-2 text-xs text-ink-muted">{email || tenantName}</p>
+                {hasNativePrompt && (
+                  <button
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void promptInstall();
+                    }}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-ink-muted hover:bg-canvas"
+                  >
+                    <Download className="h-4 w-4" /> Install {BRAND.name}
+                  </button>
+                )}
                 <button
                   onClick={() => signOut({ callbackUrl: '/' })}
                   className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-danger hover:bg-red-50"

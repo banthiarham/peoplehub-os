@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { CommandPaletteProvider } from '@/components/command-palette';
 import { Sidebar } from '@/components/layout/sidebar';
 import { Topbar } from '@/components/layout/topbar';
+import { InstallPrompt } from '@/components/pwa/install-prompt';
 import { cn } from '@/lib/utils';
 
 const SIDEBAR_STORAGE_KEY = 'peoplehub.sidebar.collapsed.v2';
@@ -32,6 +33,8 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           <Topbar />
           <main className="mx-auto max-w-[1640px] px-4 py-5 sm:px-6 lg:px-8">{children}</main>
         </div>
+        {/* 4.5rem clears the 4rem sticky top bar with an 8px gap. */}
+        <InstallPrompt className="inset-x-4 top-[4.5rem] mx-auto max-w-[460px]" />
       </div>
     </CommandPaletteProvider>
   );
