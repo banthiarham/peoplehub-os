@@ -2,9 +2,16 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { AttendanceCaptureMode, AttendanceStatus, Prisma, ShiftSwapStatus } from '@prisma/client';
+import {
+  AttendanceCaptureMode,
+  AttendanceStatus,
+  Prisma,
+  PunchDirection,
+  ShiftSwapStatus,
+} from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import {
@@ -15,6 +22,12 @@ import {
 import { toCsv } from '../../common/utils/csv';
 import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
 import { workedDayStatus } from './attendance-status';
+import {
+  nextPunchDirection,
+  summarisePunchEvents,
+  syncSystemPunchEvents,
+  type PunchEventLike,
+} from './punch-events';
 import { earlyDeparture, isLateArrival, overtimeAfterShiftEnd } from './shift-timing';
 import {
   AssignShiftDto,
@@ -28,6 +41,7 @@ import {
   ImportBiometricPunchesDto,
   ImportRosterDto,
   ListAttendanceDto,
+  ListPunchEventsDto,
   ListShiftAssignmentsDto,
   QrPunchDto,
   RegularizeDto,
@@ -164,6 +178,8 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
 
 @Injectable()
 export class AttendanceService {
+  private readonly logger = new Logger(AttendanceService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly shifts: ShiftResolutionService,
@@ -354,10 +370,270 @@ export class AttendanceService {
     }
   }
 
+  /**
+   * A finalized day has already been costed into payroll, so a punch may not
+   * rewrite it — the same guard `updateRecord` and `deleteRecord` already
+   * apply to the record itself.
+   */
+  private async assertDayNotFinalized(employeeId: string, date: Date) {
+    const record = await this.prisma.attendanceRecord.findUnique({
+      where: { employeeId_date: { employeeId, date } },
+      select: { isFinalized: true },
+    });
+    if (record?.isFinalized) {
+      throw new BadRequestException(
+        'Attendance for this day is finalized and can no longer be punched',
+      );
+    }
+  }
+
+  /**
+   * Which location one individual punch happened at.
+   *
+   * This governs the geofence and capture mode for that punch alone. The day
+   * still has exactly one *effective* location — the one the attendance rule,
+   * status and overtime are resolved against — so working at a second location
+   * cannot change how the day is measured.
+   *
+   * Precedence:
+   * 1. An explicit `locationId`, rejected when it is not authorized. A QR scan
+   *    is this case: the code names where the punch happened.
+   * 2. The authorized location whose geofence the GPS fix falls inside.
+   * 3. `fallback` — for a check-out, the location of the check-in it closes, so
+   *    a punch-out with no payload lands where the employee actually is.
+   * 4. The effective location.
+   *
+   * An employee with no extra authorized locations resolves to the effective
+   * location without a single additional decision, which is precisely the
+   * behaviour that existed before multi-location punching.
+   */
+  private async resolvePunchLocation(
+    tenantId: string,
+    employeeId: string,
+    effectiveLocationId: string | null,
+    dto: CheckInDto,
+    fallbackLocationId?: string | null,
+  ): Promise<string | null> {
+    const fallback = fallbackLocationId ?? effectiveLocationId;
+    const authorized = await this.shifts.authorizedLocationIds(
+      tenantId,
+      employeeId,
+      effectiveLocationId,
+    );
+
+    if (dto.locationId) {
+      if (!authorized.includes(dto.locationId)) {
+        throw new ForbiddenException('You are not authorized to punch at this location');
+      }
+      return dto.locationId;
+    }
+    if (authorized.length <= 1 || dto.geoLat == null || dto.geoLng == null) {
+      return fallback;
+    }
+    const matched = await this.nearestAuthorizedLocation(
+      tenantId,
+      authorized,
+      dto.geoLat,
+      dto.geoLng,
+    );
+    return matched ?? fallback;
+  }
+
+  /**
+   * Where the employee is currently checked in, or null when they are not.
+   *
+   * A check-out with no location in its payload belongs here, not at the
+   * employee's scheduled location: someone who checked in at a second site and
+   * punches out from the portal — which sends only the device id — would
+   * otherwise have the punch-out recorded at an office they were never in, and
+   * the day's last location would be wrong in every report.
+   */
+  private openPunchLocationId(events: Array<{ direction: PunchDirection; locationId: string | null }>) {
+    const last = events[events.length - 1];
+    return last?.direction === PunchDirection.IN ? last.locationId : null;
+  }
+
+  /**
+   * The nearest authorized location whose geofence the fix actually falls
+   * inside. `null` when it falls inside none of them, which leaves the punch on
+   * the effective location so `validateGeofence` rejects it with the message
+   * naming where the employee was expected — rather than silently snapping the
+   * punch to whichever office happens to be closest.
+   */
+  private async nearestAuthorizedLocation(
+    tenantId: string,
+    locationIds: string[],
+    lat: number,
+    lng: number,
+  ): Promise<string | null> {
+    const locations = await this.prisma.location.findMany({
+      where: { id: { in: locationIds }, tenantId, isActive: true },
+      select: { id: true, geoLat: true, geoLng: true, attendanceRadius: true },
+    });
+    let best: string | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const location of locations) {
+      if (location.geoLat == null || location.geoLng == null || !location.attendanceRadius) continue;
+      const distance = haversineMeters(lat, lng, location.geoLat, location.geoLng);
+      if (distance <= location.attendanceRadius && distance < bestDistance) {
+        best = location.id;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Appends one punch and rebuilds the day's record from every punch on it.
+   *
+   * Both happen in one transaction, and the direction is re-checked inside it,
+   * so two punches racing each other cannot leave the day with two consecutive
+   * check-ins or a record that disagrees with its own events.
+   */
+  private async recordPunch(input: {
+    tenantId: string;
+    employeeId: string;
+    date: Date;
+    direction: PunchDirection;
+    eventAt: Date;
+    locationId: string | null;
+    shift: { id: string; startTime: string; endTime: string } | null;
+    effectiveLocationId: string | null;
+    source: string;
+    dto: CheckInDto;
+  }) {
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.attendancePunchEvent.findMany({
+        where: { employeeId: input.employeeId, attendanceDate: input.date },
+        orderBy: { eventAt: 'asc' },
+      });
+      this.assertPunchDirection(existing, input.direction);
+      await tx.attendancePunchEvent.create({
+        data: {
+          tenantId: input.tenantId,
+          employeeId: input.employeeId,
+          attendanceDate: input.date,
+          eventAt: input.eventAt,
+          direction: input.direction,
+          locationId: input.locationId,
+          shiftId: input.shift?.id,
+          source: input.source,
+          geoLat: input.dto.geoLat,
+          geoLng: input.dto.geoLng,
+          geoAccuracy: input.dto.geoAccuracy,
+          deviceId: input.dto.deviceId,
+        },
+      });
+      return this.rebuildDayRecord(tx, {
+        tenantId: input.tenantId,
+        employeeId: input.employeeId,
+        date: input.date,
+        shift: input.shift,
+        effectiveLocationId: input.effectiveLocationId,
+        // Live punches resolve their attendance rule against the current
+        // instant, the way the punch path always has. Passing the day anchor
+        // instead would pull in a rule on its own final day and change the
+        // grace period a punch is judged by.
+        ruleAt: new Date(),
+      });
+    });
+  }
+
+  /** Rejects a punch that repeats the direction of the day's last punch. */
+  private assertPunchDirection(events: PunchEventLike[], direction: PunchDirection) {
+    if (nextPunchDirection(events) === direction) return;
+    throw new BadRequestException(
+      direction === PunchDirection.IN
+        ? 'You are already checked in — check out before checking in again'
+        : 'Check in first',
+    );
+  }
+
+  /**
+   * Rebuilds `AttendanceRecord` from the day's punch events.
+   *
+   * For a day with one check-in and one check-out this produces byte-identical
+   * values to the two-punch path it replaces: `punchIn`/`punchOut` are the
+   * first and last punch, `workingMinutes` is still the gross span between
+   * them, and status is still "guess lateness on the way in, classify by length
+   * on the way out". Extra punches only ever move `punchOut` later and add
+   * `netMinutes`; no existing reader sees a changed field.
+   */
+  private async rebuildDayRecord(
+    tx: Prisma.TransactionClient,
+    input: {
+      tenantId: string;
+      employeeId: string;
+      date: Date;
+      shift: { id: string; startTime: string; endTime: string } | null;
+      effectiveLocationId: string | null;
+      ruleAt: Date;
+    },
+  ) {
+    const events = await tx.attendancePunchEvent.findMany({
+      where: { employeeId: input.employeeId, attendanceDate: input.date },
+      orderBy: { eventAt: 'asc' },
+    });
+    const summary = summarisePunchEvents(events);
+    const rule = await this.attendanceRule(input.tenantId, {
+      shiftId: input.shift?.id,
+      locationId: input.effectiveLocationId,
+      date: input.ruleAt,
+    });
+    const arrivedLate = summary.firstIn
+      ? isLateArrival(summary.firstIn, input.shift, rule)
+      : false;
+    // Until a check-out exists the only thing knowable is lateness — the same
+    // provisional verdict the old check-in wrote. Once the day closes it is
+    // classified by its length and then qualified by lateness, exactly as the
+    // old check-out did.
+    const status = summary.lastOut
+      ? this.withLateArrival(
+          this.classifyAttendanceStatus({
+            workingMinutes: summary.grossMinutes,
+            shift: input.shift,
+            tenantId: input.tenantId,
+            locationId: input.effectiveLocationId,
+            date: input.date,
+          }),
+          arrivedLate,
+        )
+      : arrivedLate
+        ? AttendanceStatus.LATE
+        : AttendanceStatus.PRESENT;
+
+    const derived = {
+      // `undefined` when no shift resolves, so an existing shiftId is kept
+      // rather than cleared — the behaviour the old punch-out relied on.
+      shiftId: input.shift?.id,
+      punchIn: summary.firstIn,
+      punchOut: summary.lastOut,
+      workingMinutes: summary.grossMinutes ?? null,
+      netMinutes: summary.netMinutes ?? null,
+      overtimeMinutes:
+        this.overtimeMinutes(summary.firstIn, summary.lastOut, input.shift) ?? null,
+      punchSource: summary.firstInSource,
+      geoLat: summary.geoLat,
+      geoLng: summary.geoLng,
+      geoAccuracy: summary.geoAccuracy,
+      status,
+    };
+    return tx.attendanceRecord.upsert({
+      where: { employeeId_date: { employeeId: input.employeeId, date: input.date } },
+      create: {
+        tenantId: input.tenantId,
+        employeeId: input.employeeId,
+        date: input.date,
+        ...derived,
+      },
+      update: derived,
+    });
+  }
+
   async checkIn(user: AuthUser, dto: CheckInDto, forcedSource?: string) {
     const employeeId = this.requireEmployee(user);
     const today = dateOnly(new Date());
-    // The location and shift a check-in is evaluated against come from the one
+    // The location and shift the *day* is evaluated against come from the one
     // resolver: the assignment covering today when it pins a location
     // (multi-location shift support), otherwise the employee's base location.
     // Resolved against `today`, the day anchor, not the current instant — an
@@ -368,34 +644,35 @@ export class AttendanceService {
       employeeId,
       today,
     );
-    const locationId = assignedLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
+    const effectiveLocationId =
+      assignedLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
+    // Where this punch is: the scheduled location for a single-location
+    // employee, or whichever authorized location they are actually standing in.
+    const punchLocationId = await this.resolvePunchLocation(
+      user.tenantId,
+      employeeId,
+      effectiveLocationId,
+      dto,
+    );
     const captureMode =
       forcedSource === 'QR' ? AttendanceCaptureMode.QR : this.deriveInteractiveCaptureMode(dto);
 
-    await this.assertCaptureModeAllowed(user.tenantId, captureMode, locationId, dto, employeeId);
+    await this.assertCaptureModeAllowed(user.tenantId, captureMode, punchLocationId, dto, employeeId);
     await this.validateDevice(user.tenantId, employeeId, dto);
-    await this.validateGeofence(user.tenantId, employeeId, dto, locationId);
-    const existing = await this.prisma.attendanceRecord.findUnique({
-      where: { employeeId_date: { employeeId, date: today } },
-    });
-    if (existing?.punchIn) throw new BadRequestException('Already checked in today');
+    await this.validateGeofence(user.tenantId, employeeId, dto, punchLocationId);
+    await this.assertDayNotFinalized(employeeId, today);
 
-    const rule = await this.attendanceRule(user.tenantId, { shiftId: shift?.id, locationId });
-    const now = new Date();
-    const status: 'PRESENT' | 'LATE' = isLateArrival(now, shift, rule) ? 'LATE' : 'PRESENT';
-    const punch = {
-      shiftId: shift?.id,
-      punchIn: now,
-      status,
-      punchSource: forcedSource ?? captureMode,
-      geoLat: dto.geoLat,
-      geoLng: dto.geoLng,
-      geoAccuracy: dto.geoAccuracy,
-    };
-    return this.prisma.attendanceRecord.upsert({
-      where: { employeeId_date: { employeeId, date: today } },
-      create: { tenantId: user.tenantId, employeeId, date: today, ...punch },
-      update: punch,
+    return this.recordPunch({
+      tenantId: user.tenantId,
+      employeeId,
+      date: today,
+      direction: PunchDirection.IN,
+      eventAt: new Date(),
+      locationId: punchLocationId,
+      shift,
+      effectiveLocationId,
+      source: forcedSource ?? captureMode,
+      dto,
     });
   }
 
@@ -405,19 +682,27 @@ export class AttendanceService {
       throw new BadRequestException('Invalid attendance QR code');
     }
     const employeeId = this.requireEmployee(user);
-    // The QR code must match wherever the employee is actually scheduled
-    // today — their current shift assignment's location if one is set,
-    // otherwise their own default location. Resolved against the day anchor for
-    // the same reason as `checkIn`.
+    // The QR code must name a location the employee may actually punch at:
+    // wherever they are scheduled today, their base location, or any extra
+    // authorized location. An employee with no extra locations still has to
+    // match their single scheduled location, exactly as before.
+    const today = dateOnly(new Date());
     const effectiveLocationId = await this.shifts.effectiveLocationId(
       user.tenantId,
       employeeId,
-      dateOnly(new Date()),
+      today,
     );
-    if (effectiveLocationId !== qrLocationId) {
-      throw new ForbiddenException('This QR code does not match your assigned work location');
+    const authorized = await this.shifts.authorizedLocationIds(
+      user.tenantId,
+      employeeId,
+      effectiveLocationId,
+    );
+    if (!authorized.includes(qrLocationId)) {
+      throw new ForbiddenException('This QR code does not match a location you are assigned to');
     }
-    return this.checkIn(user, dto, 'QR');
+    // Scanning the code is the location claim, so the punch is pinned to it
+    // rather than re-resolved from GPS.
+    return this.checkIn(user, { ...dto, locationId: qrLocationId }, 'QR');
   }
 
   /**
@@ -516,6 +801,14 @@ export class AttendanceService {
       return;
     }
     if (dto.geoLat == null || dto.geoLng == null) {
+      // The browser never reports *why* a fix is missing to anywhere but the
+      // client — without this, an incident like "check-in blocked" is
+      // undiagnosable after the fact. geoErrorReason carries that context so
+      // it's at least visible in the logs, even though the client-facing
+      // message stays the same.
+      this.logger.warn(
+        `Check-in blocked at ${loc.name} for employee ${employeeId}: no GPS fix (browser reason: ${dto.geoErrorReason ?? 'not reported'})`,
+      );
       throw new BadRequestException(
         `Location is required to check in at ${loc.name} — allow location access and try again`,
       );
@@ -543,56 +836,58 @@ export class AttendanceService {
     }
   }
 
+  /**
+   * Punches out of the location the employee is currently checked in at.
+   *
+   * Check-out deliberately keeps the validation it has always had — the device
+   * binding only. It records where the punch happened, but adding a capture
+   * mode assertion or a geofence here would start rejecting punch-outs that
+   * succeed today, stranding employees on the clock.
+   */
   async checkOut(user: AuthUser, dto: CheckOutDto) {
     const employeeId = this.requireEmployee(user);
     await this.validateDevice(user.tenantId, employeeId, dto);
     const today = dateOnly(new Date());
-    const record = await this.prisma.attendanceRecord.findUnique({
-      where: { employeeId_date: { employeeId, date: today } },
-    });
-    if (!record?.punchIn) throw new BadRequestException('Check in first');
-    const now = new Date();
-    const workingMinutes = Math.round((now.getTime() - record.punchIn.getTime()) / 60000);
 
     // Check-in can only ever guess at PRESENT/LATE, because how long the day
-    // turns out to be is not known until the punch-out. Reclassify against the
-    // finished span, or a ten minute day stays PRESENT purely because that is
-    // what the punch-in wrote.
+    // turns out to be is not known until the punch-out. The rebuild reclassifies
+    // against the finished span, or a ten minute day stays PRESENT purely
+    // because that is what the punch-in wrote.
     const { shift, assignedLocationId } = await this.shifts.resolveAt(
       user.tenantId,
       employeeId,
       today,
     );
-    const locationId = assignedLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
-    const calculatedStatus = this.classifyAttendanceStatus({
-      workingMinutes,
-      shift,
-      tenantId: user.tenantId,
-      locationId,
-      date: today,
+    const effectiveLocationId =
+      assignedLocationId ?? (await this.employeeLocationId(user.tenantId, employeeId));
+    // A punch-out closes a specific check-in, so when the payload names no
+    // location it belongs where that check-in was — not at whichever location
+    // the employee happens to be scheduled at.
+    const openEvents = await this.prisma.attendancePunchEvent.findMany({
+      where: { employeeId, attendanceDate: today },
+      orderBy: { eventAt: 'asc' },
+      select: { direction: true, locationId: true },
     });
-    // The punch-in already decided lateness against the shift and rule; the
-    // punch-out only decides whether the day was long enough for it to matter.
-    const status = this.withLateArrival(
-      calculatedStatus,
-      record.status === AttendanceStatus.LATE,
+    const punchLocationId = await this.resolvePunchLocation(
+      user.tenantId,
+      employeeId,
+      effectiveLocationId,
+      dto,
+      this.openPunchLocationId(openEvents),
     );
+    await this.assertDayNotFinalized(employeeId, today);
 
-    return this.prisma.attendanceRecord.update({
-      where: { id: record.id },
-      data: {
-        punchOut: now,
-        workingMinutes,
-        // Every other write path derives overtime at write time; leaving it off
-        // here meant an interactive punch banked no overtime while the same two
-        // punches imported from a file did, and the summary, finalization
-        // preview and finalization all read the stored value.
-        overtimeMinutes: this.overtimeMinutes(record.punchIn, now, shift),
-        // Pinned to the shift the status and overtime were actually derived
-        // from, so the record cannot cite one shift and be measured by another.
-        shiftId: shift?.id ?? record.shiftId,
-        status,
-      },
+    return this.recordPunch({
+      tenantId: user.tenantId,
+      employeeId,
+      date: today,
+      direction: PunchDirection.OUT,
+      eventAt: new Date(),
+      locationId: punchLocationId,
+      shift,
+      effectiveLocationId,
+      source: this.deriveInteractiveCaptureMode(dto),
+      dto,
     });
   }
 
@@ -721,6 +1016,261 @@ export class AttendanceService {
     return { csv, month: start.toISOString().slice(0, 7) };
   }
 
+  /**
+   * Punch history, one row per employee-day. The only read path backed by
+   * `AttendancePunchEvent` — every other module still reads the daily
+   * `AttendanceRecord` rollup.
+   *
+   * Defaults to the days this view exists for: more than one check-in/check-out
+   * pair, or punches at more than one location. A plain one-in/one-out day says
+   * nothing the attendance record view does not already show, so listing it
+   * here just buries the days that need attention. `scope=ALL` lifts the filter.
+   */
+  async listPunchEvents(tenantId: string, q: ListPunchEventsDto) {
+    const page = q.page ?? 1;
+    const pageSize = q.pageSize ?? 25;
+    const scope = q.scope ?? 'MULTI';
+    const where = this.punchEventWhere(tenantId, q);
+
+    const days = await this.punchDaySummaries(where, scope);
+    const total = days.length;
+    const pageDays = days.slice((page - 1) * pageSize, page * pageSize);
+
+    return {
+      data: pageDays.length ? await this.expandPunchDays(pageDays) : [],
+      meta: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+        scope,
+      },
+    };
+  }
+
+  /**
+   * The (employee, day) pairs matching a filter, newest day first.
+   *
+   * Grouping by location as well as by day gets the punch count and the number
+   * of distinct locations in one aggregate query, so deciding which days
+   * qualify never loads the events themselves. Only the page's days are then
+   * expanded.
+   */
+  private async punchDaySummaries(
+    where: Prisma.AttendancePunchEventWhereInput,
+    scope: 'MULTI' | 'ALL',
+  ) {
+    const groups = await this.prisma.attendancePunchEvent.groupBy({
+      by: ['employeeId', 'attendanceDate', 'locationId'],
+      where,
+      _count: { _all: true },
+    });
+
+    const byDay = new Map<
+      string,
+      { employeeId: string; attendanceDate: Date; punchCount: number; locationIds: Set<string> }
+    >();
+    for (const group of groups) {
+      const key = `${group.employeeId}|${group.attendanceDate.toISOString().slice(0, 10)}`;
+      const day = byDay.get(key) ?? {
+        employeeId: group.employeeId,
+        attendanceDate: group.attendanceDate,
+        punchCount: 0,
+        locationIds: new Set<string>(),
+      };
+      day.punchCount += group._count._all;
+      if (group.locationId) day.locationIds.add(group.locationId);
+      byDay.set(key, day);
+    }
+
+    const days = [...byDay.values()].filter(
+      (day) =>
+        scope === 'ALL' ||
+        // More than one pair, or the same day worked at more than one place.
+        day.punchCount > 2 ||
+        day.locationIds.size > 1,
+    );
+    days.sort(
+      (a, b) =>
+        b.attendanceDate.getTime() - a.attendanceDate.getTime() ||
+        a.employeeId.localeCompare(b.employeeId),
+    );
+    return days;
+  }
+
+  /** Loads and folds the punches for an already-selected page of days. */
+  private async expandPunchDays(
+    days: Array<{ employeeId: string; attendanceDate: Date }>,
+  ) {
+    const events = await this.prisma.attendancePunchEvent.findMany({
+      where: {
+        OR: days.map((day) => ({
+          employeeId: day.employeeId,
+          attendanceDate: day.attendanceDate,
+        })),
+      },
+      include: {
+        employee: { select: { id: true, firstName: true, lastName: true, employeeCode: true } },
+        location: { select: { id: true, name: true, city: true } },
+        shift: { select: { id: true, name: true } },
+      },
+      orderBy: { eventAt: 'asc' },
+    });
+
+    const byKey = new Map<string, typeof events>();
+    for (const event of events) {
+      const key = `${event.employeeId}|${event.attendanceDate.toISOString().slice(0, 10)}`;
+      const bucket = byKey.get(key) ?? [];
+      bucket.push(event);
+      byKey.set(key, bucket);
+    }
+
+    // Driven by `days`, not by the query result, so page order is the order the
+    // summaries were ranked in.
+    return days.map((day) => {
+      const key = `${day.employeeId}|${day.attendanceDate.toISOString().slice(0, 10)}`;
+      const dayEvents = byKey.get(key) ?? [];
+      const summary = summarisePunchEvents(dayEvents);
+      return {
+        employeeId: day.employeeId,
+        employee: dayEvents[0]?.employee ?? null,
+        date: day.attendanceDate,
+        events: dayEvents,
+        segments: summary.segments,
+        punchCount: summary.punchCount,
+        firstIn: summary.firstIn,
+        lastOut: summary.lastOut,
+        isOpen: summary.isOpen,
+        grossMinutes: summary.grossMinutes ?? null,
+        netMinutes: summary.netMinutes ?? null,
+        locations: this.distinctLocations(dayEvents),
+      };
+    });
+  }
+
+  /** Locations worked that day, in the order they were first punched at. */
+  private distinctLocations(
+    events: Array<{ location: { id: string; name: string } | null }>,
+  ): Array<{ id: string; name: string }> {
+    const seen = new Map<string, { id: string; name: string }>();
+    for (const event of events) {
+      if (event.location && !seen.has(event.location.id)) {
+        seen.set(event.location.id, { id: event.location.id, name: event.location.name });
+      }
+    }
+    return [...seen.values()];
+  }
+
+  private punchEventWhere(
+    tenantId: string,
+    q: ListPunchEventsDto,
+  ): Prisma.AttendancePunchEventWhereInput {
+    const from = q.from ? requireAttendanceDate(q.from, 'from') : undefined;
+    const to = q.to ? requireAttendanceDate(q.to, 'to') : undefined;
+    return {
+      tenantId,
+      ...(q.employeeId && { employeeId: q.employeeId }),
+      ...(q.locationId && { locationId: q.locationId }),
+      ...((from || to) && {
+        attendanceDate: { ...(from && { gte: from }), ...(to && { lte: to }) },
+      }),
+    };
+  }
+
+  /**
+   * The same history as a CSV, one row per punch, honouring the same scope as
+   * the screen — exporting every ordinary day when the view is filtered to the
+   * multi-punch ones would not be the same report.
+   */
+  async exportPunchEventsCsv(tenantId: string, q: ListPunchEventsDto): Promise<string> {
+    const scope = q.scope ?? 'MULTI';
+    const where = this.punchEventWhere(tenantId, q);
+    const events = await this.prisma.attendancePunchEvent.findMany({
+      where,
+      include: {
+        employee: { select: { firstName: true, lastName: true, employeeCode: true } },
+        location: { select: { name: true } },
+      },
+      orderBy: [{ attendanceDate: 'asc' }, { employeeId: 'asc' }, { eventAt: 'asc' }],
+      take: 20000,
+    });
+    // Filtered against the qualifying days rather than re-queried per day: the
+    // rows are already loaded, and an `OR` of every qualifying day would be a
+    // far larger query than the scan it replaces.
+    const included =
+      scope === 'ALL'
+        ? events
+        : await this.punchDaySummaries(where, scope).then((days) => {
+            const keys = new Set(
+              days.map(
+                (day) => `${day.employeeId}|${day.attendanceDate.toISOString().slice(0, 10)}`,
+              ),
+            );
+            return events.filter((event) =>
+              keys.has(
+                `${event.employeeId}|${event.attendanceDate.toISOString().slice(0, 10)}`,
+              ),
+            );
+          });
+
+    return toCsv(
+      included.map((event) => ({
+        date: event.attendanceDate.toISOString().slice(0, 10),
+        employeeCode: event.employee.employeeCode,
+        name: `${event.employee.firstName} ${event.employee.lastName}`,
+        direction: event.direction,
+        time: event.eventAt.toISOString(),
+        location: event.location?.name ?? '',
+        source: event.source,
+        gpsAccuracyM: event.geoAccuracy,
+        systemGenerated: event.isSystemGenerated,
+      })),
+    );
+  }
+
+  /**
+   * One employee's punches for one day, paired into segments with the totals
+   * the day rolls up to. Backs the portal timeline and the per-day drilldown.
+   */
+  async punchDay(tenantId: string, employeeId: string, date: Date) {
+    const day = dateOnly(date);
+    const events = await this.prisma.attendancePunchEvent.findMany({
+      where: { tenantId, employeeId, attendanceDate: day },
+      include: { location: { select: { id: true, name: true, city: true } } },
+      orderBy: { eventAt: 'asc' },
+    });
+    const summary = summarisePunchEvents(events);
+    return {
+      date: day,
+      employeeId,
+      events,
+      segments: summary.segments,
+      firstIn: summary.firstIn,
+      lastOut: summary.lastOut,
+      isOpen: summary.isOpen,
+      punchCount: summary.punchCount,
+      grossMinutes: summary.grossMinutes ?? null,
+      netMinutes: summary.netMinutes ?? null,
+      // Distinct locations worked, in the order they were first punched at.
+      locations: events.reduce<Array<{ id: string; name: string }>>((acc, event) => {
+        if (event.location && !acc.some((item) => item.id === event.location!.id)) {
+          acc.push({ id: event.location.id, name: event.location.name });
+        }
+        return acc;
+      }, []),
+    };
+  }
+
+  /** The signed-in employee's own punches for a day, defaulting to today. */
+  async myPunchDay(user: AuthUser, date?: string) {
+    const employeeId = this.requireEmployee(user);
+    return this.punchDay(
+      user.tenantId,
+      employeeId,
+      date ? requireAttendanceDate(date) : dateOnly(new Date()),
+    );
+  }
+
   async importBiometricPunches(tenantId: string, dto: ImportBiometricPunchesDto) {
     return this.importAttendanceRows(tenantId, dto, 'BIOMETRIC');
   }
@@ -803,33 +1353,38 @@ export class AttendanceService {
           this.classifyAttendanceStatus({ workingMinutes, shift, tenantId, locationId, date }),
           punchIn ? isLateArrival(punchIn, shift, await ruleFor(shift?.id, locationId, date)) : false,
         );
+      const derived = {
+        shiftId: shift?.id,
+        punchIn,
+        punchOut,
+        workingMinutes,
+        // A file carries one pair per row, so its net time is its gross span.
+        netMinutes: workingMinutes,
+        overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
+        punchSource: source,
+        status,
+        remarks: row.deviceId ? `${source} import: ${row.deviceId}` : `${source} import`,
+        isFinalized: source === 'BIOMETRIC' || source === 'API',
+      };
       await this.prisma.attendanceRecord.upsert({
         where: { employeeId_date: { employeeId: employee.id, date } },
-        create: {
-          tenantId,
-          employeeId: employee.id,
-          shiftId: shift?.id,
-          date,
-          punchIn,
-          punchOut,
-          workingMinutes,
-          overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
-          punchSource: source,
-          status,
-          remarks: row.deviceId ? `${source} import: ${row.deviceId}` : `${source} import`,
-          isFinalized: source === 'BIOMETRIC' || source === 'API',
-        },
-        update: {
-          shiftId: shift?.id,
-          punchIn,
-          punchOut,
-          workingMinutes,
-          overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
-          punchSource: source,
-          status,
-          remarks: row.deviceId ? `${source} import: ${row.deviceId}` : `${source} import`,
-          isFinalized: source === 'BIOMETRIC' || source === 'API',
-        },
+        create: { tenantId, employeeId: employee.id, date, ...derived },
+        update: derived,
+      });
+      // Mirrored so an imported day reads the same in punch history as it does
+      // in the record. Re-uploading the same file replaces these rows rather
+      // than stacking a second copy of every punch.
+      await syncSystemPunchEvents(this.prisma, {
+        tenantId,
+        employeeId: employee.id,
+        date,
+        punchIn,
+        punchOut,
+        locationId,
+        shiftId: shift?.id ?? null,
+        source: this.importSourceToCaptureMode(source),
+        deviceId: row.deviceId ?? null,
+        remarks: `${source} import`,
       });
       imported++;
     }
@@ -853,6 +1408,28 @@ export class AttendanceService {
     }
 
     const date = dto.date ? requireAttendanceDate(dto.date) : record.date;
+    const dateChanged = date.getTime() !== record.date.getTime();
+    if (dateChanged) {
+      // `(employeeId, date)` is unique, so moving a record onto a day the
+      // employee already has one for is a plain conflict rather than a 500 from
+      // a raw constraint violation.
+      const clash = await this.prisma.attendanceRecord.findUnique({
+        where: { employeeId_date: { employeeId: record.employeeId, date } },
+        select: { id: true },
+      });
+      if (clash && clash.id !== record.id) {
+        throw new BadRequestException(
+          `This employee already has an attendance record on ${date.toISOString().slice(0, 10)}`,
+        );
+      }
+    }
+    if (dto.locationId) {
+      const location = await this.prisma.location.findFirst({
+        where: { id: dto.locationId, tenantId },
+        select: { id: true },
+      });
+      if (!location) throw new NotFoundException('Location not found');
+    }
     const punchIn = dto.punchIn !== undefined ? new Date(dto.punchIn) : record.punchIn;
     const punchOut = dto.punchOut !== undefined ? new Date(dto.punchOut) : record.punchOut;
     const workingMinutes =
@@ -860,6 +1437,7 @@ export class AttendanceService {
         ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000))
         : undefined;
     const shift = await this.currentShiftAt(tenantId, record.employeeId, date);
+    const punchLocations = await this.correctedPunchLocations(tenantId, record, dto, date);
     const shouldReclassify = !dto.status && (dto.date !== undefined || dto.punchIn !== undefined || dto.punchOut !== undefined);
     const status = dto.status ?? (shouldReclassify
       ? this.classifyAttendanceStatus({
@@ -871,32 +1449,113 @@ export class AttendanceService {
         })
       : record.status);
 
-    return this.prisma.attendanceRecord.update({
-      where: { id },
-      data: {
+    // The record and the events it derives are written together: a correction
+    // that updated one and failed on the other would leave punch history
+    // describing a day the record no longer claims.
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.attendanceRecord.update({
+        where: { id },
+        data: {
+          date,
+          shiftId: shift?.id,
+          punchIn,
+          punchOut,
+          workingMinutes,
+          netMinutes: workingMinutes,
+          overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
+          status,
+          punchSource: record.punchSource ?? 'MANUAL',
+          remarks: record.remarks ?? 'Manual attendance correction',
+        },
+      });
+      // Moving a record to another day leaves its old day's derived events
+      // behind otherwise, describing punches the record no longer claims.
+      if (dateChanged) {
+        await syncSystemPunchEvents(tx, {
+          tenantId,
+          employeeId: record.employeeId,
+          date: record.date,
+          source: AttendanceCaptureMode.MANUAL,
+        });
+      }
+      await syncSystemPunchEvents(tx, {
+        tenantId,
+        employeeId: record.employeeId,
         date,
-        shiftId: shift?.id,
         punchIn,
         punchOut,
-        workingMinutes,
-        overtimeMinutes: this.overtimeMinutes(punchIn, punchOut, shift),
-        status,
-        punchSource: record.punchSource ?? 'MANUAL',
-        remarks: record.remarks ?? 'Manual attendance correction',
-      },
+        locationId: punchLocations.inLocationId,
+        outLocationId: punchLocations.outLocationId,
+        shiftId: shift?.id ?? null,
+        source: AttendanceCaptureMode.MANUAL,
+        remarks: 'Manual attendance correction',
+      });
+      return updated;
     });
+  }
+
+  /**
+   * Where a corrected day's derived punches belong.
+   *
+   * An explicit `locationId` wins. Otherwise the day keeps the locations its
+   * punches already record — reaching for the employee's base location would
+   * quietly relocate a day worked at a second site back to their home office
+   * every time HR nudged a punch time. Only a day with no punches at all falls
+   * through to the location the employee is scheduled at.
+   */
+  private async correctedPunchLocations(
+    tenantId: string,
+    record: { employeeId: string; date: Date; employee: { locationId: string | null } },
+    dto: UpdateAttendanceRecordDto,
+    date: Date,
+  ): Promise<{ inLocationId: string | null; outLocationId: string | null }> {
+    if (dto.locationId) {
+      return { inLocationId: dto.locationId, outLocationId: dto.locationId };
+    }
+    const existing = await this.prisma.attendancePunchEvent.findMany({
+      where: { employeeId: record.employeeId, attendanceDate: record.date },
+      orderBy: { eventAt: 'asc' },
+      select: { direction: true, locationId: true },
+    });
+    const firstIn = existing.find((event) => event.direction === PunchDirection.IN);
+    const lastOut = [...existing].reverse().find((event) => event.direction === PunchDirection.OUT);
+    if (firstIn || lastOut) {
+      const fallback = firstIn?.locationId ?? lastOut?.locationId ?? null;
+      return {
+        inLocationId: firstIn?.locationId ?? fallback,
+        outLocationId: lastOut?.locationId ?? fallback,
+      };
+    }
+    const scheduled =
+      (await this.shifts.effectiveLocationId(tenantId, record.employeeId, date)) ??
+      record.employee.locationId;
+    return { inLocationId: scheduled, outLocationId: scheduled };
   }
 
   async deleteRecord(tenantId: string, id: string) {
     const record = await this.prisma.attendanceRecord.findFirst({
       where: { id, tenantId },
-      select: { id: true, isFinalized: true },
+      select: { id: true, isFinalized: true, employeeId: true, date: true },
     });
     if (!record) throw new NotFoundException('Attendance record not found');
     if (record.isFinalized) {
       throw new BadRequestException('Finalized attendance cannot be deleted');
     }
-    await this.prisma.attendanceRecord.delete({ where: { id } });
+    // Both in one transaction: a delete that dropped the record but failed to
+    // drop its derived events would leave punch history showing punches for a
+    // day that no longer exists.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.attendanceRecord.delete({ where: { id } });
+      // The derived events go with the record they were derived from. Punches
+      // the employee actually made survive, so deleting a record never destroys
+      // punch evidence — it only removes what the record itself produced.
+      await syncSystemPunchEvents(tx, {
+        tenantId,
+        employeeId: record.employeeId,
+        date: record.date,
+        source: AttendanceCaptureMode.MANUAL,
+      });
+    });
     return { deleted: true };
   }
 
@@ -1268,16 +1927,29 @@ export class AttendanceService {
       punchIn: input.punchIn,
       punchOut: input.punchOut,
       workingMinutes,
+      netMinutes: workingMinutes,
       overtimeMinutes,
       status: AttendanceStatus.PRESENT,
       punchSource: 'MANUAL',
       remarks: `Regularization: ${input.reason}`,
     };
-    return this.prisma.attendanceRecord.upsert({
+    const record = await this.prisma.attendanceRecord.upsert({
       where: { employeeId_date: { employeeId, date: input.date } },
       create: { tenantId, employeeId, date: input.date, ...derived },
       update: derived,
     });
+    await syncSystemPunchEvents(this.prisma, {
+      tenantId,
+      employeeId,
+      date: input.date,
+      punchIn: input.punchIn,
+      punchOut: input.punchOut,
+      locationId: await this.employeeLocationId(tenantId, employeeId),
+      shiftId: shift?.id ?? null,
+      source: AttendanceCaptureMode.MANUAL,
+      remarks: `Regularization: ${input.reason}`,
+    });
+    return record;
   }
 
   async stats(tenantId: string, month?: string) {

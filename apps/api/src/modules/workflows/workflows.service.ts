@@ -3,6 +3,7 @@ import { Cron } from '@nestjs/schedule';
 import { ApprovalStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { syncSystemPunchEvents } from '../attendance/punch-events';
 import { CreateWorkflowDto, RaiseApprovalDto, UpdateWorkflowDto, WorkflowStepDto } from './dto/workflows.dto';
 
 type WorkflowStepRecord = {
@@ -635,27 +636,38 @@ export class WorkflowsService {
     const workingMinutes =
       punchIn && punchOut ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000)) : undefined;
 
+    const derived = {
+      status: 'PRESENT' as const,
+      punchIn,
+      punchOut,
+      // One approved pair, so the net time is the gross span.
+      netMinutes: workingMinutes,
+      workingMinutes,
+      punchSource: 'MANUAL',
+      remarks: `Regularization approved: ${reason}`,
+    };
     await tx.attendanceRecord.upsert({
       where: { employeeId_date: { employeeId, date } },
-      create: {
-        tenantId: request.tenantId,
-        employeeId,
-        date,
-        status: 'PRESENT',
-        punchIn,
-        punchOut,
-        workingMinutes,
-        punchSource: 'MANUAL',
-        remarks: `Regularization approved: ${reason}`,
-      },
-      update: {
-        status: 'PRESENT',
-        punchIn,
-        punchOut,
-        workingMinutes,
-        punchSource: 'MANUAL',
-        remarks: `Regularization approved: ${reason}`,
-      },
+      create: { tenantId: request.tenantId, employeeId, date, ...derived },
+      update: derived,
+    });
+
+    // An approved regularization has to leave the same punch history as one
+    // applied directly by HR, or the day reads as unpunched in the report while
+    // the record shows times.
+    const employee = await tx.employee.findUnique({
+      where: { id: employeeId },
+      select: { locationId: true },
+    });
+    await syncSystemPunchEvents(tx, {
+      tenantId: request.tenantId,
+      employeeId,
+      date,
+      punchIn,
+      punchOut,
+      locationId: employee?.locationId ?? null,
+      source: 'MANUAL',
+      remarks: `Regularization approved: ${reason}`,
     });
   }
 

@@ -126,10 +126,20 @@ export class CreateEmployeeDto {
   @IsString()
   designationId?: string;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ description: 'Primary/base work location' })
   @IsOptional()
   @IsString()
   locationId?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Every location this employee may punch attendance at. The primary location is always allowed and does not need listing. Omit to leave the current set unchanged; send an empty array to clear it.',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  authorizedLocationIds?: string[];
 
   @ApiPropertyOptional()
   @IsOptional()

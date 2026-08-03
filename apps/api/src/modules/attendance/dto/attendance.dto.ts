@@ -6,6 +6,7 @@ import {
   IsBoolean,
   IsDateString,
   IsEnum,
+  IsIn,
   IsInt,
   IsNotEmpty,
   IsNumber,
@@ -60,6 +61,23 @@ export class CheckInDto {
   @Type(() => Number)
   @IsNumber()
   fixAt?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Which authorized location this punch is at. Omit to use the location the employee is scheduled at, or the one their GPS fix falls inside.',
+  })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Browser-reported reason no GPS fix was available, sent instead of geoLat/geoLng so a geofence rejection is traceable server-side',
+    enum: ['denied', 'unavailable'],
+  })
+  @IsOptional()
+  @IsIn(['denied', 'unavailable'])
+  geoErrorReason?: 'denied' | 'unavailable';
 }
 
 export class QrPunchDto extends CheckInDto {
@@ -69,12 +87,12 @@ export class QrPunchDto extends CheckInDto {
   qrCode!: string;
 }
 
-export class CheckOutDto {
-  @ApiProperty({ description: 'Stable device identifier registered to this employee' })
-  @IsString()
-  @IsNotEmpty()
-  deviceId!: string;
-}
+/**
+ * Extends the check-in payload so a punch-out records where it happened.
+ * Every added field is optional, and check-out deliberately keeps its existing
+ * validation: no capture-mode assertion and no geofence, exactly as before.
+ */
+export class CheckOutDto extends CheckInDto {}
 
 export class ListAttendanceDto {
   @ApiPropertyOptional({ default: 1 })
@@ -111,6 +129,59 @@ export class ListAttendanceDto {
   @IsOptional()
   @IsEnum(AttendanceStatus)
   status?: AttendanceStatus;
+}
+
+/**
+ * Filters for the punch history report.
+ *
+ * Paginated by day rather than by punch: the report groups a day's punches
+ * together, and an event-level page boundary would cut a day in half.
+ */
+export class ListPunchEventsDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiPropertyOptional({ default: 25, description: 'Days per page, not punches per page' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  pageSize?: number = 25;
+
+  @ApiPropertyOptional({
+    enum: ['MULTI', 'ALL'],
+    default: 'MULTI',
+    description:
+      'MULTI (default) returns only days worth reviewing here — more than one check-in/check-out pair, or punches at more than one location. A plain one-in/one-out day is already shown by the attendance record view. ALL returns every day with punches.',
+  })
+  @IsOptional()
+  @IsIn(['MULTI', 'ALL'])
+  scope?: 'MULTI' | 'ALL' = 'MULTI';
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  employeeId?: string;
+
+  @ApiPropertyOptional({ description: 'Only punches recorded at this location' })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
+
+  @ApiPropertyOptional({ example: '2026-07-01', description: 'Attendance day, inclusive' })
+  @IsOptional()
+  @IsString()
+  from?: string;
+
+  @ApiPropertyOptional({ example: '2026-07-31', description: 'Attendance day, inclusive' })
+  @IsOptional()
+  @IsString()
+  to?: string;
 }
 
 export class MonthQueryDto {
@@ -345,6 +416,14 @@ export class UpdateAttendanceRecordDto {
   @IsOptional()
   @IsDateString()
   punchOut?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Corrects the location the day's derived punches are recorded at. Omit to keep whatever the day's punches already say.",
+  })
+  @IsOptional()
+  @IsString()
+  locationId?: string;
 
   @ApiPropertyOptional({ enum: AttendanceStatus })
   @IsOptional()

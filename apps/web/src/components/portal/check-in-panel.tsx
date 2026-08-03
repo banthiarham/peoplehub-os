@@ -22,6 +22,24 @@ interface MyAttendanceRecord {
   geoAccuracy: number | null;
 }
 
+interface PunchEvent {
+  id: string;
+  eventAt: string;
+  direction: 'IN' | 'OUT';
+  location: { id: string; name: string } | null;
+}
+
+interface PunchDay {
+  events: PunchEvent[];
+  /** True while the last punch of the day is a check-in. */
+  isOpen: boolean;
+  firstIn: string | null;
+  lastOut: string | null;
+  grossMinutes: number | null;
+  netMinutes: number | null;
+  locations: Array<{ id: string; name: string }>;
+}
+
 function apiError(err: unknown): string {
   const e = err as { response?: { data?: { message?: string | string[] } } };
   const m = e?.response?.data?.message;
@@ -52,26 +70,44 @@ export function CheckInPanel() {
     queryKey: ['attendance', 'my-month'],
     queryFn: () => api.get('/attendance/me').then((r) => r.data),
   });
+  // Whether the employee is on the clock comes from the punch log, not from the
+  // record: with several punches a day the record's `punchOut` holds the last
+  // completed check-out even while they are checked back in somewhere else.
+  const { data: punchDay } = useQuery<PunchDay>({
+    queryKey: ['attendance', 'my-punches', todayKey()],
+    queryFn: () => api.get('/attendance/punch-events/me').then((r) => r.data),
+  });
   const today: MyAttendanceRecord | undefined = data?.records?.find(
     (r: MyAttendanceRecord) => r.date.slice(0, 10) === todayKey(),
   );
 
   const checkIn = useMutation({
-    mutationFn: (f: LiveFix | null) =>
+    mutationFn: (payload: { fix: LiveFix | null; reason?: 'denied' | 'unavailable' }) =>
       api
         .post('/attendance/check-in', {
           deviceId: getDeviceId(),
           ...getDeviceInfo(),
-          ...(f
-            ? { geoLat: f.lat, geoLng: f.lng, geoAccuracy: f.accuracy, fixAt: f.timestamp }
-            : {}),
+          ...(payload.fix
+            ? {
+                geoLat: payload.fix.lat,
+                geoLng: payload.fix.lng,
+                geoAccuracy: payload.fix.accuracy,
+                fixAt: payload.fix.timestamp,
+              }
+            : payload.reason
+              ? { geoErrorReason: payload.reason }
+              : {}),
         })
         .then((r) => r.data),
     onSuccess: (record) => {
       setArming(false);
       queryClient.invalidateQueries({ queryKey: ['attendance'] });
+      // Not `record.punchIn` — that is the day's *first* check-in, which is not
+      // this punch once the day has more than one.
       toast(
-        `Checked in at ${formatTime(record.punchIn)}${record.status === 'LATE' ? ' — marked late' : ''}`,
+        `Checked in at ${formatTime(new Date().toISOString())}${
+          record.status === 'LATE' ? ' — marked late' : ''
+        }`,
         record.status === 'LATE' ? 'info' : 'success',
       );
     },
@@ -98,23 +134,28 @@ export function CheckInPanel() {
   useEffect(() => {
     if (!arming || checkIn.isPending) return;
     if (isPrecise && fix) {
-      checkIn.mutate(fix);
+      checkIn.mutate({ fix });
     } else if (status === 'denied' || status === 'unavailable') {
-      checkIn.mutate(null);
+      checkIn.mutate({ fix: null, reason: status });
     }
   }, [arming, isPrecise, fix, status, checkIn]);
 
   if (isLoading) return <Skeleton className="h-44" />;
 
-  const punchedIn = !!today?.punchIn;
-  const punchedOut = !!today?.punchOut;
+  const events = punchDay?.events ?? [];
+  // On the clock: the day's last punch was a check-in. Falls back to the record
+  // for the moment before the punch log loads.
+  const onTheClock = punchDay ? punchDay.isOpen : !!today?.punchIn && !today?.punchOut;
+  const hasPunched = events.length > 0 || !!today?.punchIn;
   const elapsedSec = arming ? Math.round((Date.now() - armedAt) / 1000) : 0;
 
   return (
     <Card className="p-5">
-      {!punchedIn && !arming && (
+      {!onTheClock && !arming && (
         <div className="text-center">
-          <p className="text-sm text-ink-muted">You haven&apos;t checked in today</p>
+          <p className="text-sm text-ink-muted">
+            {hasPunched ? 'You are checked out' : "You haven't checked in today"}
+          </p>
           <Button
             size="lg"
             className="mt-3 w-full"
@@ -123,10 +164,12 @@ export function CheckInPanel() {
               setArming(true);
             }}
           >
-            <MapPin className="h-4 w-4" /> Check in
+            <MapPin className="h-4 w-4" /> {hasPunched ? 'Check in again' : 'Check in'}
           </Button>
           <p className="mt-2 text-[11px] text-ink-faint">
-            Uses a fresh GPS fix (≤{TARGET_ACCURACY_M}m) from your registered device
+            {hasPunched
+              ? 'Checking in again at another site starts a new stretch of the same day'
+              : `Uses a fresh GPS fix (≤${TARGET_ACCURACY_M}m) from your registered device`}
           </p>
         </div>
       )}
@@ -157,7 +200,7 @@ export function CheckInPanel() {
               <XCircle className="h-3.5 w-3.5" /> Cancel
             </Button>
             {fix && !isPrecise && elapsedSec > 12 && !checkIn.isPending && (
-              <Button size="sm" variant="secondary" onClick={() => checkIn.mutate(fix)}>
+              <Button size="sm" variant="secondary" onClick={() => checkIn.mutate({ fix })}>
                 Use ±{Math.round(fix.accuracy)}m fix
               </Button>
             )}
@@ -165,26 +208,57 @@ export function CheckInPanel() {
         </div>
       )}
 
-      {punchedIn && !arming && (
-        <div>
+      {hasPunched && !arming && (
+        <div className={onTheClock ? '' : 'mt-5 border-t border-line pt-4'}>
           <div className="flex items-center justify-between">
             <div>
               <p className="text-[11px] uppercase tracking-wide text-ink-muted">Today</p>
               <p className="mt-0.5 text-lg font-semibold">
-                {formatTime(today!.punchIn)} → {punchedOut ? formatTime(today!.punchOut) : '…'}
+                {formatTime(punchDay?.firstIn ?? today?.punchIn ?? null)} →{' '}
+                {onTheClock ? '…' : formatTime(punchDay?.lastOut ?? today?.punchOut ?? null)}
               </p>
               <p className="mt-0.5 text-xs text-ink-muted">
-                {punchedOut && today!.workingMinutes != null
-                  ? `${(today!.workingMinutes / 60).toFixed(1)}h worked`
-                  : 'On the clock'}
-                {today!.geoAccuracy != null && ` · GPS ±${Math.round(today!.geoAccuracy)}m`}
+                {onTheClock
+                  ? 'On the clock'
+                  : today?.workingMinutes != null
+                    ? `${(today.workingMinutes / 60).toFixed(1)}h worked`
+                    : '—'}
+                {/* Only worth showing once the two differ, i.e. the day was
+                    split across more than one stretch. */}
+                {punchDay?.netMinutes != null &&
+                  punchDay.grossMinutes != null &&
+                  punchDay.netMinutes !== punchDay.grossMinutes &&
+                  ` · ${(punchDay.netMinutes / 60).toFixed(1)}h on site`}
+                {today?.geoAccuracy != null && ` · GPS ±${Math.round(today.geoAccuracy)}m`}
               </p>
             </div>
-            <Badge variant={today!.status === 'LATE' ? 'warning' : 'success'}>
-              {today!.status}
-            </Badge>
+            {today && (
+              <Badge variant={today.status === 'LATE' ? 'warning' : 'success'}>{today.status}</Badge>
+            )}
           </div>
-          {!punchedOut && (
+
+          {events.length > 0 && (
+            <ul className="mt-3 space-y-1.5">
+              {events.map((event) => (
+                <li key={event.id} className="flex items-center gap-2 text-xs">
+                  <span
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                      event.direction === 'IN' ? 'bg-emerald-500' : 'bg-ink-faint'
+                    }`}
+                  />
+                  <span className="font-medium tabular-nums">{formatTime(event.eventAt)}</span>
+                  <span className="text-ink-muted">
+                    {event.direction === 'IN' ? 'Checked in' : 'Checked out'}
+                  </span>
+                  {event.location && (
+                    <span className="ml-auto truncate text-ink-faint">{event.location.name}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {onTheClock && (
             <Button
               variant="outline"
               className="mt-4 w-full"

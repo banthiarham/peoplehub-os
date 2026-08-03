@@ -23,6 +23,7 @@ import {
   ImportRosterDto,
   ListCaptureSettingsDto,
   ListAttendanceDto,
+  ListPunchEventsDto,
   MonthQueryDto,
   QrPunchDto,
   RegularizeDto,
@@ -58,6 +59,54 @@ export class AttendanceController {
   @Scopes('attendance:write')
   checkOut(@CurrentUser() user: AuthUser, @Body() dto: CheckOutDto) {
     return this.attendance.checkOut(user, dto);
+  }
+
+  @Get('punch-events')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Scopes('attendance:read')
+  @ApiOperation({
+    summary: 'Punch history: every check-in/check-out with its location and time',
+  })
+  punchEvents(@CurrentUser() user: AuthUser, @Query() q: ListPunchEventsDto) {
+    return this.attendance.listPunchEvents(user.tenantId, q);
+  }
+
+  @Get('punch-events/export')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: 'Download punch history as CSV, one row per punch' })
+  async exportPunchEvents(
+    @CurrentUser() user: AuthUser,
+    @Query() q: ListPunchEventsDto,
+    @Res({ passthrough: true }) res: FastifyReply,
+  ) {
+    const csv = await this.attendance.exportPunchEventsCsv(user.tenantId, q);
+    res.header('Content-Type', 'text/csv; charset=utf-8');
+    res.header('Content-Disposition', 'attachment; filename="punch-history.csv"');
+    return csv;
+  }
+
+  @Get('punch-events/me')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: "Own punches for a day, paired into segments with totals" })
+  myPunchDay(@CurrentUser() user: AuthUser, @Query() q: DateQueryDto) {
+    return this.attendance.myPunchDay(user, q.date);
+  }
+
+  @Get('punch-events/:employeeId')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: "An employee's punches for a day, paired into segments" })
+  punchDay(
+    @CurrentUser() user: AuthUser,
+    @Param('employeeId') employeeId: string,
+    @Query() q: DateQueryDto,
+  ) {
+    return this.attendance.punchDay(
+      user.tenantId,
+      employeeId,
+      q.date ? new Date(q.date) : new Date(),
+    );
   }
 
   @Get('device/me')
