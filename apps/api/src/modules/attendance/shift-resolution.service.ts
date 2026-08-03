@@ -22,6 +22,13 @@ import { PrismaService } from '../../common/database/prisma.service';
  * 2. The employee's own `locationId` — their default/base location, which
  *    assigning a roster never reads, writes, or clears.
  *
+ * Exactly one location is *effective* per employee per date, and that is still
+ * the location the day's attendance rule, capture settings and status
+ * classification are resolved against. {@link ShiftResolutionService.authorizedLocationIds}
+ * answers a different question — which locations an employee is *permitted* to
+ * punch at — and governs only the geofence and capture mode of an individual
+ * punch.
+ *
  * Assignments may legitimately overlap (an open-ended base assignment plus
  * single-day roster or swap overrides). Overlap is therefore resolved, not
  * forbidden: the assignment that starts latest wins for the day, ties broken by
@@ -146,6 +153,49 @@ export class ShiftResolutionService {
       select: { locationId: true },
     });
     return employee?.locationId ?? null;
+  }
+
+  /**
+   * Every location this employee may punch at, in preference order: the one
+   * they are scheduled at today first, then their base location, then any extra
+   * authorized location.
+   *
+   * The scheduled and base locations are always included even when no
+   * `EmployeeLocation` row names them, so an employee can never be locked out
+   * of their own office by an incomplete authorized list, and an employee with
+   * no rows at all resolves to exactly the single location the punch path used
+   * before this table existed.
+   *
+   * `effectiveLocationId` is passed in rather than resolved here because every
+   * caller has already resolved the shift for the date and would otherwise pay
+   * for the same assignment lookup twice.
+   */
+  async authorizedLocationIds(
+    tenantId: string,
+    employeeId: string,
+    effectiveLocationId: string | null,
+  ): Promise<string[]> {
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: employeeId, tenantId },
+      select: {
+        locationId: true,
+        authorizedLocations: {
+          // Tenant-scoped through the location so a stale row pointing at
+          // another workspace's location can never widen the set.
+          where: { location: { tenantId, isActive: true } },
+          select: { locationId: true },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        },
+      },
+    });
+    const ordered: string[] = [];
+    const add = (id: string | null | undefined) => {
+      if (id && !ordered.includes(id)) ordered.push(id);
+    };
+    add(effectiveLocationId);
+    add(employee?.locationId);
+    for (const row of employee?.authorizedLocations ?? []) add(row.locationId);
+    return ordered;
   }
 
   /**

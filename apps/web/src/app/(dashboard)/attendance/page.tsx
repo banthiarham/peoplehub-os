@@ -193,6 +193,7 @@ interface EffectiveShift {
 type CaptureMode = 'WEB' | 'MOBILE' | 'GPS' | 'QR' | 'BIOMETRIC' | 'MANUAL' | 'API_IMPORT';
 type AttendanceTab =
   | 'today'
+  | 'punches'
   | 'capture'
   | 'rules'
   | 'shifts'
@@ -205,6 +206,7 @@ type AttendanceTab =
 
 const ATTENDANCE_TABS: Array<{ id: AttendanceTab; label: string; icon: typeof Clock }> = [
   { id: 'today', label: 'Attendance', icon: Clock },
+  { id: 'punches', label: 'Punch history', icon: MapPin },
   { id: 'capture', label: 'Capture', icon: Settings2 },
   { id: 'rules', label: 'Rules', icon: Settings2 },
   { id: 'shifts', label: 'Shifts', icon: CalendarClock },
@@ -767,6 +769,7 @@ export default function AttendancePage() {
           </div>
         ))}
 
+      {tab === 'punches' && <PunchHistoryTab />}
       {tab === 'rules' && <AttendanceRulesTab />}
       {tab === 'capture' && <CaptureSettingsTab />}
       {tab === 'shifts' && <ShiftsTab />}
@@ -2169,6 +2172,275 @@ function ShiftSwapsTab() {
     onError: (err) => toast(apiError(err), 'error'),
   });
   return <Card><Table><THead><TR><TH>Employee</TH><TH>Requested</TH><TH>Target</TH><TH>Status</TH><TH></TH></TR></THead><TBody>{data?.map((s) => <TR key={s.id}><TD>{s.requester.firstName} {s.requester.lastName}</TD><TD>{s.requestedShift.name}</TD><TD>{s.targetShift.name}</TD><TD><Badge variant={statusVariant(s.status)}>{s.status}</Badge></TD><TD>{s.status === 'REQUESTED' && <div className="flex gap-2"><Button size="sm" onClick={() => decide.mutate({ id: s.id, status: 'APPROVED' })}>Approve</Button><Button size="sm" variant="outline" onClick={() => decide.mutate({ id: s.id, status: 'REJECTED' })}>Reject</Button></div>}</TD></TR>)}</TBody></Table></Card>;
+}
+
+interface PunchEventRow {
+  id: string;
+  eventAt: string;
+  direction: 'IN' | 'OUT';
+  source: string;
+  geoAccuracy: number | null;
+  isSystemGenerated: boolean;
+  location: { id: string; name: string; city: string | null } | null;
+}
+
+interface PunchDayRow {
+  employeeId: string;
+  employee: { id: string; firstName: string; lastName: string; employeeCode: string } | null;
+  date: string;
+  events: PunchEventRow[];
+  punchCount: number;
+  firstIn: string | null;
+  lastOut: string | null;
+  isOpen: boolean;
+  grossMinutes: number | null;
+  netMinutes: number | null;
+  locations: Array<{ id: string; name: string }>;
+}
+
+const PUNCH_PAGE_SIZE = 25;
+
+/**
+ * Days read from the raw punch log rather than the daily record, so a day
+ * worked across several sites is legible.
+ *
+ * Defaults to the days that need it — more than one pair, or more than one
+ * location. An ordinary one-in/one-out day says nothing the attendance view
+ * does not already show, so listing those by default only buries these.
+ */
+function PunchHistoryTab() {
+  const toast = useToast();
+  const employeeOptions = useEmployeeOptions();
+  const locationOptions = useLocationOptions();
+  const today = new Date().toISOString().slice(0, 10);
+  const [filters, setFilters] = useState({
+    employeeId: '',
+    locationId: '',
+    from: today,
+    to: today,
+    scope: 'MULTI' as 'MULTI' | 'ALL',
+  });
+  const [page, setPage] = useState(1);
+  const params = {
+    page,
+    pageSize: PUNCH_PAGE_SIZE,
+    scope: filters.scope,
+    ...(filters.employeeId && { employeeId: filters.employeeId }),
+    ...(filters.locationId && { locationId: filters.locationId }),
+    ...(filters.from && { from: filters.from }),
+    ...(filters.to && { to: filters.to }),
+  };
+  const { data, isLoading } = useQuery({
+    queryKey: ['attendance', 'punch-events', params],
+    queryFn: () =>
+      api.get('/attendance/punch-events', { params }).then(
+        (r) =>
+          r.data as {
+            data: PunchDayRow[];
+            meta: { page: number; total: number; totalPages: number };
+          },
+      ),
+  });
+  const setFilter = <K extends keyof typeof filters>(key: K) => (value: (typeof filters)[K]) => {
+    setPage(1);
+    setFilters((current) => ({ ...current, [key]: value }));
+  };
+  const exportCsv = async () => {
+    try {
+      const response = await api.get('/attendance/punch-events/export', {
+        params,
+        responseType: 'blob',
+      });
+      downloadFile(response.data, 'punch-history.csv');
+    } catch (err) {
+      toast(apiError(err), 'error');
+    }
+  };
+
+  const rows = data?.data ?? [];
+  const totalPages = data?.meta.totalPages ?? 0;
+  const showingAll = filters.scope === 'ALL';
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <Select
+            value={filters.employeeId}
+            onChange={(e) => setFilter('employeeId')(e.target.value)}
+          >
+            <option value="">All employees</option>
+            {employeeOptions.map((employee) => (
+              <option key={employee.id} value={employee.id}>
+                {employeeLabel(employee)}
+              </option>
+            ))}
+          </Select>
+          <Select
+            value={filters.locationId}
+            onChange={(e) => setFilter('locationId')(e.target.value)}
+          >
+            <option value="">All locations</option>
+            {locationOptions.map((location) => (
+              <option key={location.id} value={location.id}>
+                {location.name}
+              </option>
+            ))}
+          </Select>
+          <Input type="date" value={filters.from} onChange={(e) => setFilter('from')(e.target.value)} />
+          <Input type="date" value={filters.to} onChange={(e) => setFilter('to')(e.target.value)} />
+          <Button variant="outline" onClick={exportCsv}>
+            <Download className="h-4 w-4" /> Export CSV
+          </Button>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-line pt-3">
+          <Select
+            className="max-w-xs"
+            value={filters.scope}
+            onChange={(e) => setFilter('scope')(e.target.value as 'MULTI' | 'ALL')}
+          >
+            <option value="MULTI">Multi-punch and multi-location days</option>
+            <option value="ALL">All days with punches</option>
+          </Select>
+          <p className="text-xs text-ink-faint">
+            {showingAll
+              ? 'Including ordinary single check-in/check-out days.'
+              : 'Ordinary single check-in/check-out days are hidden — they already appear under Attendance.'}
+          </p>
+        </div>
+      </Card>
+
+      {isLoading ? (
+        <Skeleton className="h-64" />
+      ) : rows.length === 0 ? (
+        <Card>
+          <EmptyState
+            icon={MapPin}
+            title={showingAll ? 'No punches in this range' : 'No multi-location days in this range'}
+            description={
+              showingAll
+                ? 'Check-ins and check-outs appear here as they happen, with the location each one was recorded at.'
+                : 'Nobody split a day across locations or punched more than once. Switch to "All days with punches" to see every day.'
+            }
+          />
+        </Card>
+      ) : (
+        <div className="space-y-3">
+          {rows.map((day) => (
+            <Card key={`${day.employeeId}-${day.date}`} className="p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="font-medium">
+                    {day.employee
+                      ? `${day.employee.firstName} ${day.employee.lastName}`
+                      : 'Unknown employee'}
+                    <span className="ml-1.5 text-xs text-ink-faint">
+                      {day.employee?.employeeCode}
+                    </span>
+                  </p>
+                  <p className="mt-0.5 text-xs text-ink-muted">
+                    {formatDate(day.date)} · {day.punchCount} punches
+                    {day.locations.length > 1 && ` · ${day.locations.length} locations`}
+                  </p>
+                </div>
+                <div className="text-right text-xs text-ink-muted">
+                  <p className="text-sm font-semibold text-ink tabular-nums">
+                    {formatTime(day.firstIn)} → {day.isOpen ? '…' : formatTime(day.lastOut)}
+                  </p>
+                  <p className="mt-0.5">
+                    {day.grossMinutes != null && `${(day.grossMinutes / 60).toFixed(1)}h span`}
+                    {/* Only worth showing once the two differ — i.e. the day had
+                        a gap between stretches. */}
+                    {day.netMinutes != null &&
+                      day.netMinutes !== day.grossMinutes &&
+                      ` · ${(day.netMinutes / 60).toFixed(1)}h on site`}
+                  </p>
+                </div>
+              </div>
+
+              <Table className="mt-3">
+                <THead>
+                  <TR>
+                    <TH>Punch</TH>
+                    <TH>Time</TH>
+                    <TH>Location</TH>
+                    <TH>Source</TH>
+                  </TR>
+                </THead>
+                <TBody>
+                  {day.events.map((event) => (
+                    <TR key={event.id}>
+                      <TD>
+                        <Badge variant={event.direction === 'IN' ? 'success' : 'default'}>
+                          {event.direction === 'IN' ? (
+                            <>
+                              <LogIn className="h-3 w-3" /> In
+                            </>
+                          ) : (
+                            <>
+                              <LogOut className="h-3 w-3" /> Out
+                            </>
+                          )}
+                        </Badge>
+                      </TD>
+                      <TD className="tabular-nums">{formatTime(event.eventAt)}</TD>
+                      <TD>{event.location?.name ?? '—'}</TD>
+                      <TD>
+                        <span className="text-xs text-ink-muted">{event.source}</span>
+                        {/* Reconstructed from an import or a correction rather
+                            than punched by the employee — worth distinguishing
+                            in an audit view. */}
+                        {event.isSystemGenerated && (
+                          <span className="ml-1.5 text-[11px] text-ink-faint">derived</span>
+                        )}
+                      </TD>
+                    </TR>
+                  ))}
+                </TBody>
+              </Table>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {totalPages > 1 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-ink-muted">
+          <span>
+            Page {page} of {totalPages} · {data?.meta.total} days
+          </span>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(1)}>
+              First
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => p - 1)}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              Next
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page >= totalPages}
+              onClick={() => setPage(totalPages)}
+            >
+              Last
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function CompOffTab() {

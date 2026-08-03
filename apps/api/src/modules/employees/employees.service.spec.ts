@@ -133,4 +133,125 @@ describe('EmployeesService', () => {
       data: [expect.objectContaining({ fieldName: 'pan', approvedAt: null })],
     });
   });
+
+  describe('authorized attendance locations', () => {
+    /** Everything `create` touches, plus the join table it writes separately. */
+    function createHarness() {
+      const employeeLocation = {
+        deleteMany: jest.fn(),
+        upsert: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([]),
+      };
+      const location = {
+        findMany: jest.fn(({ where }: any) =>
+          Promise.resolve((where.id.in as string[]).map((id) => ({ id }))),
+        ),
+      };
+      const created = { id: 'emp-1', status: 'ACTIVE', locationId: 'loc-a', joiningDate: null };
+      const tx = {
+        employee: { create: jest.fn().mockResolvedValue(created), update: jest.fn() },
+        employeeLocation,
+        location,
+        employeeLifecycleEvent: { create: jest.fn() },
+        auditLog: { create: jest.fn() },
+      };
+      const prisma = {
+        employee: { findFirst: jest.fn().mockResolvedValue(null) },
+        user: { findFirst: jest.fn().mockResolvedValue(null) },
+        $transaction: jest.fn((run: any) => run(tx)),
+      };
+      const balances = { initializeForEmployee: jest.fn() };
+      return { prisma, tx, employeeLocation, location, balances };
+    }
+
+    it('keeps authorizedLocationIds out of the Employee row and writes the join table', async () => {
+      const { prisma, tx, employeeLocation, balances } = createHarness();
+      const service = new EmployeesService(prisma as any, {} as any, balances as any);
+
+      await service.create(
+        'tenant-1',
+        {
+          firstName: 'Asha',
+          lastName: 'R',
+          employeeCode: 'PH001',
+          locationId: 'loc-a',
+          authorizedLocationIds: ['loc-b'],
+        } as any,
+        'user-1',
+      );
+
+      // Prisma rejects an unknown argument, so this must never reach the row.
+      const [{ data }] = tx.employee.create.mock.calls[0];
+      expect(data).not.toHaveProperty('authorizedLocationIds');
+      expect(data).toMatchObject({ locationId: 'loc-a', employeeCode: 'PH001' });
+
+      // The primary is authorized whether or not the caller listed it.
+      expect(employeeLocation.upsert).toHaveBeenCalledTimes(2);
+      expect(employeeLocation.upsert.mock.calls.map(([args]: any) => args.create)).toEqual([
+        { employeeId: 'emp-1', locationId: 'loc-a', isPrimary: true },
+        { employeeId: 'emp-1', locationId: 'loc-b', isPrimary: false },
+      ]);
+    });
+
+    it('rejects a location from another workspace', async () => {
+      const { prisma, location, balances } = createHarness();
+      // Only the primary comes back as belonging to the tenant.
+      location.findMany.mockResolvedValue([{ id: 'loc-a' }]);
+      const service = new EmployeesService(prisma as any, {} as any, balances as any);
+
+      await expect(
+        service.create(
+          'tenant-1',
+          {
+            firstName: 'Asha',
+            lastName: 'R',
+            employeeCode: 'PH001',
+            locationId: 'loc-a',
+            authorizedLocationIds: ['loc-from-another-tenant'],
+          } as any,
+          'user-1',
+        ),
+      ).rejects.toThrow(/do not belong to this workspace/i);
+    });
+
+    it('drops the former primary when an employee transfers office', async () => {
+      const existing = { id: 'emp-1', tenantId: 'tenant-1', locationId: 'loc-a', status: 'ACTIVE' };
+      const employeeLocation = {
+        // The extras a caller deliberately added; the old primary is excluded
+        // by the `isPrimary: false` filter the service queries with.
+        findMany: jest.fn().mockResolvedValue([{ locationId: 'loc-c' }]),
+        deleteMany: jest.fn(),
+        upsert: jest.fn(),
+      };
+      const prisma = {
+        employee: {
+          findFirst: jest.fn().mockResolvedValue(existing),
+          update: jest.fn().mockResolvedValue({ ...existing, locationId: 'loc-b' }),
+        },
+        employeeLocation,
+        location: {
+          findMany: jest.fn(({ where }: any) =>
+            Promise.resolve((where.id.in as string[]).map((id) => ({ id }))),
+          ),
+        },
+        employeeProfileChange: { createMany: jest.fn() },
+        auditLog: { create: jest.fn() },
+      };
+      const service = new EmployeesService(prisma as any, {} as any, {} as any);
+
+      await service.update(user, 'emp-1', { locationId: 'loc-b' });
+
+      expect(employeeLocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { employeeId: 'emp-1', isPrimary: false } }),
+      );
+      expect(employeeLocation.upsert.mock.calls.map(([args]: any) => args.create)).toEqual([
+        { employeeId: 'emp-1', locationId: 'loc-b', isPrimary: true },
+        { employeeId: 'emp-1', locationId: 'loc-c', isPrimary: false },
+      ]);
+      // loc-a, the office they left, is no longer authorized.
+      expect(employeeLocation.deleteMany).toHaveBeenCalledWith({
+        where: { employeeId: 'emp-1', locationId: { notIn: ['loc-b', 'loc-c'] } },
+      });
+    });
+  });
 });

@@ -19,6 +19,7 @@ import {
 import { api } from '@/lib/api';
 import { formatDate } from '@/lib/utils';
 import { AttendanceLeaveSummary } from '@/components/employees/attendance-leave-summary';
+import { AuthorizedLocationsField } from '@/components/forms/authorized-locations-field';
 import { EmployeeSendEmailDialog } from '@/components/forms/employee-send-email-dialog';
 import { PeopleAddDocumentDialog } from '@/components/forms/people-add-document-dialog';
 import { Avatar } from '@/components/ui/avatar';
@@ -102,6 +103,9 @@ export default function EmployeeProfilePage() {
   const toast = useToast();
   const [editOpen, setEditOpen] = useState(false);
   const [editForm, setEditForm] = useState(editInitial);
+  // Held apart from `editForm`, whose values are all strings and get filtered
+  // by `value !== ''` when the patch payload is built.
+  const [authorizedLocationIds, setAuthorizedLocationIds] = useState<string[]>([]);
   const { data: e, isLoading } = useQuery({
     queryKey: ['employees', id],
     queryFn: () => api.get(`/employees/${id}`).then((r) => r.data),
@@ -137,7 +141,11 @@ export default function EmployeeProfilePage() {
   const updateEmployee = useMutation({
     mutationFn: () => {
       const payload = Object.fromEntries(Object.entries(editForm).filter(([, value]) => value !== ''));
-      return api.patch(`/employees/${id}`, payload).then((r) => r.data);
+      // Always sent, so unticking every extra location actually clears the set
+      // rather than reading as "leave unchanged".
+      return api
+        .patch(`/employees/${id}`, { ...payload, authorizedLocationIds })
+        .then((r) => r.data);
     },
     onSuccess: () => {
       toast('Employee details updated');
@@ -170,6 +178,14 @@ export default function EmployeeProfilePage() {
       esicNumber: e.esicNumber ?? '',
       taxRegime: e.taxRegime ?? '',
     });
+    // The primary location is implicit on the server, so it is not carried in
+    // the editable extras.
+    const primaryId = e.locationId ?? e.location?.id ?? '';
+    setAuthorizedLocationIds(
+      (e.authorizedLocations ?? [])
+        .map((row: { locationId: string }) => row.locationId)
+        .filter((locationId: string) => locationId !== primaryId),
+    );
   }, [e]);
 
   if (isLoading || !e) {
@@ -269,6 +285,20 @@ export default function EmployeeProfilePage() {
                   <option value="CONSULTANT">Consultant</option>
                 </Select>
               </div>
+            </div>
+
+            <div>
+              <p className="mb-1 text-sm font-semibold text-ink">Attendance locations</p>
+              <p className="mb-3 text-xs text-ink-muted">
+                Every site this employee may punch attendance at. They can check in and out at any
+                of these during the day.
+              </p>
+              <AuthorizedLocationsField
+                locations={options?.locations}
+                primaryLocationId={editForm.locationId}
+                value={authorizedLocationIds}
+                onChange={setAuthorizedLocationIds}
+              />
             </div>
 
             <div>

@@ -127,6 +127,11 @@ enum AttendanceCaptureMode {
   API_IMPORT
 }
 
+enum PunchDirection {
+  IN
+  OUT
+}
+
 enum PayrollRunStatus {
   DRAFT
   PROCESSING
@@ -399,6 +404,8 @@ model Location {
   attendanceCaptureSettings AttendanceCaptureSetting[]
   leavePolicies             LeavePolicy[]
   shiftAssignments          ShiftAssignment[]
+  authorizedEmployees       EmployeeLocation[]
+  punchEvents               AttendancePunchEvent[]
 
   @@index([tenantId])
   @@map("locations")
@@ -689,6 +696,8 @@ model Employee {
   device                   EmployeeDevice?
   RosterUploadRow          RosterUploadRow[]
   AttendanceFinalization   AttendanceFinalization[]
+  authorizedLocations      EmployeeLocation[]
+  punchEvents              AttendancePunchEvent[]
 
   @@unique([tenantId, employeeCode])
   @@index([tenantId])
@@ -807,9 +816,37 @@ model Shift {
   rosterRows          RosterUploadRow[]
   requestedShiftSwaps ShiftSwapRequest[] @relation("RequestedShift")
   targetShiftSwaps    ShiftSwapRequest[] @relation("TargetShift")
+  punchEvents         AttendancePunchEvent[]
 
   @@index([tenantId])
   @@map("shifts")
+}
+
+/// Locations an employee is authorized to punch at, beyond their base
+/// `Employee.locationId`. Purely additive: an employee with no rows here
+/// resolves exactly as before, through the shift assignment override and then
+/// their base location. The base location is always implicitly authorized, so
+/// configuring this list can never lock someone out of their own office.
+///
+/// Deliberately not date-effective. `ShiftAssignment` already owns "where is
+/// this person *scheduled* on this date"; this table only answers "where are
+/// they *permitted* to punch at all".
+model EmployeeLocation {
+  id         String   @id @default(cuid())
+  employeeId String
+  locationId String
+  /// Mirrors `Employee.locationId` for the row representing the base location.
+  /// The employee record remains the source of truth for the primary location.
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, locationId])
+  @@index([employeeId])
+  @@index([locationId])
+  @@map("employee_locations")
 }
 
 model ShiftAssignment {
@@ -977,9 +1014,17 @@ model AttendanceRecord {
   finalizationId  String?
   date            DateTime         @db.Date
   status          AttendanceStatus @default(PRESENT)
+  /// First check-in of the day, across every location worked.
   punchIn         DateTime?
+  /// Last check-out of the day, across every location worked.
   punchOut        DateTime?
+  /// Gross span: `punchOut - punchIn`. Unchanged meaning — every existing
+  /// reader (payroll, finalization, ledger, exports) keeps reading this.
   workingMinutes  Int?
+  /// Sum of the paired check-in/check-out segments, excluding the gaps between
+  /// them. Equal to `workingMinutes` on a single-segment day. Reporting only:
+  /// status, overtime and payroll are still derived from the gross span.
+  netMinutes      Int?
   overtimeMinutes Int?
   punchSource     String? // WEB, MOBILE, GPS, BIOMETRIC, MANUAL, API
   geoLat          Float?
@@ -1001,6 +1046,50 @@ model AttendanceRecord {
   @@index([shiftId])
   @@index([finalizationId])
   @@map("attendance_records")
+}
+
+/// One row per raw punch, so an employee can check in and out several times a
+/// day across several locations. `AttendanceRecord` stays the daily rollup that
+/// every existing module reads; only the punch history report reads this table.
+///
+/// `attendanceDate` is the business day the punch is attributed to, stamped at
+/// write time from the same day anchor `AttendanceRecord.date` uses, so the two
+/// can never disagree about which day a punch belongs to.
+model AttendancePunchEvent {
+  id             String         @id @default(cuid())
+  tenantId       String
+  employeeId     String
+  attendanceDate DateTime       @db.Date
+  eventAt        DateTime
+  direction      PunchDirection
+  /// The location this specific punch happened at. Governs the geofence and
+  /// capture mode for this punch only — the day's status is still classified
+  /// against the employee's effective location for the date.
+  locationId     String?
+  shiftId        String?
+  source         String // WEB, MOBILE, GPS, QR, BIOMETRIC, MANUAL, API_IMPORT
+  geoLat         Float?
+  geoLng         Float?
+  geoAccuracy    Float?
+  deviceId       String?
+  /// True for events reconstructed from an import, a regularization or an HR
+  /// record edit rather than punched by the employee. These are replaced
+  /// wholesale when their source day is rewritten; punched events never are.
+  isSystemGenerated Boolean @default(false)
+  remarks        String?
+  createdAt      DateTime @default(now())
+
+  employee Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  shift    Shift?    @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+
+  /// Makes re-importing the same biometric file a no-op instead of doubling
+  /// every punch.
+  @@unique([employeeId, attendanceDate, direction, eventAt])
+  @@index([tenantId, attendanceDate])
+  @@index([employeeId, attendanceDate, eventAt])
+  @@index([locationId, attendanceDate])
+  @@map("attendance_punch_events")
 }
 
 model LeaveType {

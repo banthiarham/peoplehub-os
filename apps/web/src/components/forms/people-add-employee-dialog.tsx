@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input, Select } from '@/components/ui/input';
 import { useToast } from '@/components/ui/toaster';
+import { AuthorizedLocationsField } from './authorized-locations-field';
 import { apiErrorMessage } from './people-form-utils';
 
 interface OptionItem {
@@ -83,6 +84,9 @@ type OnboardingCredentials = { email: string; temporaryPassword: string };
 export function PeopleAddEmployeeDialog() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(initialForm);
+  // Kept outside `form`, whose values are all strings and are string-filtered
+  // when the payload is built.
+  const [authorizedLocationIds, setAuthorizedLocationIds] = useState<string[]>([]);
   const [credentials, setCredentials] = useState<OnboardingCredentials | null>(null);
   const toast = useToast();
   const queryClient = useQueryClient();
@@ -104,7 +108,12 @@ export function PeopleAddEmployeeDialog() {
           .filter(([, v]) => v !== '')
           .map(([key, value]) => [key, key === 'noticePeriodDays' ? Number(value) : value]),
       );
-      return api.post('/employees', payload).then((r) => r.data);
+      return api
+        .post('/employees', {
+          ...payload,
+          ...(authorizedLocationIds.length ? { authorizedLocationIds } : {}),
+        })
+        .then((r) => r.data);
     },
     onSuccess: (employee) => {
       const createdCredentials = employee?.onboardingCredentials ?? null;
@@ -112,6 +121,7 @@ export function PeopleAddEmployeeDialog() {
       toast(createdCredentials ? 'Employee created with login credentials' : 'Employee created');
       queryClient.invalidateQueries({ queryKey: ['employees'] });
       setForm(initialForm);
+      setAuthorizedLocationIds([]);
       if (!createdCredentials) setOpen(false);
     },
     onError: (err) => toast(apiErrorMessage(err), 'error'),
@@ -218,6 +228,18 @@ export function PeopleAddEmployeeDialog() {
                 <EnumSelect value={form.workMode} onChange={set('workMode')} items={WORK_MODES} />
               </Labeled>
             </div>
+
+            <SectionTitle>Attendance Locations</SectionTitle>
+            <p className="mb-2 text-xs text-ink-muted">
+              Tick every site this employee may punch attendance at. Leave it as just the primary
+              location for someone who works from one place.
+            </p>
+            <AuthorizedLocationsField
+              locations={options?.locations}
+              primaryLocationId={form.locationId}
+              value={authorizedLocationIds}
+              onChange={setAuthorizedLocationIds}
+            />
 
             <SectionTitle>Statutory And Tax</SectionTitle>
             <div className="grid gap-4 sm:grid-cols-3">
