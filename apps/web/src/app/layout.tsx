@@ -12,8 +12,8 @@ export const metadata: Metadata = {
   description: BRAND.description,
   manifest: '/manifest.webmanifest',
   icons: {
-    icon: '/icons/icon-192.png',
-    apple: '/icons/icon-192.png',
+    icon: '/icons/pwa/icon-192x192.png',
+    apple: '/icons/pwa/apple-touch-icon.png',
   },
   other: {
     'mobile-web-app-capable': 'yes',
