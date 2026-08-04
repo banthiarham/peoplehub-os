@@ -521,12 +521,21 @@ describe('AttendanceService', () => {
         holiday: { findMany: jest.fn().mockResolvedValue([]) },
         leaveRequest: { findMany: jest.fn().mockResolvedValue([]) },
         employeeDevice: {
-          findUnique: jest.fn(({ where }: { where: Record<string, any> }) =>
-            Promise.resolve(where.employeeId ? (devices.get(where.employeeId) ?? null) : null),
-          ),
+          findUnique: jest.fn(({ where }: { where: Record<string, any> }) => {
+            if (where.employeeId) return Promise.resolve(devices.get(where.employeeId) ?? null);
+            // The one-employee-per-device lookup, `@@unique([tenantId, deviceId])`.
+            const { tenantId, deviceId } = where.tenantId_deviceId ?? {};
+            return Promise.resolve(
+              [...devices.values()].find(
+                (row) => row.tenantId === tenantId && row.deviceId === deviceId,
+              ) ?? null,
+            );
+          }),
           create: jest.fn(({ data }: { data: Record<string, any> }) => {
-            devices.set(data.employeeId, { ...data });
-            return Promise.resolve(data);
+            // `registeredAt`/`lastSeenAt` are `@default(now())` in the schema.
+            const row = { registeredAt: new Date(), lastSeenAt: new Date(), ...data };
+            devices.set(data.employeeId, row);
+            return Promise.resolve(row);
           }),
           update: jest.fn(({ where, data }: { where: any; data: any }) => {
             const bound = { ...devices.get(where.employeeId), ...data };
@@ -1001,8 +1010,9 @@ describe('AttendanceService', () => {
       });
 
       it('checks out at the location the employee checked in at, not their primary', async () => {
-        // The portal sends only the device id on check-out, so nothing in the
-        // payload names a location. Falling back to the scheduled location
+        // The geo-absent fallback: a punch-out whose payload names no location
+        // and carries no fix — what the clients still send when GPS is denied,
+        // unavailable or too slow. Falling back to the scheduled location
         // recorded the punch-out at an office the employee was never in.
         const prisma = multiSite();
         const service = newAttendanceService(prisma);
@@ -1027,6 +1037,95 @@ describe('AttendanceService', () => {
         ]);
       });
 
+      /** Base at A, also authorized for B, both with a 100m geofence. */
+      const fencedSites = () =>
+        punchHarness({
+          locationId: 'loc-a',
+          authorizedLocationIds: ['loc-a', 'loc-b'],
+          locations: [
+            { id: 'loc-a', geoLat: 12.9, geoLng: 77.6, attendanceRadius: 100 },
+            { id: 'loc-b', geoLat: 19.07, geoLng: 72.87, attendanceRadius: 100 },
+          ],
+        });
+
+      it('resolves the check-out to whichever authorized geofence the fix falls inside', async () => {
+        // Checked in at A, walked to B, punched out there with nothing but a
+        // fix — the case the portal could not express before, which left every
+        // punch-out recorded back at the check-in.
+        const prisma = fencedSites();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        // The check-in ran the geofence; only the check-out's calls matter here.
+        prisma.location.findFirst.mockClear();
+        jest.setSystemTime(at(18, 0));
+        await service.checkOut(user, punch({ geoLat: 19.07, geoLng: 72.87, geoAccuracy: 10 }));
+
+        expect(prisma.punchEventRows[1]).toMatchObject({ direction: 'OUT', locationId: 'loc-b' });
+        // No geofence was enforced on the punch-out: `validateGeofence` loads
+        // the location to measure against, and it was never reached.
+        expect(prisma.location.findFirst).not.toHaveBeenCalled();
+      });
+
+      it('falls back to the open check-in when the fix is inside no authorized geofence', async () => {
+        // Punching out from home, kilometres from either office. The fix
+        // resolves nothing, so the punch-out stays where the check-in was
+        // rather than being rejected or snapped to the nearest office.
+        const prisma = fencedSites();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-b' }));
+        jest.setSystemTime(at(18, 0));
+        await service.checkOut(user, punch({ geoLat: 28.61, geoLng: 77.21, geoAccuracy: 10 }));
+
+        expect(prisma.punchEventRows[1]).toMatchObject({ direction: 'OUT', locationId: 'loc-b' });
+      });
+
+      it('keeps a coordinate-bearing punch-out on its WEB/MOBILE capture mode', async () => {
+        // `GPS` is a capture-mode policy meaning requiresGps + requiresGeofence,
+        // and check-out asserts neither. The fix is location resolution only,
+        // and the event's own geo columns already record that one was attached.
+        const prisma = fencedSites();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(13, 0));
+        await service.checkOut(user, punch({ geoLat: 12.9, geoLng: 77.6, geoAccuracy: 8 }));
+        jest.setSystemTime(at(14, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(18, 0));
+        await service.checkOut(
+          user,
+          punch({ platform: 'Android', geoLat: 12.9, geoLng: 77.6, geoAccuracy: 8 }),
+        );
+
+        expect(prisma.punchEventRows[1]).toMatchObject({
+          direction: 'OUT',
+          source: 'WEB',
+          geoAccuracy: 8,
+        });
+        // Device info still classifies the punch-out; only the fix is excluded.
+        expect(prisma.punchEventRows[3]).toMatchObject({ direction: 'OUT', source: 'MOBILE' });
+      });
+
+      it('leaves the daily record source on the first check-in when the punch-out sends a fix', async () => {
+        const prisma = fencedSites();
+        const service = newAttendanceService(prisma);
+
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        jest.setSystemTime(at(18, 0));
+        const record = (await service.checkOut(
+          user,
+          punch({ geoLat: 12.9, geoLng: 77.6, geoAccuracy: 8 }),
+        )) as never as Record<string, any>;
+
+        expect(record.punchSource).toBe('WEB');
+      });
+
       it('still lets an explicit location on the check-out win', async () => {
         // Checked in at A, walked to B, punched out there.
         const prisma = multiSite();
@@ -1047,6 +1146,73 @@ describe('AttendanceService', () => {
 
         jest.setSystemTime(at(9, 0));
         await expect(service.checkIn(user, device)).rejects.toThrow(/finalized/i);
+      });
+    });
+
+    /**
+     * The binding is the only thing standing between a shared login and buddy
+     * punching, so every one of its refusals is pinned here.
+     */
+    describe('device binding enforcement', () => {
+      const multiSite = () =>
+        punchHarness({ locationId: 'loc-a', authorizedLocationIds: ['loc-a', 'loc-b'] });
+      const colleague = { tenantId: 'tenant-1', employeeId: 'emp-2' } as never;
+      const punch = (extra: Record<string, unknown> = {}) =>
+        ({ deviceId: 'device-1', ...extra }) as never;
+      const WRONG_DEVICE = /not your registered punch device/i;
+
+      /** Binds device-1 to emp-1, the way a first punch does. */
+      async function bound() {
+        const prisma = multiSite();
+        const service = newAttendanceService(prisma);
+        jest.setSystemTime(at(9, 0));
+        await service.checkIn(user, punch({ locationId: 'loc-a' }));
+        return { prisma, service };
+      }
+
+      it('refuses a check-in from another device', async () => {
+        const { service } = await bound();
+        jest.setSystemTime(at(10, 0));
+
+        await expect(service.checkIn(user, punch({ deviceId: 'device-2' }))).rejects.toThrow(
+          WRONG_DEVICE,
+        );
+      });
+
+      it('refuses a check-out from another device', async () => {
+        // Enforced on both directions. A punch-out is not a lesser punch.
+        const { service } = await bound();
+        jest.setSystemTime(at(18, 0));
+
+        await expect(service.checkOut(user, punch({ deviceId: 'device-2' }))).rejects.toThrow(
+          WRONG_DEVICE,
+        );
+      });
+
+      it('refuses a device already registered to another employee', async () => {
+        // The buddy-punching case: one phone, two people.
+        const { prisma } = await bound();
+        const service = newAttendanceService(prisma);
+        jest.setSystemTime(at(10, 0));
+
+        await expect(service.checkIn(colleague, punch({ locationId: 'loc-a' }))).rejects.toThrow(
+          /already registered to another employee/i,
+        );
+      });
+
+      it('binds the device on a first punch and accepts it thereafter', async () => {
+        const { prisma, service } = await bound();
+        jest.setSystemTime(at(18, 0));
+
+        await service.checkOut(user, punch());
+
+        expect(prisma.employeeDevice.create).toHaveBeenCalledTimes(1);
+        expect(prisma.employeeDevice.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { employeeId: 'emp-1' },
+            data: { lastSeenAt: expect.any(Date) },
+          }),
+        );
       });
     });
 

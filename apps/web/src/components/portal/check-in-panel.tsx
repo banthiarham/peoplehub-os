@@ -4,8 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { LocateFixed, MapPin, XCircle } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
-import { getDeviceId, getDeviceInfo } from '@/lib/device';
-import { TARGET_ACCURACY_M, useLiveLocation, type LiveFix } from '@/lib/geo';
+import { getDeviceInfo, requireDeviceId } from '@/lib/device';
+import { captureFreshFix, TARGET_ACCURACY_M, useLiveLocation, type LiveFix } from '@/lib/geo';
 import { formatTime } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -39,6 +39,14 @@ interface PunchDay {
   netMinutes: number | null;
   locations: Array<{ id: string; name: string }>;
 }
+
+/**
+ * How long a check-out waits for a GPS fix before punching out without one.
+ * Shorter than the check-in budget on purpose: a missing fix only costs the
+ * punch-out its resolved location, whereas check-out itself must never be held
+ * up — the fallback records it at the location being closed either way.
+ */
+const CHECKOUT_FIX_WAIT_MS = 6_000;
 
 function apiError(err: unknown): string {
   const e = err as { response?: { data?: { message?: string | string[] } } };
@@ -85,7 +93,7 @@ export function CheckInPanel() {
     mutationFn: (payload: { fix: LiveFix | null; reason?: 'denied' | 'unavailable' }) =>
       api
         .post('/attendance/check-in', {
-          deviceId: getDeviceId(),
+          deviceId: requireDeviceId(),
           ...getDeviceInfo(),
           ...(payload.fix
             ? {
@@ -118,8 +126,26 @@ export function CheckInPanel() {
   });
 
   const checkOut = useMutation({
-    mutationFn: () =>
-      api.post('/attendance/check-out', { deviceId: getDeviceId() }).then((r) => r.data),
+    mutationFn: async () => {
+      // A day can span several sites, so the punch-out carries its own fix for
+      // the server to resolve which one it happened at. Nothing about it can
+      // reject the punch: check-out runs no geofence, and when no fix arrives
+      // the payload is exactly what it has always been.
+      const { fix } = await captureFreshFix(CHECKOUT_FIX_WAIT_MS);
+      return api
+        .post('/attendance/check-out', {
+          deviceId: requireDeviceId(),
+          ...(fix
+            ? {
+                geoLat: fix.lat,
+                geoLng: fix.lng,
+                geoAccuracy: fix.accuracy,
+                fixAt: fix.timestamp,
+              }
+            : {}),
+        })
+        .then((r) => r.data);
+    },
     onSuccess: (record) => {
       queryClient.invalidateQueries({ queryKey: ['attendance'] });
       const hours = record.workingMinutes ? (record.workingMinutes / 60).toFixed(1) : null;
