@@ -21,18 +21,14 @@ import {
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
 import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
+import { workedDayStatus } from './attendance-status';
 import {
   nextPunchDirection,
   summarisePunchEvents,
   syncSystemPunchEvents,
   type PunchEventLike,
 } from './punch-events';
-import {
-  earlyDeparture,
-  isLateArrival,
-  overtimeAfterShiftEnd,
-  workingDayThresholds,
-} from './shift-timing';
+import { earlyDeparture, isLateArrival, overtimeAfterShiftEnd } from './shift-timing';
 import {
   AssignShiftDto,
   CheckInDto,
@@ -1575,25 +1571,19 @@ export class AttendanceService {
     return status === AttendanceStatus.PRESENT && arrivedLate ? AttendanceStatus.LATE : status;
   }
 
+  /**
+   * A day with both punches, scored as a share of its shift. See
+   * `attendance-status.ts` for the thresholds and why the break is not read.
+   */
   private classifyAttendanceStatus(input: {
     workingMinutes?: number;
-    shift?: {
-      halfDayAfterMinutes?: number | null;
-      minWorkingMinutes?: number | null;
-      breakDurationMins?: number | null;
-      startTime?: string | null;
-      endTime?: string | null;
-    } | null;
+    shift?: { startTime?: string | null; endTime?: string | null } | null;
     tenantId?: string;
     locationId?: string | null;
     date?: Date;
   }): AttendanceStatus {
     if (input.workingMinutes == null) return 'MISSING_PUNCH';
-    // Scaled to how long the resolved shift actually runs, overnight included.
-    const { halfDayAfterMinutes, minWorkingMinutes } = workingDayThresholds(input.shift);
-    if (input.workingMinutes < halfDayAfterMinutes) return 'ABSENT';
-    if (input.workingMinutes < minWorkingMinutes) return 'HALF_DAY';
-    return 'PRESENT';
+    return workedDayStatus({ workingMinutes: input.workingMinutes, shift: input.shift });
   }
 
   /** Minutes clocked after the resolved shift ended. See `overtimeAfterShiftEnd`. */
