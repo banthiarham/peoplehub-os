@@ -8,6 +8,7 @@ import {
 import {
   AttendanceCaptureMode,
   AttendanceStatus,
+  CompOffStatus,
   Prisma,
   PunchDirection,
   ShiftSwapStatus,
@@ -33,8 +34,10 @@ import {
   AssignShiftDto,
   CheckInDto,
   CheckOutDto,
+  CreateCompOffDto,
   CreateShiftSwapDto,
   CreateShiftDto,
+  DecideCompOffDto,
   DecideShiftSwapDto,
   FinalizeAttendanceDto,
   ImportAttendanceRowsDto,
@@ -65,6 +68,9 @@ const LEAVE_RECONCILABLE_STATUSES: AttendanceStatus[] = [
   AttendanceStatus.MISSING_PUNCH,
   AttendanceStatus.HALF_DAY,
 ];
+
+/** How long a comp-off stays available before it lapses, in days. */
+const COMP_OFF_VALIDITY_DAYS = 90;
 
 /** Reject GPS fixes with a worse accuracy radius than this (meters). */
 const MAX_FIX_ACCURACY_M = 150;
@@ -2646,7 +2652,7 @@ export class AttendanceService {
             sourceAttendanceRecordId: record.id,
             earnedDate: record.date,
             days: 1,
-            expiresAt: new Date(record.date.getTime() + 90 * 24 * 60 * 60 * 1000),
+            expiresAt: new Date(record.date.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
             notes: 'Generated from finalized weekend/holiday work',
           },
           update: {},
@@ -2708,6 +2714,71 @@ export class AttendanceService {
       include: { employee: { select: { firstName: true, lastName: true, employeeCode: true } } },
       orderBy: { earnedDate: 'desc' },
       take: 100,
+    });
+  }
+
+  /**
+   * Manually credits a comp-off. HR needs this because the automatic grant only
+   * fires at month finalization, and only for days the system itself classified
+   * as weekly-off or holiday work — an ad-hoc credit (an on-call Sunday, a day
+   * worked before the tenant's holiday calendar was loaded) has no other route.
+   *
+   * The earned day is linked to its attendance record when one exists, so the
+   * grant and the day it was earned on stay traceable to each other, and a
+   * second credit for the same day is rejected rather than silently doubled.
+   */
+  async createCompOff(tenantId: string, dto: CreateCompOffDto) {
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: dto.employeeId, tenantId },
+      select: { id: true },
+    });
+    if (!employee) throw new NotFoundException('Employee not found');
+
+    const earnedDate = requireAttendanceDate(dto.earnedDate);
+    const duplicate = await this.prisma.compOffGrant.findFirst({
+      where: {
+        tenantId,
+        employeeId: employee.id,
+        earnedDate,
+        status: { in: [CompOffStatus.AVAILABLE, CompOffStatus.USED] },
+      },
+      select: { id: true },
+    });
+    if (duplicate) {
+      throw new BadRequestException('This employee already has a comp-off credited for that date');
+    }
+
+    const record = await this.prisma.attendanceRecord.findUnique({
+      where: { employeeId_date: { employeeId: employee.id, date: earnedDate } },
+      select: { id: true },
+    });
+
+    return this.prisma.compOffGrant.create({
+      data: {
+        tenantId,
+        employeeId: employee.id,
+        sourceAttendanceRecordId: record?.id,
+        earnedDate,
+        days: dto.days ?? 1,
+        expiresAt: dto.expiresAt
+          ? requireAttendanceDate(dto.expiresAt, 'expiresAt')
+          : new Date(earnedDate.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+        notes: dto.notes ?? 'Manually credited',
+      },
+      include: { employee: { select: { firstName: true, lastName: true, employeeCode: true } } },
+    });
+  }
+
+  /** Marks a grant used, cancelled or expired. Only an available grant can move. */
+  async decideCompOff(tenantId: string, id: string, dto: DecideCompOffDto) {
+    const grant = await this.prisma.compOffGrant.findFirst({ where: { id, tenantId } });
+    if (!grant) throw new NotFoundException('Comp-off not found');
+    if (grant.status !== CompOffStatus.AVAILABLE) {
+      throw new BadRequestException(`This comp-off is already ${grant.status.toLowerCase()}`);
+    }
+    return this.prisma.compOffGrant.update({
+      where: { id },
+      data: { status: dto.status, ...(dto.notes && { notes: dto.notes }) },
     });
   }
 

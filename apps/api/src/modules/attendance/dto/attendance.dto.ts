@@ -17,7 +17,13 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
-import { AttendanceCaptureMode, AttendanceStatus, ShiftSwapStatus, ShiftType } from '@prisma/client';
+import {
+  AttendanceCaptureMode,
+  AttendanceStatus,
+  CompOffStatus,
+  ShiftSwapStatus,
+  ShiftType,
+} from '@prisma/client';
 import { SUPPORTED_ATTENDANCE_DATE_FORMATS } from '../../../common/utils/attendance-date';
 
 export class CheckInDto {
@@ -751,6 +757,45 @@ export class DecideShiftSwapDto {
   @IsOptional()
   @IsString()
   note?: string;
+}
+
+export class CreateCompOffDto {
+  @ApiProperty({ description: 'Employee the comp-off is credited to' })
+  @IsString()
+  @IsNotEmpty()
+  employeeId!: string;
+
+  @ApiProperty({ description: 'The weekly-off or holiday that was worked' })
+  @IsDateString()
+  earnedDate!: string;
+
+  @ApiPropertyOptional({ description: 'Credited days; half-day comp-offs are 0.5', default: 1 })
+  @IsOptional()
+  @IsNumber()
+  @Min(0.5)
+  @Max(2)
+  days?: number;
+
+  @ApiPropertyOptional({ description: 'Expiry date; defaults to 90 days after the earned date' })
+  @IsOptional()
+  @IsDateString()
+  expiresAt?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class DecideCompOffDto {
+  @ApiProperty({ enum: [CompOffStatus.USED, CompOffStatus.CANCELLED, CompOffStatus.EXPIRED] })
+  @IsEnum(CompOffStatus)
+  status!: CompOffStatus;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  notes?: string;
 }
 
 export class UpsertHolidayDto {

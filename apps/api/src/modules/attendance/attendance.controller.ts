@@ -10,9 +10,11 @@ import {
   AssignShiftDto,
   CheckInDto,
   CheckOutDto,
+  CreateCompOffDto,
   CreateShiftSwapDto,
   CreateShiftDto,
   DateQueryDto,
+  DecideCompOffDto,
   DecideShiftSwapDto,
   EffectiveShiftQueryDto,
   FinalizeAttendanceDto,
@@ -339,6 +341,22 @@ export class AttendanceController {
   @Scopes('attendance:read')
   compOffs(@CurrentUser() user: AuthUser) {
     return this.attendance.listCompOffs(user);
+  }
+
+  @Post('comp-offs')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Manually credit a comp-off for a worked weekly-off or holiday' })
+  createCompOff(@CurrentUser() user: AuthUser, @Body() dto: CreateCompOffDto) {
+    return this.attendance.createCompOff(user.tenantId, dto);
+  }
+
+  @Patch('comp-offs/:id')
+  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Mark a comp-off used, cancelled or expired' })
+  decideCompOff(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DecideCompOffDto) {
+    return this.attendance.decideCompOff(user.tenantId, id, dto);
   }
 
   @Get('shift-swaps')
