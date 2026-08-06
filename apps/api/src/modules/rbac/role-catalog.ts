@@ -44,6 +44,21 @@ const grant = (module: string, permissionTypes: PermissionType[], scopeType: Sco
   scopeType,
 });
 
+/**
+ * NOTE ON SELF-SERVICE LEAVE
+ *
+ * Applying for your own leave is deliberately NOT a catalog grant. It is authorised by
+ * the caller's own employee link (`@SelfService()` on the route, plus an active-employee
+ * check in `LeaveService`), not by a `leave` module permission.
+ *
+ * Granting `leave: CREATE` to every role instead would have handed each of them
+ * `leave:write`, and `RolesGuard` matches roles OR scopes - so the scope would have
+ * widened access to every other route sharing it, and would have survived any later
+ * narrowing of the self-service routes. Employee linkage is the narrower, more honest
+ * predicate: it cannot be widened by a permission row and it disappears when the person
+ * leaves.
+ */
+
 export const SYSTEM_ROLE_CATALOG: CatalogRole[] = [
   {
     name: 'Tenant Owner',

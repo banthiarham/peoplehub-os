@@ -14,6 +14,14 @@ import { PermissionType } from '@prisma/client';
 export const PAYROLL_LIFECYCLE_SCOPES = ['payroll:run', 'payroll:lock', 'payroll:unlock'] as const;
 
 /**
+ * Scope actions that gate module-wide configuration (leave types, leave policies, ...)
+ * as opposed to acting on a record. `RolesGuard` matches roles OR scopes, so a route
+ * that must stay administrative cannot rely on a generic `:write` scope: any role that
+ * can create its own record in that module would satisfy it.
+ */
+export const CONFIGURE_SCOPES = ['leave:configure'] as const;
+
+/**
  * Maps a permission module to its scope namespace.
  *
  * Only `workflows` is renamed: the decorators have always used `workflow:*`.
@@ -34,15 +42,20 @@ export function scopeModule(moduleName: string): string {
  *    lifecycle on it let Finance Admin and Manager lock a payroll run.
  *  - `MANAGE_INTEGRATIONS`, `MANAGE_API_KEYS` and `VIEW_SENSITIVE` previously fell
  *    through to `[]`, which made every Developer and Integration Admin grant inert.
+ *  - `CONFIGURE` keeps `write` so nothing that already relied on it loses access, and
+ *    additionally derives `configure`. Module-setup routes match on `configure` so that
+ *    granting a role `CREATE` (apply for my own leave) does not also hand it the leave
+ *    type and policy editors through the shared `:write` scope.
  */
 export function scopeActions(permissionType: PermissionType): string[] {
   switch (permissionType) {
     case PermissionType.VIEW:
       return ['read'];
+    case PermissionType.CONFIGURE:
+      return ['write', 'configure'];
     case PermissionType.CREATE:
     case PermissionType.EDIT:
     case PermissionType.DELETE:
-    case PermissionType.CONFIGURE:
       return ['write'];
     case PermissionType.APPROVE:
       return ['approve'];

@@ -2,11 +2,12 @@ import { ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { RolesGuard } from './roles.guard';
 import { AuthUser } from '../types/auth-user';
-import { catalogRoleScopes } from '../../modules/rbac/role-catalog';
+import { SYSTEM_ROLE_NAMES, catalogRoleScopes } from '../../modules/rbac/role-catalog';
 import { AnalyticsController } from '../../modules/analytics/analytics.controller';
 import { AssetsController } from '../../modules/assets/assets.controller';
 import { DeveloperController } from '../../modules/developer/developer.controller';
 import { EngagementController } from '../../modules/engagement/engagement.controller';
+import { LeaveController } from '../../modules/leave/leave.controller';
 import { OnboardingController } from '../../modules/onboarding/onboarding.controller';
 import { PayrollController } from '../../modules/payroll/payroll.controller';
 import { RbacController } from '../../modules/rbac/rbac.controller';
@@ -83,6 +84,97 @@ describe('RolesGuard: recruitment management vs approval', () => {
 
   it('refuses an Employee on recruitment reads', () => {
     expect(allowed(RecruitmentController, 'listCandidates', userFor('Employee'))).toBe(false);
+  });
+});
+
+describe('RolesGuard: leave self-service is authorised by the employee link', () => {
+  const SELF_SERVICE = ['apply', 'cancel', 'myRequests', 'myBalances', 'types'];
+
+  /** The same role, but the user account is not linked to an employee record. */
+  const unlinked = (roleName: string): AuthUser => ({ ...userFor(roleName), employeeId: null }) as AuthUser;
+
+  it.each(SYSTEM_ROLE_NAMES)('lets an employee-linked %s reach every self-service route', (roleName) => {
+    for (const method of SELF_SERVICE) {
+      expect(allowed(LeaveController, method, userFor(roleName))).toBe(true);
+    }
+  });
+
+  it('lets an employee-linked Manager apply without any leave:write scope', () => {
+    const manager = userFor('Manager');
+    expect(manager.scopes).not.toContain('leave:write');
+    expect(allowed(LeaveController, 'apply', manager)).toBe(true);
+    expect(allowed(LeaveController, 'cancel', manager)).toBe(true);
+  });
+
+  // apply and cancel are self-service ONLY - no scope is an alternative route in.
+  it.each(SYSTEM_ROLE_NAMES)('refuses %s on apply and cancel with no employee record', (roleName) => {
+    expect(allowed(LeaveController, 'apply', unlinked(roleName))).toBe(false);
+    expect(allowed(LeaveController, 'cancel', unlinked(roleName))).toBe(false);
+  });
+
+  it('refuses an unlinked technical role on the own-data reads too', () => {
+    for (const roleName of ['Developer', 'Integration Admin']) {
+      expect(allowed(LeaveController, 'myRequests', unlinked(roleName))).toBe(false);
+      expect(allowed(LeaveController, 'myBalances', unlinked(roleName))).toBe(false);
+      expect(allowed(LeaveController, 'types', unlinked(roleName))).toBe(false);
+    }
+  });
+
+  // myRequests/myBalances/types also accept `leave:read`, so a leave-reading role without
+  // an employee record still passes the guard. LeaveService is what refuses it - the guard
+  // is the coarse gate, ownership is enforced where the employee is resolved.
+  it('leaves the own-data reads to the service for an unlinked leave reader', () => {
+    for (const roleName of ['Auditor', 'Employee', 'Manager']) {
+      expect(allowed(LeaveController, 'myRequests', unlinked(roleName))).toBe(true);
+      expect(allowed(LeaveController, 'types', unlinked(roleName))).toBe(true);
+    }
+  });
+
+  it('refuses a machine token even when it carries the leave scopes', () => {
+    const apiKey = {
+      ...userFor('Employee'),
+      authType: 'apiKey',
+      employeeId: 'employee-1',
+      scopes: ['leave:read', 'leave:write'],
+    } as AuthUser;
+    expect(allowed(LeaveController, 'apply', apiKey)).toBe(false);
+    expect(allowed(LeaveController, 'cancel', apiKey)).toBe(false);
+  });
+
+  it('lets the platform Super Admin through, as everywhere else', () => {
+    const platform = { ...userFor('Employee'), roles: [], isSuperAdmin: true } as AuthUser;
+    expect(allowed(LeaveController, 'apply', platform)).toBe(true);
+  });
+});
+
+describe('RolesGuard: leave configuration and approval are unchanged', () => {
+  // Self-service does not run through `leave:write`, but leave setup still must not be
+  // reachable by anyone who merely holds it: RolesGuard matches roles OR scopes.
+  it.each(['createType', 'updateType', 'createPolicy', 'updatePolicy'])(
+    'keeps leave setup on the Tenant Owner and HR Admin: %s',
+    (method) => {
+      expect(allowed(LeaveController, method, OWNER)).toBe(true);
+      expect(allowed(LeaveController, method, userFor('HR Admin'))).toBe(true);
+      for (const roleName of ['Manager', 'Employee', 'Payroll Admin', 'Finance Admin', 'Auditor', 'Recruiter']) {
+        expect(allowed(LeaveController, method, userFor(roleName))).toBe(false);
+      }
+    },
+  );
+
+  it('keeps leave approval on the approver roles only', () => {
+    for (const roleName of ['Tenant Owner', 'HR Admin', 'Manager']) {
+      expect(allowed(LeaveController, 'approve', userFor(roleName))).toBe(true);
+      expect(allowed(LeaveController, 'reject', userFor(roleName))).toBe(true);
+    }
+    for (const roleName of ['Employee', 'Recruiter', 'Auditor', 'Developer', 'Finance Admin']) {
+      expect(allowed(LeaveController, 'approve', userFor(roleName))).toBe(false);
+      expect(allowed(LeaveController, 'reject', userFor(roleName))).toBe(false);
+    }
+  });
+
+  it('keeps the tenant-wide leave reads on the leave:read holders', () => {
+    expect(allowed(LeaveController, 'list', userFor('Auditor'))).toBe(true);
+    expect(allowed(LeaveController, 'list', userFor('Developer'))).toBe(false);
   });
 });
 
