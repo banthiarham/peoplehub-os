@@ -26,7 +26,7 @@ import { useState } from 'react';
 import type { ChangeEvent } from 'react';
 import { api } from '@/lib/api';
 import { downloadFile } from '@/lib/download';
-import { getDeviceId, getDeviceInfo } from '@/lib/device';
+import { getDeviceInfo, requireDeviceId } from '@/lib/device';
 import { asArray, employeeLabel, employeeOptionsFrom, type EmployeeOption } from '@/lib/options';
 import {
   ATTENDANCE_IMPORT_TEMPLATE,
@@ -238,6 +238,13 @@ const CAPTURE_MODE_HELP: Record<CaptureMode, string> = {
   API_IMPORT: 'External attendance system sync endpoint.',
 };
 
+/**
+ * How long a check-out waits for a GPS fix before punching out without one.
+ * Shorter than the check-in budget on purpose: a missing fix only costs the
+ * punch-out its resolved location, and it must never hold the punch up.
+ */
+const CHECKOUT_FIX_WAIT_MS = 6_000;
+
 /** Today, so a sample roster row is never dated in the past. */
 const ROSTER_SAMPLE_DATE = new Date().toISOString().slice(0, 10);
 
@@ -423,7 +430,7 @@ export default function AttendancePage() {
       const { fix, reason } = await captureFreshFix();
       return api
         .post('/attendance/check-in', {
-          deviceId: getDeviceId(),
+          deviceId: requireDeviceId(),
           ...getDeviceInfo(),
           ...(fix
             ? { geoLat: fix.lat, geoLng: fix.lng, geoAccuracy: fix.accuracy, fixAt: fix.timestamp }
@@ -446,8 +453,21 @@ export default function AttendancePage() {
   });
 
   const checkOut = useMutation({
-    mutationFn: () =>
-      api.post('/attendance/check-out', { deviceId: getDeviceId() }).then((r) => r.data),
+    mutationFn: async () => {
+      // Carries its own fix so the server can resolve which authorized location
+      // the punch-out happened at — a day can span several. It cannot reject
+      // the punch: check-out runs no geofence, and with no fix the payload is
+      // exactly what it has always been.
+      const { fix } = await captureFreshFix(CHECKOUT_FIX_WAIT_MS);
+      return api
+        .post('/attendance/check-out', {
+          deviceId: requireDeviceId(),
+          ...(fix
+            ? { geoLat: fix.lat, geoLng: fix.lng, geoAccuracy: fix.accuracy, fixAt: fix.timestamp }
+            : {}),
+        })
+        .then((r) => r.data);
+    },
     onSuccess: (record) => {
       const h = Math.floor((record.workingMinutes ?? 0) / 60);
       const m = (record.workingMinutes ?? 0) % 60;
@@ -547,7 +567,7 @@ export default function AttendancePage() {
               onClick={() => checkOut.mutate()}
               disabled={checkOut.isPending}
             >
-              <LogOut className="h-3.5 w-3.5" /> Check out
+              <LogOut className="h-3.5 w-3.5" /> {checkOut.isPending ? 'Locating…' : 'Check out'}
             </Button>
             <Button size="sm" onClick={() => checkIn.mutate()} disabled={checkIn.isPending}>
               <LogIn className="h-3.5 w-3.5" /> {checkIn.isPending ? 'Locating…' : 'Check in'}

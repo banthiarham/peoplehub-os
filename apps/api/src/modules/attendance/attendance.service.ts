@@ -245,6 +245,23 @@ export class AttendanceService {
     return AttendanceCaptureMode.WEB;
   }
 
+  /**
+   * The capture mode a punch-out is recorded under.
+   *
+   * A punch-out may now carry a GPS fix, but only so `resolvePunchLocation` can
+   * tell which authorized location it happened at. It is deliberately *not*
+   * classified as a GPS punch: `GPS` is a capture-mode policy whose defaults
+   * are `requiresGps` and `requiresGeofence`, and check-out asserts neither
+   * (see `checkOut`). Labelling the event GPS would tell everyone reading the
+   * punch export that those checks ran on it, which is never true. That a fix
+   * was attached is already recorded on the event's own geo columns, so the
+   * mode is derived with the fix excluded and a punch-out keeps the WEB/MOBILE
+   * semantics it has always had.
+   */
+  private punchOutCaptureMode(dto: CheckOutDto): AttendanceCaptureMode {
+    return this.deriveInteractiveCaptureMode({ ...dto, geoLat: undefined, geoLng: undefined });
+  }
+
   private importSourceToCaptureMode(source: 'BIOMETRIC' | 'MANUAL' | 'API'): AttendanceCaptureMode {
     if (source === 'API') return AttendanceCaptureMode.API_IMPORT;
     return source === 'BIOMETRIC' ? AttendanceCaptureMode.BIOMETRIC : AttendanceCaptureMode.MANUAL;
@@ -843,6 +860,11 @@ export class AttendanceService {
    * binding only. It records where the punch happened, but adding a capture
    * mode assertion or a geofence here would start rejecting punch-outs that
    * succeed today, stranding employees on the clock.
+   *
+   * The clients now send a GPS fix when one is available. It is used for one
+   * thing only: resolving which authorized location the punch-out happened at.
+   * No fix, a stale one, or one inside no authorized geofence all fall back to
+   * the location of the check-in being closed, exactly as before.
    */
   async checkOut(user: AuthUser, dto: CheckOutDto) {
     const employeeId = this.requireEmployee(user);
@@ -886,7 +908,7 @@ export class AttendanceService {
       locationId: punchLocationId,
       shift,
       effectiveLocationId,
-      source: this.deriveInteractiveCaptureMode(dto),
+      source: this.punchOutCaptureMode(dto),
       dto,
     });
   }
