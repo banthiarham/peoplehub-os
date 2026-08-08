@@ -45,7 +45,12 @@ export class ApplyLeaveDto {
   @IsString()
   attachmentKey?: string;
 
-  @ApiPropertyOptional({ description: 'Apply on behalf of (HR only)' })
+  /**
+   * Accepted only when it equals the caller's own employee id; anything else is refused.
+   * Kept so existing clients that echo their own id keep working - this endpoint has no
+   * on-behalf-of mode.
+   */
+  @ApiPropertyOptional({ description: 'Must be your own employee id if sent; on-behalf-of is not supported' })
   @IsOptional()
   @IsString()
   employeeId?: string;

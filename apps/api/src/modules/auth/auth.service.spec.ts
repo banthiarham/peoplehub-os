@@ -1,4 +1,5 @@
 import { JwtService } from '@nestjs/jwt';
+import { PermissionType } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash } from 'crypto';
 import { AuthService, TENANT_OWNER_SCOPES } from './auth.service';
@@ -309,7 +310,9 @@ describe('Tenant Owner scopes', () => {
     for (const scope of [
       'attendance:approve', 'attendance:import', 'attendance:read', 'attendance:write',
       'documents:read', 'documents:write', 'employees:approve', 'employees:read', 'employees:write',
-      'helpdesk:approve', 'helpdesk:read', 'helpdesk:write', 'leave:approve', 'leave:read', 'leave:write',
+      'helpdesk:approve', 'helpdesk:read', 'helpdesk:write',
+      // leave:configure carries the leave type/policy setup routes that used to sit on leave:write
+      'leave:approve', 'leave:configure', 'leave:read', 'leave:write',
       'notifications:read', 'notifications:write', 'organization:read', 'organization:write',
       'payroll:approve', 'payroll:read', 'payroll:write',
       'workflow:approve', 'workflow:read', 'workflow:write',
@@ -375,5 +378,57 @@ describe('login scope derivation for the final catalog', () => {
     const scopes = await loginAs('Integration Admin');
     expect(scopes).toContain('developer:integrations');
     expect(scopes).not.toContain('developer:api_keys');
+  });
+
+  it('gives a Tenant Owner leave:configure even when their role rows lack the CONFIGURE grant', async () => {
+    // Simulates a tenant provisioned before `leave: CONFIGURE` existed and never backfilled:
+    // the compatibility list is what keeps leave setup reachable for the owner.
+    const permissions = [
+      { module: 'leave', permissionType: PermissionType.VIEW },
+      { module: 'leave', permissionType: PermissionType.CREATE },
+    ];
+    const prisma = {
+      user: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'user-1',
+          tenantId: 'tenant-1',
+          email: 'owner@example.com',
+          name: 'Tenant Owner',
+          avatarUrl: null,
+          passwordHash: bcrypt.hashSync('Password@123', 4),
+          isSuperAdmin: false,
+          tenant: { id: 'tenant-1', slug: 'acme', name: 'Acme' },
+          employee: null,
+          userRoles: [{ role: { name: 'Tenant Owner', permissions } }],
+        }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const jwt = { signAsync: jest.fn().mockResolvedValue('token') } as unknown as JwtService;
+    const service = new AuthService(prisma as any, jwt);
+    const result = await service.login({ email: 'owner@example.com', password: 'Password@123' });
+
+    expect(result.user.scopes).toContain('leave:configure');
+  });
+
+  it.each(SYSTEM_ROLE_CATALOG.map((r) => r.name).filter((name) => name !== 'Tenant Owner'))(
+    'never gives %s leave:configure at login',
+    async (roleName) => {
+      expect(await loginAs(roleName)).not.toContain('leave:configure');
+    },
+  );
+
+  it('leaves the rest of the leave scopes exactly as they were', async () => {
+    // The compatibility pin must not widen anything else: self-service leave is authorised
+    // by the employee link, and no non-admin role may gain leave:write from this change.
+    expect(await loginAs('HR Admin')).toEqual(expect.arrayContaining(['leave:read', 'leave:write', 'leave:approve']));
+    for (const roleName of ['Manager', 'Payroll Admin', 'Auditor', 'Read-only Leadership User']) {
+      expect(await loginAs(roleName)).not.toContain('leave:write');
+    }
+    for (const roleName of ['Finance Admin', 'Recruiter', 'Developer', 'Integration Admin']) {
+      const scopes = await loginAs(roleName);
+      expect(scopes).not.toContain('leave:write');
+      expect(scopes).not.toContain('leave:read');
+    }
   });
 });

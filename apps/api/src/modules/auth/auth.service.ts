@@ -34,6 +34,10 @@ const LEGACY_TENANT_OWNER_SCOPES = [
   'helpdesk:read',
   'helpdesk:write',
   'leave:approve',
+  // Leave type and policy setup moved off the shared `leave:write` onto `leave:configure`.
+  // Pinned here rather than left to the catalog so owner access to leave setup cannot be
+  // lost by a later narrowing of the catalog's `leave` grant.
+  'leave:configure',
   'leave:read',
   'leave:write',
   'notifications:read',

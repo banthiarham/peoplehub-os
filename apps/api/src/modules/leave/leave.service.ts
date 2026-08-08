@@ -16,6 +16,24 @@ function dateOnly(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+/**
+ * Employee statuses that may transact their own leave.
+ *
+ * `ON_PROBATION` and `ON_NOTICE` are included on purpose: whether they may take a given
+ * leave type is a policy question the apply flow answers per request, not a reason to
+ * refuse them the self-service routes outright. Everything omitted here - CANDIDATE,
+ * PREBOARDING, EXITED, ABSCONDING, INACTIVE - describes someone who is not currently
+ * working, so a token still carrying their `employeeId` must not transact leave.
+ */
+const LEAVE_SELF_SERVICE_STATUSES = [
+  'ACTIVE',
+  'ON_PROBATION',
+  'CONFIRMED',
+  'ON_NOTICE',
+  'CONTRACTOR',
+  'INTERN',
+] as const;
+
 @Injectable()
 export class LeaveService {
   constructor(
@@ -24,9 +42,35 @@ export class LeaveService {
     private readonly shifts: ShiftResolutionService,
   ) {}
 
-  private requireEmployee(user: AuthUser): string {
+  /**
+   * Resolves the caller's own employee record, or refuses.
+   *
+   * This is the authorisation for every self-service leave route, so it re-reads the
+   * record rather than trusting the token: `employeeId` is minted at login and a token
+   * outlives an exit, a deactivation or a move to another tenant. The `tenantId` filter
+   * is what stops a stale or forged token reaching another workspace's employee.
+   */
+  private async requireActiveEmployee(user: AuthUser) {
     if (!user.employeeId) throw new ForbiddenException('No employee profile linked to this user');
-    return user.employeeId;
+    const employee = await this.prisma.employee.findFirst({
+      where: {
+        id: user.employeeId,
+        tenantId: user.tenantId,
+        status: { in: [...LEAVE_SELF_SERVICE_STATUSES] },
+      },
+      select: {
+        id: true,
+        status: true,
+        gender: true,
+        employmentType: true,
+        locationId: true,
+        probationEndDate: true,
+      },
+    });
+    if (!employee) {
+      throw new ForbiddenException('No active employee profile linked to this user');
+    }
+    return employee;
   }
 
   async types(tenantId: string) {
@@ -81,6 +125,16 @@ export class LeaveService {
     const leaveType = await this.prisma.leaveType.findFirst({ where: { id: leaveTypeId, tenantId } });
     if (!leaveType) throw new NotFoundException('Leave type not found');
     return leaveType;
+  }
+
+  /**
+   * Own balances. Resolves the employee from the token instead of letting the controller
+   * pass `user.employeeId ?? ''`, which returned an empty list for an unlinked user and
+   * so read as "you have no balances" rather than "you have no employee record".
+   */
+  async myBalances(user: AuthUser, year = new Date().getFullYear()) {
+    const { id: employeeId } = await this.requireActiveEmployee(user);
+    return this.balances(user.tenantId, employeeId, year);
   }
 
   async balances(tenantId: string, employeeId: string, year = new Date().getFullYear()) {
@@ -151,24 +205,23 @@ export class LeaveService {
     });
   }
 
+  /**
+   * Raises a leave request for the CALLER, and only for the caller.
+   *
+   * The target employee comes from the authenticated token, never from the body. A body
+   * that names a different employee is refused outright rather than silently ignored, so
+   * an on-behalf-of attempt surfaces as a 403 instead of quietly booking the wrong
+   * person's leave. There is deliberately no on-behalf-of path through this route.
+   */
   async apply(user: AuthUser, dto: ApplyLeaveDto) {
-    const employeeId = dto.employeeId ?? this.requireEmployee(user);
+    const employee = await this.requireActiveEmployee(user);
+    const employeeId = employee.id;
+    if (dto.employeeId && dto.employeeId !== employeeId) {
+      throw new ForbiddenException('Leave can only be applied for your own employee record');
+    }
     const from = dateOnly(new Date(dto.fromDate));
     const to = dateOnly(new Date(dto.toDate));
     if (to < from) throw new BadRequestException('toDate must be on or after fromDate');
-
-    const employee = await this.prisma.employee.findFirst({
-      where: { id: employeeId, tenantId: user.tenantId },
-      select: {
-        id: true,
-        status: true,
-        gender: true,
-        employmentType: true,
-        locationId: true,
-        probationEndDate: true,
-      },
-    });
-    if (!employee) throw new NotFoundException('Employee not found');
 
     const leaveType = await this.ensureLeaveType(user.tenantId, dto.leaveTypeId);
     if (!leaveType) throw new NotFoundException('Leave type not found');
@@ -280,9 +333,9 @@ export class LeaveService {
   }
 
   async myRequests(user: AuthUser) {
-    const employeeId = this.requireEmployee(user);
+    const { id: employeeId } = await this.requireActiveEmployee(user);
     return this.prisma.leaveRequest.findMany({
-      where: { employeeId },
+      where: { tenantId: user.tenantId, employeeId },
       include: { leaveType: { select: { name: true, code: true } } },
       orderBy: { createdAt: 'desc' },
       take: 50,
@@ -331,7 +384,9 @@ export class LeaveService {
   }
 
   async cancel(user: AuthUser, id: string) {
-    const employeeId = this.requireEmployee(user);
+    const { id: employeeId } = await this.requireActiveEmployee(user);
+    // `employeeId` is part of the lookup, so someone else's request reads as not found
+    // rather than as a request this caller is not allowed to cancel.
     const request = await this.prisma.leaveRequest.findFirst({
       where: { id, tenantId: user.tenantId, employeeId },
     });

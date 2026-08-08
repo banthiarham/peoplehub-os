@@ -130,6 +130,20 @@ describe('system role catalog: role behaviour', () => {
     expect(catalogRoleScopes('Manager')).not.toContain('payroll:approve');
   });
 
+  it('keeps leave write and configure off every role that does not administer leave', () => {
+    // Self-service leave is authorised by the caller's employee link, not by a catalog
+    // grant. If a `leave: CREATE` is ever added here it also derives `leave:write`, which
+    // RolesGuard accepts as an alternative to the role list on other leave routes.
+    const leaveAdmins = ['Tenant Owner', 'HR Admin'];
+    for (const roleName of SYSTEM_ROLE_NAMES.filter((name) => !leaveAdmins.includes(name) && name !== 'Employee')) {
+      expect(catalogRoleScopes(roleName)).not.toContain('leave:write');
+    }
+    expect(catalogRoleScopes('Tenant Owner')).toContain('leave:configure');
+    for (const roleName of SYSTEM_ROLE_NAMES.filter((name) => name !== 'Tenant Owner')) {
+      expect(catalogRoleScopes(roleName)).not.toContain('leave:configure');
+    }
+  });
+
   it('gives Payroll Admin run, lock and unlock', () => {
     const scopes = catalogRoleScopes('Payroll Admin');
     expect(scopes).toEqual(expect.arrayContaining(['payroll:run', 'payroll:lock', 'payroll:unlock']));

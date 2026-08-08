@@ -32,6 +32,20 @@ describe('permission scope mapping', () => {
     expect(scopes).not.toContain('payroll:unlock');
   });
 
+  it('separates module configuration from a plain write', () => {
+    expect(scopeActions(PermissionType.CONFIGURE)).toEqual(['write', 'configure']);
+    for (const type of [PermissionType.CREATE, PermissionType.EDIT, PermissionType.DELETE]) {
+      expect(scopeActions(type)).toEqual(['write']);
+      expect(scopeActions(type)).not.toContain('configure');
+    }
+  });
+
+  it('never derives a configure scope from a create grant', () => {
+    const scopes = scopesForPermissions([{ module: 'leave', permissionType: PermissionType.CREATE }]);
+    expect(scopes).toEqual(['leave:write']);
+    expect(scopes).not.toContain('leave:configure');
+  });
+
   it('de-duplicates and sorts', () => {
     expect(
       scopesForPermissions([
