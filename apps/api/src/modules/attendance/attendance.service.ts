@@ -1708,6 +1708,29 @@ export class AttendanceService {
       ) ?? null;
   }
 
+  /**
+   * The employee's own month, as a ledger rather than a list of punches.
+   *
+   * An absence is the absence of a row — nothing writes an `ABSENT` record until
+   * the month is finalized — so reading the table alone showed only the days the
+   * employee turned up. The record-less days are filled in from
+   * `monthlyLedgerFor`, the same derivation the HR-side summary uses, which
+   * keeps the two views of one month in agreement.
+   *
+   * Stored records are returned verbatim so every field the portal already reads
+   * (`id`, `geoAccuracy`, `punchSource`, …) survives untouched, and records that
+   * fall outside the ledger window are still returned: the result is always a
+   * superset of what this endpoint used to return.
+   *
+   * Every applicable day is returned with its own status — WEEKEND and HOLIDAY
+   * included — so the month reads as a continuous timeline up to today rather
+   * than a list of exceptions.
+   *
+   * The single day held back is a derived ABSENT for today: the day is still in
+   * progress, and it would otherwise greet every employee with an absence until
+   * they punch in. Today still appears as a weekend, a holiday, approved leave,
+   * or whatever its stored record says, because none of those are provisional.
+   */
   async me(user: AuthUser, month?: string) {
     const employeeId = this.requireEmployee(user);
     const { start, end } = parseMonth(month);
@@ -1715,10 +1738,52 @@ export class AttendanceService {
       where: { employeeId, date: { gte: start, lt: end } },
       orderBy: { date: 'desc' },
     });
-    const count = (s: string) => records.filter((r) => r.status === s).length;
-    const worked = records.filter((r) => r.workingMinutes != null);
+
+    const employee = await this.prisma.employee.findFirst({
+      where: { id: employeeId, tenantId: user.tenantId },
+      select: { joiningDate: true, exitDate: true },
+    });
+    const monthKey = `${start.getUTCFullYear()}-${String(start.getUTCMonth() + 1).padStart(2, '0')}`;
+    const ledger = await this.monthlyLedgerFor(user.tenantId, employeeId, monthKey, {
+      joiningDate: employee?.joiningDate,
+      exitDate: employee?.exitDate,
+    });
+
+    const dateKey = (date: Date) => date.toISOString().slice(0, 10);
+    const recordedDates = new Set(records.map((r) => dateKey(r.date)));
+    const todayKey = dateKey(dateOnly(new Date()));
+    const derived = ledger.days
+      .filter(
+        (day) =>
+          !recordedDates.has(dateKey(day.date)) &&
+          !(dateKey(day.date) === todayKey && day.status === 'ABSENT'),
+      )
+      .map((day) => ({
+        id: `derived:${dateKey(day.date)}`,
+        employeeId,
+        date: day.date,
+        status: day.status,
+        punchIn: null,
+        punchOut: null,
+        workingMinutes: null,
+        overtimeMinutes: null,
+        geoAccuracy: null,
+        punchSource: null,
+        shiftId: day.shiftId,
+        locationId: day.locationId,
+        isFinalized: false,
+        isDerived: true as const,
+      }));
+
+    const rows = [
+      ...records.map((record) => ({ ...record, isDerived: false as const })),
+      ...derived,
+    ].sort((a, b) => b.date.getTime() - a.date.getTime());
+
+    const count = (s: string) => rows.filter((r) => r.status === s).length;
+    const worked = rows.filter((r) => r.workingMinutes != null);
     return {
-      records,
+      records: rows,
       summary: {
         present: count('PRESENT'),
         late: count('LATE'),

@@ -1,3 +1,4 @@
+import { AuthUser } from '../../common/types/auth-user';
 import { AttendanceService } from './attendance.service';
 import { ShiftResolutionService } from './shift-resolution.service';
 
@@ -2701,6 +2702,285 @@ describe('AttendanceService', () => {
     expect(byDate.get('2026-06-03')).toBe('HOLIDAY');
     expect(byDate.get('2026-06-06')).toBe('WEEKEND');
     expect(created).toHaveLength(30);
+  });
+
+  describe('me', () => {
+    const shift = {
+      id: 'shift-1',
+      weeklyOffDays: [0, 6],
+      startTime: '09:00',
+      endTime: '18:00',
+      gracePeriodMins: 15,
+      earlyLeavingGraceMins: 15,
+    };
+
+    const user: AuthUser = {
+      userId: 'user-1',
+      tenantId: 'tenant-1',
+      email: 'emp@example.com',
+      name: 'Emp',
+      isSuperAdmin: false,
+      employeeId: 'emp-1',
+      roles: [],
+    };
+
+    function mePrisma(options?: {
+      records?: Array<Record<string, unknown>>;
+      holidays?: string[];
+      leaves?: Array<{ employeeId: string; fromDate: string; toDate: string }>;
+      employee?: Record<string, unknown>;
+    }) {
+      return {
+        employee: {
+          findFirst: jest
+            .fn()
+            .mockResolvedValue({ locationId: 'loc-1', ...(options?.employee ?? {}) }),
+        },
+        attendanceRecord: { findMany: jest.fn().mockResolvedValue(options?.records ?? []) },
+        holiday: {
+          findMany: jest.fn().mockResolvedValue(
+            (options?.holidays ?? []).map((date) => ({ date: new Date(`${date}T00:00:00.000Z`) })),
+          ),
+        },
+        leaveRequest: {
+          findMany: jest.fn().mockResolvedValue(
+            (options?.leaves ?? []).map((leave) => ({
+              employeeId: leave.employeeId,
+              fromDate: new Date(`${leave.fromDate}T00:00:00.000Z`),
+              toDate: new Date(`${leave.toDate}T00:00:00.000Z`),
+            })),
+          ),
+        },
+        shiftAssignment: { findMany: jest.fn().mockResolvedValue([]) },
+        shift: { findFirst: jest.fn().mockResolvedValue(shift) },
+        attendanceRule: { findMany: jest.fn().mockResolvedValue([]) },
+      };
+    }
+
+    // June 2026 is fully in the past, so nothing is clamped to today.
+    const month = '2026-06';
+    const byDate = (result: { records: Array<{ date: Date }> }) =>
+      new Map(result.records.map((row) => [row.date.toISOString().slice(0, 10), row as any]));
+
+    it('fills unrecorded working days in as ABSENT and counts them in the summary', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          records: [
+            {
+              id: 'rec-1',
+              date: new Date('2026-06-01T00:00:00.000Z'),
+              status: 'PRESENT',
+              punchIn: new Date('2026-06-01T09:00:00.000Z'),
+              punchOut: new Date('2026-06-01T18:00:00.000Z'),
+              workingMinutes: 480,
+              geoAccuracy: 12,
+              punchSource: 'GPS',
+            },
+          ],
+        }),
+      );
+
+      const result = await service.me(user, month);
+      const days = byDate(result);
+
+      // The whole of June, not just the days that were punched.
+      expect(result.records).toHaveLength(30);
+      // 22 working days in June 2026; one is recorded, the other 21 are absences.
+      expect(days.get('2026-06-02')?.status).toBe('ABSENT');
+      expect(days.get('2026-06-02')?.isDerived).toBe(true);
+      expect(result.summary.absent).toBe(21);
+      expect(result.summary.present).toBe(1);
+      // Only real records carry hours, so the average is untouched by derivation.
+      expect(result.summary.avgWorkHours).toBe(8);
+    });
+
+    it('returns stored records verbatim, including fields the ledger does not carry', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          records: [
+            {
+              id: 'rec-1',
+              date: new Date('2026-06-01T00:00:00.000Z'),
+              status: 'LATE',
+              punchIn: new Date('2026-06-01T10:00:00.000Z'),
+              punchOut: null,
+              workingMinutes: null,
+              geoAccuracy: 18,
+              punchSource: 'GPS',
+              remarks: 'traffic',
+            },
+          ],
+        }),
+      );
+
+      const result = await service.me(user, month);
+      const row = byDate(result).get('2026-06-01');
+
+      expect(row.id).toBe('rec-1');
+      expect(row.geoAccuracy).toBe(18);
+      expect(row.punchSource).toBe('GPS');
+      expect(row.remarks).toBe('traffic');
+      expect(row.isDerived).toBe(false);
+      expect(result.summary.late).toBe(1);
+    });
+
+    it('includes weekly offs and holidays, with a stored record taking precedence', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          holidays: ['2026-06-03'],
+          records: [
+            { id: 'rec-sat', date: new Date('2026-06-06T00:00:00.000Z'), status: 'PRESENT', workingMinutes: 300 },
+          ],
+        }),
+      );
+
+      const result = await service.me(user, month);
+      const days = byDate(result);
+
+      expect(days.get('2026-06-03')?.status).toBe('HOLIDAY');
+      expect(days.get('2026-06-07')?.status).toBe('WEEKEND'); // Sunday
+      // A Saturday that was actually worked reads as worked, not as a weekly off.
+      expect(days.get('2026-06-06')?.id).toBe('rec-sat');
+      expect(days.get('2026-06-06')?.status).toBe('PRESENT');
+      // Neither weekly offs nor holidays move the summary counters: the holiday
+      // takes one working day out of the 22, and the worked Saturday was never
+      // one of them.
+      expect(result.summary.absent).toBe(21);
+      expect(result.summary.present).toBe(1);
+    });
+
+    it('reports every day of the month with no gaps in the timeline', async () => {
+      const service = newAttendanceService(mePrisma());
+
+      const result = await service.me(user, month);
+      const dates = result.records.map((row) => row.date.toISOString().slice(0, 10)).sort();
+
+      expect(dates).toHaveLength(30);
+      expect(dates[0]).toBe('2026-06-01');
+      expect(dates[29]).toBe('2026-06-30');
+      expect(new Set(dates).size).toBe(30);
+    });
+
+    it('derives approved leave as ON_LEAVE rather than absence', async () => {
+      const service = newAttendanceService(
+        mePrisma({ leaves: [{ employeeId: 'emp-1', fromDate: '2026-06-02', toDate: '2026-06-03' }] }),
+      );
+
+      const result = await service.me(user, month);
+      const days = byDate(result);
+
+      expect(days.get('2026-06-02')?.status).toBe('ON_LEAVE');
+      expect(days.get('2026-06-03')?.status).toBe('ON_LEAVE');
+      expect(result.summary.onLeave).toBe(2);
+      expect(result.summary.absent).toBe(20);
+    });
+
+    it('does not derive absences before joining or after relieving', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          employee: {
+            joiningDate: new Date('2026-06-10T00:00:00.000Z'),
+            exitDate: new Date('2026-06-19T00:00:00.000Z'),
+          },
+        }),
+      );
+
+      const result = await service.me(user, month);
+      const dates = result.records.map((row) => row.date.toISOString().slice(0, 10));
+
+      expect(dates.every((date) => date >= '2026-06-10' && date <= '2026-06-19')).toBe(true);
+      // 10th–19th is eight working days plus one weekend pair: the timeline
+      // covers all ten, and only the eight count as absences.
+      expect(result.records).toHaveLength(10);
+      expect(result.summary.absent).toBe(8);
+    });
+
+    // The current date moves, so these derive it the same way the service does
+    // rather than pinning a fixture month.
+    const now = new Date();
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const todayKey = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()))
+      .toISOString()
+      .slice(0, 10);
+
+    it('never derives an absence for today, which is still in progress', async () => {
+      const service = newAttendanceService(mePrisma());
+
+      const result = await service.me(user, currentMonth);
+      const days = byDate(result);
+
+      // Today is either withheld as a would-be absence or present as a
+      // weekly off, never as an absence.
+      expect(days.get(todayKey)?.status).not.toBe('ABSENT');
+      // Future days are outside the ledger window entirely.
+      expect(result.records.every((row) => row.date.toISOString().slice(0, 10) <= todayKey)).toBe(
+        true,
+      );
+    });
+
+    it('still shows today when it is a holiday', async () => {
+      const service = newAttendanceService(mePrisma({ holidays: [todayKey] }));
+
+      const result = await service.me(user, currentMonth);
+
+      expect(byDate(result).get(todayKey)?.status).toBe('HOLIDAY');
+    });
+
+    it('still shows today when it has a stored record', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          records: [
+            {
+              id: 'rec-today',
+              date: new Date(`${todayKey}T00:00:00.000Z`),
+              status: 'PRESENT',
+              punchIn: new Date(`${todayKey}T09:00:00.000Z`),
+              workingMinutes: 480,
+            },
+          ],
+        }),
+      );
+
+      const result = await service.me(user, currentMonth);
+      const today = byDate(result).get(todayKey);
+
+      expect(today?.id).toBe('rec-today');
+      expect(today?.status).toBe('PRESENT');
+      expect(today?.isDerived).toBe(false);
+    });
+
+    it('still returns records that fall outside the derived window', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          employee: { joiningDate: new Date('2026-06-10T00:00:00.000Z') },
+          records: [
+            // Recorded before joining — previously visible, and must stay visible.
+            { id: 'rec-early', date: new Date('2026-06-02T00:00:00.000Z'), status: 'PRESENT', workingMinutes: 480 },
+          ],
+        }),
+      );
+
+      const result = await service.me(user, month);
+
+      expect(byDate(result).get('2026-06-02')?.id).toBe('rec-early');
+      expect(result.summary.present).toBe(1);
+    });
+
+    it('orders the merged month newest first', async () => {
+      const service = newAttendanceService(
+        mePrisma({
+          records: [
+            { id: 'rec-15', date: new Date('2026-06-15T00:00:00.000Z'), status: 'PRESENT', workingMinutes: 480 },
+          ],
+        }),
+      );
+
+      const result = await service.me(user, month);
+      const dates = result.records.map((row) => row.date.getTime());
+
+      expect(dates).toEqual([...dates].sort((a, b) => b - a));
+      expect(result.records[0].date.toISOString().slice(0, 10)).toBe('2026-06-30');
+    });
   });
 
   describe('check-in resolves the assignment covering the punch day', () => {
