@@ -3922,3 +3922,94 @@ describe('AttendanceService', () => {
     });
   });
 });
+
+describe('manual comp-off grants', () => {
+  function compOffHarness(overrides: Record<string, any> = {}) {
+    const prisma = {
+      employee: { findFirst: jest.fn().mockResolvedValue({ id: 'emp-1' }) },
+      attendanceRecord: { findUnique: jest.fn().mockResolvedValue(null) },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn((args: any) => Promise.resolve({ id: 'grant-1', ...args.data })),
+        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+      },
+      ...overrides,
+    };
+    return { prisma, service: newAttendanceService(prisma) };
+  }
+
+  it('credits a comp-off, defaulting the expiry to 90 days after the earned day', async () => {
+    const { prisma, service } = compOffHarness();
+
+    await service.createCompOff('tenant-1', { employeeId: 'emp-1', earnedDate: '2026-08-15' });
+
+    const { data } = prisma.compOffGrant.create.mock.calls[0][0];
+    expect(data).toMatchObject({ tenantId: 'tenant-1', employeeId: 'emp-1', days: 1 });
+    expect(data.earnedDate.toISOString().slice(0, 10)).toBe('2026-08-15');
+    expect(data.expiresAt.toISOString().slice(0, 10)).toBe('2026-11-13');
+  });
+
+  it('links the grant to the attendance record of the day it was earned on', async () => {
+    const { prisma, service } = compOffHarness({
+      attendanceRecord: { findUnique: jest.fn().mockResolvedValue({ id: 'record-9' }) },
+    });
+
+    await service.createCompOff('tenant-1', { employeeId: 'emp-1', earnedDate: '2026-08-15' });
+
+    expect(prisma.compOffGrant.create.mock.calls[0][0].data.sourceAttendanceRecordId).toBe('record-9');
+  });
+
+  it('rejects a second credit for a day the employee already has one for', async () => {
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'grant-existing' }),
+        create: jest.fn(),
+        update: jest.fn(),
+      },
+    });
+
+    await expect(
+      service.createCompOff('tenant-1', { employeeId: 'emp-1', earnedDate: '2026-08-15' }),
+    ).rejects.toThrow('already has a comp-off credited');
+  });
+
+  it('rejects an employee outside the tenant', async () => {
+    const { service } = compOffHarness({ employee: { findFirst: jest.fn().mockResolvedValue(null) } });
+
+    await expect(
+      service.createCompOff('tenant-1', { employeeId: 'emp-other', earnedDate: '2026-08-15' }),
+    ).rejects.toThrow('Employee not found');
+  });
+
+  it('only moves a grant that is still available', async () => {
+    const { prisma, service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
+        create: jest.fn(),
+        update: jest.fn(),
+      },
+    });
+
+    await expect(
+      service.decideCompOff('tenant-1', 'grant-1', { status: 'CANCELLED' as never }),
+    ).rejects.toThrow('already used');
+    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+  });
+
+  it('marks an available grant used', async () => {
+    const { prisma, service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'AVAILABLE' }),
+        create: jest.fn(),
+        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+      },
+    });
+
+    await service.decideCompOff('tenant-1', 'grant-1', { status: 'USED' as never });
+
+    expect(prisma.compOffGrant.update).toHaveBeenCalledWith({
+      where: { id: 'grant-1' },
+      data: { status: 'USED' },
+    });
+  });
+});

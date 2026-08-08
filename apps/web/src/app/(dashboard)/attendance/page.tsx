@@ -2463,12 +2463,174 @@ function PunchHistoryTab() {
   );
 }
 
+/**
+ * Comp-off ledger plus a manual credit form.
+ *
+ * The automatic grant only runs at month finalization, so until the month is
+ * closed — and for any day the system never classified as a weekly-off or
+ * holiday — HR has no way to credit a worked rest day. This form is that way in.
+ */
 function CompOffTab() {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const employeeOptions = useEmployeeOptions();
   const { data } = useQuery({
     queryKey: ['attendance', 'comp-offs'],
     queryFn: () => api.get('/attendance/comp-offs').then((r) => r.data as CompOffRow[]),
   });
-  return <Card><Table><THead><TR><TH>Employee</TH><TH>Earned</TH><TH>Days</TH><TH>Expires</TH><TH>Status</TH></TR></THead><TBody>{data?.map((c) => <TR key={c.id}><TD>{c.employee.firstName} {c.employee.lastName}</TD><TD>{formatDate(c.earnedDate)}</TD><TD>{c.days}</TD><TD>{c.expiresAt ? formatDate(c.expiresAt) : '—'}</TD><TD><Badge variant={statusVariant(c.status)}>{c.status}</Badge></TD></TR>)}</TBody></Table></Card>;
+
+  const [form, setForm] = useState({
+    employeeId: '',
+    earnedDate: new Date().toISOString().slice(0, 10),
+    days: '1',
+    expiresAt: '',
+    notes: '',
+  });
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ['attendance', 'comp-offs'] });
+
+  const create = useMutation({
+    mutationFn: () =>
+      api.post('/attendance/comp-offs', {
+        employeeId: form.employeeId,
+        earnedDate: form.earnedDate,
+        days: Number(form.days),
+        // Omitted rather than sent empty, so the API applies its own validity window.
+        ...(form.expiresAt && { expiresAt: form.expiresAt }),
+        ...(form.notes && { notes: form.notes }),
+      }),
+    onSuccess: () => {
+      toast('Comp-off credited');
+      invalidate();
+      setForm((f) => ({ ...f, employeeId: '', notes: '' }));
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  const decide = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: 'USED' | 'CANCELLED' }) =>
+      api.patch(`/attendance/comp-offs/${id}`, { status }),
+    onSuccess: () => {
+      toast('Comp-off updated');
+      invalidate();
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
+      <Card className="p-4">
+        <h3 className="text-sm font-semibold text-ink">Credit a comp-off</h3>
+        <p className="mt-1 text-xs text-ink-muted">
+          For a weekly-off or holiday the employee actually worked.
+        </p>
+        <form
+          className="mt-3 space-y-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            create.mutate();
+          }}
+        >
+          <Select
+            value={form.employeeId}
+            onChange={(e) => setForm((f) => ({ ...f, employeeId: e.target.value }))}
+            required
+          >
+            <option value="">Select employee</option>
+            {employeeOptions.map((employee) => (
+              <option key={employee.id} value={employee.id}>
+                {employeeLabel(employee)}
+              </option>
+            ))}
+          </Select>
+          <label className="block text-xs text-ink-muted">
+            Earned on
+            <Input
+              type="date"
+              value={form.earnedDate}
+              onChange={(e) => setForm((f) => ({ ...f, earnedDate: e.target.value }))}
+              required
+            />
+          </label>
+          <label className="block text-xs text-ink-muted">
+            Days
+            <Select value={form.days} onChange={(e) => setForm((f) => ({ ...f, days: e.target.value }))}>
+              <option value="0.5">Half day (0.5)</option>
+              <option value="1">Full day (1)</option>
+            </Select>
+          </label>
+          <label className="block text-xs text-ink-muted">
+            Expires on (optional — defaults to 90 days)
+            <Input
+              type="date"
+              value={form.expiresAt}
+              onChange={(e) => setForm((f) => ({ ...f, expiresAt: e.target.value }))}
+            />
+          </label>
+          <Input
+            placeholder="Note (optional)"
+            value={form.notes}
+            onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
+          />
+          <Button type="submit" disabled={!form.employeeId || create.isPending}>
+            Credit comp-off
+          </Button>
+        </form>
+      </Card>
+      <Card>
+        <Table>
+          <THead>
+            <TR>
+              <TH>Employee</TH>
+              <TH>Earned</TH>
+              <TH>Days</TH>
+              <TH>Expires</TH>
+              <TH>Status</TH>
+              <TH>Actions</TH>
+            </TR>
+          </THead>
+          <TBody>
+            {data?.map((c) => (
+              <TR key={c.id}>
+                <TD>
+                  {c.employee.firstName} {c.employee.lastName}
+                </TD>
+                <TD>{formatDate(c.earnedDate)}</TD>
+                <TD>{c.days}</TD>
+                <TD>{c.expiresAt ? formatDate(c.expiresAt) : '—'}</TD>
+                <TD>
+                  <Badge variant={statusVariant(c.status)}>{c.status}</Badge>
+                </TD>
+                <TD className="space-x-1">
+                  {c.status === 'AVAILABLE' ? (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: c.id, status: 'USED' })}
+                      >
+                        Mark used
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: c.id, status: 'CANCELLED' })}
+                      >
+                        Cancel
+                      </Button>
+                    </>
+                  ) : (
+                    <span className="text-xs text-ink-faint">—</span>
+                  )}
+                </TD>
+              </TR>
+            ))}
+          </TBody>
+        </Table>
+      </Card>
+    </div>
+  );
 }
 
 function HolidaysTab() {
