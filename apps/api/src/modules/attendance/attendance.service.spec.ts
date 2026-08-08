@@ -117,6 +117,14 @@ function withPunchEvents(prisma: Record<string, any>): Record<string, any> {
     findFirst: jest.fn().mockResolvedValue(null),
     ...(prisma.location ?? {}),
   };
+  // The daily ledger reads the holiday calendar the same way the monthly ledger
+  // and finalization do, so every double needs the table. Empty by default: a
+  // test that says nothing about holidays means the tenant configured none.
+  prisma.holiday = {
+    findMany: jest.fn().mockResolvedValue([]),
+    findFirst: jest.fn().mockResolvedValue(null),
+    ...(prisma.holiday ?? {}),
+  };
   return prisma;
 }
 
@@ -319,6 +327,118 @@ describe('AttendanceService', () => {
       'ABSENT',
     ]);
     expect(result.summary.absent).toBe(1);
+  });
+
+  describe('forDate holiday classification', () => {
+    const HOLIDAY = new Date('2026-07-01T00:00:00.000Z'); // A Wednesday.
+
+    /**
+     * Four employees on one date, one per precedence tier, so a change to the
+     * ordering shows up as a reordered row list rather than a single failure.
+     */
+    function buildDailyHarness(options: { holidays?: Date[]; date?: Date } = {}) {
+      const date = options.date ?? HOLIDAY;
+      const employees = ['emp-record', 'emp-leave', 'emp-weekend', 'emp-working'].map((id) => ({
+        id,
+        firstName: id,
+        lastName: 'Employee',
+        employeeCode: id,
+        department: null,
+      }));
+      const prisma = {
+        employee: { findMany: jest.fn().mockResolvedValue(employees) },
+        attendanceRecord: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'record-1',
+              employeeId: 'emp-record',
+              date,
+              status: 'PRESENT',
+              punchIn: null,
+              punchOut: null,
+            },
+          ]),
+        },
+        leaveRequest: { findMany: jest.fn().mockResolvedValue([{ employeeId: 'emp-leave' }]) },
+        holiday: {
+          findMany: jest.fn().mockResolvedValue((options.holidays ?? []).map((d) => ({ date: d }))),
+        },
+        // Only `emp-weekend` treats this weekday as a weekly off, so the holiday
+        // and weekly-off tiers stay independently observable.
+        shiftAssignment: {
+          findFirst: jest.fn().mockImplementation(({ where }: { where: { employeeId: string } }) =>
+            Promise.resolve({
+              shift: {
+                id: `shift-${where.employeeId}`,
+                weeklyOffDays: where.employeeId === 'emp-weekend' ? [date.getUTCDay()] : [],
+              },
+            }),
+          ),
+        },
+        shift: { findFirst: jest.fn() },
+      };
+      return { prisma, service: newAttendanceService(prisma), date };
+    }
+
+    it('reports a configured holiday as HOLIDAY rather than ABSENT', async () => {
+      const { prisma, service, date } = buildDailyHarness({ holidays: [HOLIDAY] });
+
+      const result = await service.forDate('tenant-1', date);
+
+      const byEmployee = new Map(result.rows.map((row) => [row.employee.id, row.status]));
+      expect(byEmployee.get('emp-working')).toBe('HOLIDAY');
+      expect(result.summary.absent).toBe(0);
+      expect(prisma.holiday.findMany).toHaveBeenCalledWith({
+        where: { holidayCalendar: { tenantId: 'tenant-1' }, date: { gte: date, lte: date } },
+        select: { date: true },
+      });
+    });
+
+    it('keeps record over leave over holiday over weekly off over absence', async () => {
+      const { service, date } = buildDailyHarness({ holidays: [HOLIDAY] });
+
+      const result = await service.forDate('tenant-1', date);
+
+      // A stored record still wins; approved leave still outranks the holiday;
+      // a weekly off that lands on a holiday reads as the holiday.
+      expect(result.rows.map((row) => row.status)).toEqual([
+        'PRESENT',
+        'ON_LEAVE',
+        'HOLIDAY',
+        'HOLIDAY',
+      ]);
+      expect(result.summary).toEqual({ present: 1, late: 0, absent: 0, onLeave: 1, total: 4 });
+    });
+
+    it('leaves weekly off and absence untouched on a day with no holiday', async () => {
+      const { service, date } = buildDailyHarness();
+
+      const result = await service.forDate('tenant-1', date);
+
+      expect(result.rows.map((row) => row.status)).toEqual([
+        'PRESENT',
+        'ON_LEAVE',
+        'WEEKEND',
+        'ABSENT',
+      ]);
+      expect(result.summary).toEqual({ present: 1, late: 0, absent: 1, onLeave: 1, total: 4 });
+    });
+
+    it('does not apply a holiday configured for a different day', async () => {
+      const { service, date } = buildDailyHarness({
+        holidays: [new Date('2026-07-02T00:00:00.000Z')],
+      });
+
+      const result = await service.forDate('tenant-1', date);
+
+      expect(result.rows.map((row) => row.status)).toEqual([
+        'PRESENT',
+        'ON_LEAVE',
+        'WEEKEND',
+        'ABSENT',
+      ]);
+    });
+
   });
 
   it('updates only weekly off days on a tenant shift', async () => {
@@ -3691,6 +3811,114 @@ describe('AttendanceService', () => {
       expect(prisma.attendanceCaptureSetting.findFirst).toHaveBeenCalledWith({
         where: { tenantId: 'tenant-1', locationId: 'loc-remote', mode: 'MANUAL' },
       });
+    });
+  });
+
+  describe('createHoliday', () => {
+    const AUG_15 = Date.UTC(2026, 7, 15);
+
+    function holidayPrisma(existing: Record<string, unknown> | null = null) {
+      return {
+        holidayCalendar: {
+          upsert: jest.fn().mockResolvedValue({ id: 'default-tenant-1-2026' }),
+          findFirst: jest.fn().mockResolvedValue({ id: 'default-tenant-1-2026' }),
+        },
+        holiday: {
+          findFirst: jest.fn().mockResolvedValue(existing),
+          create: jest.fn((args: { data: Record<string, unknown> }) =>
+            Promise.resolve({ id: 'holiday-1', ...args.data }),
+          ),
+        },
+      };
+    }
+
+    /** The stored day of a `createHoliday` call, as its UTC day key. */
+    async function storedDay(prisma: ReturnType<typeof holidayPrisma>, date: string) {
+      await newAttendanceService(prisma).createHoliday('tenant-1', {
+        name: 'Independence Day',
+        date,
+      });
+      const [[args]] = prisma.holiday.create.mock.calls;
+      return args.data.date as Date;
+    }
+
+    /*
+     * Timezone independence is a property of `parseAttendanceDate`, which reads
+     * the literal date part out of the string and calls `Date.UTC` — it never
+     * constructs a day from local parts, so it cannot drift with the host zone.
+     * `attendance-date.spec.ts` owns that proof. What matters here is that
+     * `createHoliday` goes through it rather than through `new Date(...)`, so
+     * these assert delegation and the resulting day. Note that reassigning
+     * `process.env.TZ` inside a test does nothing under Jest: it replaces
+     * `process.env` with a plain object, so V8 never gets the change
+     * notification and the zone stays whatever the process launched with.
+     */
+    it('stores the calendar day the author wrote', async () => {
+      const stored = await storedDay(holidayPrisma(), '2026-08-15');
+
+      expect(stored.toISOString()).toBe('2026-08-15T00:00:00.000Z');
+    });
+
+    it('keeps the written day for a timestamp that falls on another local date', async () => {
+      // 23:30Z on the 15th is already the 16th in the production zone (+05:30).
+      // Reading local date parts filed this holiday a day late; the literal
+      // date part keeps it on the 15th on every host.
+      const stored = await storedDay(holidayPrisma(), '2026-08-15T23:30:00.000Z');
+
+      expect(stored.getTime()).toBe(AUG_15);
+    });
+
+    it('files the calendar under the year of the normalized day', async () => {
+      const prisma = holidayPrisma();
+
+      await newAttendanceService(prisma).createHoliday('tenant-1', {
+        name: 'New Year',
+        date: '2026-01-01',
+      });
+
+      expect(prisma.holidayCalendar.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'default-tenant-1-2026' } }),
+      );
+    });
+
+    it('rejects a second holiday on a day the calendar already covers', async () => {
+      const prisma = holidayPrisma({ id: 'holiday-existing', name: 'Independence Day' });
+      const service = newAttendanceService(prisma);
+
+      await expect(
+        service.createHoliday('tenant-1', { name: 'Independence Day (dup)', date: '2026-08-15' }),
+      ).rejects.toThrow('already on this calendar for 2026-08-15');
+      expect(prisma.holiday.findFirst).toHaveBeenCalledWith({
+        where: { holidayCalendarId: 'default-tenant-1-2026', date: new Date(AUG_15) },
+        select: { id: true, name: true },
+      });
+      expect(prisma.holiday.create).not.toHaveBeenCalled();
+    });
+
+    it('allows the same date on a different calendar', async () => {
+      const prisma = holidayPrisma();
+      prisma.holidayCalendar.findFirst.mockResolvedValue({ id: 'calendar-mumbai' });
+
+      await newAttendanceService(prisma).createHoliday(
+        'tenant-1',
+        { name: 'Local Holiday', date: '2026-08-15' },
+        'calendar-mumbai',
+      );
+
+      expect(prisma.holiday.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { holidayCalendarId: 'calendar-mumbai', date: new Date(AUG_15) },
+        }),
+      );
+      expect(prisma.holiday.create).toHaveBeenCalled();
+    });
+
+    it('rejects a date it cannot map to a calendar day', async () => {
+      const service = newAttendanceService(holidayPrisma());
+
+      await expect(
+        service.createHoliday('tenant-1', { name: 'Bad', date: '15/08/2026' }),
+      ).rejects.toThrow('Invalid date');
     });
   });
 });

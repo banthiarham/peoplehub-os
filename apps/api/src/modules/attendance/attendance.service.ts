@@ -917,9 +917,19 @@ export class AttendanceService {
     return this.forDate(tenantId, dateOnly(new Date()));
   }
 
+  /**
+   * Read-only daily ledger. A stored record wins; every other day is derived
+   * through `classifyExpectedDay`, the same precedence the monthly ledger and
+   * month finalization apply, so the three cannot disagree about what an
+   * unrecorded day was. Before this shared the holiday tier, a public holiday
+   * read as ABSENT here while finalization recorded it as HOLIDAY.
+   *
+   * Nothing is persisted: correcting the derivation changes what the day looks
+   * like, never what any attendance record or payroll input contains.
+   */
   async forDate(tenantId: string, requestedDate: Date) {
     const date = dateOnly(requestedDate);
-    const [employees, records, onLeave] = await Promise.all([
+    const [employees, records, onLeave, holidaySet] = await Promise.all([
       this.prisma.employee.findMany({
         where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] } },
         select: {
@@ -935,19 +945,24 @@ export class AttendanceService {
         where: { tenantId, status: 'APPROVED', fromDate: { lte: date }, toDate: { gte: date } },
         select: { employeeId: true },
       }),
+      this.holidayDateSet(tenantId, date, date),
     ]);
     const recordMap = new Map(records.map((r) => [r.employeeId, r]));
     const leaveSet = new Set(onLeave.map((l) => l.employeeId));
+    const isHoliday = holidaySet.has(date.toISOString().slice(0, 10));
 
     const rows = await Promise.all(
       employees.map(async (e) => {
         const rec = recordMap.get(e.id);
         let status: AttendanceStatus;
         if (rec) status = rec.status;
-        else if (leaveSet.has(e.id)) status = 'ON_LEAVE';
         else {
           const { isWeeklyOff } = await this.weeklyOffAt(tenantId, e.id, date);
-          status = isWeeklyOff ? 'WEEKEND' : 'ABSENT';
+          status = this.classifyExpectedDay({
+            onLeave: leaveSet.has(e.id),
+            isHoliday,
+            isWeeklyOff,
+          });
         }
         return {
           employee: e,
@@ -2903,8 +2918,19 @@ export class AttendanceService {
     });
   }
 
+  /**
+   * The stored day is taken from the literal date the author wrote, via the
+   * same parser every other attendance date goes through. `new Date(...)` read
+   * through local date parts made the stored day depend on the server's
+   * timezone: on any host at a negative UTC offset `2026-08-15` was written as
+   * `2026-08-14`, and the holiday then matched no attendance day at all, since
+   * every reader keys on the UTC day. The calendar year is derived from the
+   * same normalized day so a holiday can never be filed under a year its own
+   * date does not fall in.
+   */
   async createHoliday(tenantId: string, dto: UpsertHolidayDto, calendarId?: string) {
-    const year = new Date(dto.date).getUTCFullYear();
+    const date = requireAttendanceDate(dto.date);
+    const year = date.getUTCFullYear();
     const calendar = calendarId
       ? await this.prisma.holidayCalendar.findFirst({ where: { id: calendarId, tenantId } })
       : await this.prisma.holidayCalendar.upsert({
@@ -2913,11 +2939,25 @@ export class AttendanceService {
           update: {},
         }).catch(() => this.prisma.holidayCalendar.findFirst({ where: { tenantId, year, isDefault: true } }));
     if (!calendar) throw new NotFoundException('Holiday calendar not found');
+    // A second holiday on a day the calendar already covers adds nothing —
+    // every reader treats the day as a set membership — but it does duplicate
+    // the day in the admin list and in the portal's upcoming-holiday lookup.
+    // Application-level because the table carries no unique constraint to lean
+    // on; two simultaneous creates could still both pass this check.
+    const existing = await this.prisma.holiday.findFirst({
+      where: { holidayCalendarId: calendar.id, date },
+      select: { id: true, name: true },
+    });
+    if (existing) {
+      throw new BadRequestException(
+        `${existing.name} is already on this calendar for ${date.toISOString().slice(0, 10)}`,
+      );
+    }
     return this.prisma.holiday.create({
       data: {
         holidayCalendarId: calendar.id,
         name: dto.name,
-        date: dateOnly(new Date(dto.date)),
+        date,
         isOptional: dto.isOptional ?? false,
       },
     });
