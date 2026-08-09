@@ -111,6 +111,13 @@ export class AttendanceController {
     );
   }
 
+  @Post('device/challenge')
+  @ApiOperation({ summary: 'Issue the single-use challenge a punch device signs' })
+  @Scopes('attendance:write')
+  deviceChallenge(@CurrentUser() user: AuthUser) {
+    return this.attendance.deviceChallenge(user);
+  }
+
   @Get('device/me')
   @ApiOperation({ summary: 'Own registered punch device, if any' })
   @Scopes('attendance:read')
@@ -131,7 +138,7 @@ export class AttendanceController {
   @Scopes('attendance:write')
   @ApiOperation({ summary: 'Reset an employee device binding (e.g. phone change)' })
   resetDevice(@CurrentUser() user: AuthUser, @Param('employeeId') employeeId: string) {
-    return this.attendance.resetDevice(user.tenantId, employeeId);
+    return this.attendance.resetDevice(user.tenantId, employeeId, user.userId);
   }
 
   @Get('today')

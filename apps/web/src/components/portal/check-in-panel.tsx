@@ -4,7 +4,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { LocateFixed, MapPin, XCircle } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
-import { getDeviceInfo, requireDeviceId } from '@/lib/device';
+import { getDeviceInfo } from '@/lib/device';
+import { devicePunchFields } from '@/lib/device-punch';
 import { captureFreshFix, TARGET_ACCURACY_M, useLiveLocation, type LiveFix } from '@/lib/geo';
 import { formatTime } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
@@ -90,10 +91,10 @@ export function CheckInPanel() {
   );
 
   const checkIn = useMutation({
-    mutationFn: (payload: { fix: LiveFix | null; reason?: 'denied' | 'unavailable' }) =>
+    mutationFn: async (payload: { fix: LiveFix | null; reason?: 'denied' | 'unavailable' }) =>
       api
         .post('/attendance/check-in', {
-          deviceId: requireDeviceId(),
+          ...(await devicePunchFields()),
           ...getDeviceInfo(),
           ...(payload.fix
             ? {
@@ -134,7 +135,7 @@ export function CheckInPanel() {
       const { fix } = await captureFreshFix(CHECKOUT_FIX_WAIT_MS);
       return api
         .post('/attendance/check-out', {
-          deviceId: requireDeviceId(),
+          ...(await devicePunchFields()),
           ...(fix
             ? {
                 geoLat: fix.lat,
