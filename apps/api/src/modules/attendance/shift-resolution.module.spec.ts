@@ -1,4 +1,5 @@
 import { Test } from '@nestjs/testing';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { DatabaseModule } from '../../common/database/database.module';
 import { LeaveService } from '../leave/leave.service';
 import { LeaveModule } from '../leave/leave.module';
@@ -14,7 +15,14 @@ import { ShiftResolutionService } from './shift-resolution.service';
 describe('ShiftResolutionModule wiring', () => {
   it('injects the shared resolver into both attendance and leave', async () => {
     const moduleRef = await Test.createTestingModule({
-      imports: [DatabaseModule, AttendanceModule, LeaveModule],
+      // The QR display controller uses `ThrottlerGuard`, whose options AppModule
+      // registers globally. Mirrored so this compiles the graph that boots.
+      imports: [
+        ThrottlerModule.forRoot([{ ttl: 60000, limit: 100 }]),
+        DatabaseModule,
+        AttendanceModule,
+        LeaveModule,
+      ],
     }).compile();
 
     expect(moduleRef.get(AttendanceService)).toBeInstanceOf(AttendanceService);

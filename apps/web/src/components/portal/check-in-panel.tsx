@@ -1,7 +1,7 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { LocateFixed, MapPin, XCircle } from 'lucide-react';
+import { LocateFixed, MapPin, QrCode, XCircle } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import { getDeviceInfo } from '@/lib/device';
@@ -11,8 +11,10 @@ import { formatTime } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToast } from '@/components/ui/toaster';
+import { QrScanDialog } from '@/components/portal/qr-scan-dialog';
 
 interface MyAttendanceRecord {
   date: string;
@@ -28,6 +30,12 @@ interface PunchEvent {
   eventAt: string;
   direction: 'IN' | 'OUT';
   location: { id: string; name: string } | null;
+}
+
+interface CheckInOptions {
+  location: { id: string; name: string } | null;
+  gps: { enabled: boolean };
+  qr: { enabled: boolean };
 }
 
 interface PunchDay {
@@ -73,7 +81,16 @@ export function CheckInPanel() {
   const toast = useToast();
   const [arming, setArming] = useState(false);
   const [armedAt, setArmedAt] = useState(0);
+  const [choosing, setChoosing] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
   const { fix, status, isPrecise } = useLiveLocation(arming);
+
+  const { data: options } = useQuery<CheckInOptions>({
+    queryKey: ['attendance', 'check-in-options'],
+    queryFn: () => api.get('/attendance/check-in-options').then((r) => r.data),
+  });
+  const qrEnabled = options?.qr.enabled ?? false;
 
   const { data, isLoading } = useQuery({
     queryKey: ['attendance', 'my-month'],
@@ -126,6 +143,30 @@ export function CheckInPanel() {
     },
   });
 
+  const qrCheckIn = useMutation({
+    mutationFn: async (qrCode: string) =>
+      api
+        // No geo fields: the scan is the location claim.
+        .post('/attendance/qr/check-in', {
+          ...(await devicePunchFields()),
+          ...getDeviceInfo(),
+          qrCode,
+        })
+        .then((r) => r.data),
+    onSuccess: (record) => {
+      setScanning(false);
+      queryClient.invalidateQueries({ queryKey: ['attendance'] });
+      toast(
+        `Checked in at ${formatTime(new Date().toISOString())}${
+          record.status === 'LATE' ? ' — marked late' : ''
+        }`,
+        record.status === 'LATE' ? 'info' : 'success',
+      );
+    },
+    // On the dialog, not a toast: the camera stays open so they can rescan.
+    onError: (err) => setScanError(apiError(err)),
+  });
+
   const checkOut = useMutation({
     mutationFn: async () => {
       // A day can span several sites, so the punch-out carries its own fix for
@@ -167,6 +208,12 @@ export function CheckInPanel() {
     }
   }, [arming, isPrecise, fix, status, checkIn]);
 
+  const startGpsCheckIn = () => {
+    setChoosing(false);
+    setArmedAt(Date.now());
+    setArming(true);
+  };
+
   if (isLoading) return <Skeleton className="h-44" />;
 
   const events = punchDay?.events ?? [];
@@ -186,17 +233,17 @@ export function CheckInPanel() {
           <Button
             size="lg"
             className="mt-3 w-full"
-            onClick={() => {
-              setArmedAt(Date.now());
-              setArming(true);
-            }}
+            // Nothing to choose between without QR, so it goes straight to GPS.
+            onClick={() => (qrEnabled ? setChoosing(true) : startGpsCheckIn())}
           >
             <MapPin className="h-4 w-4" /> {hasPunched ? 'Check in again' : 'Check in'}
           </Button>
           <p className="mt-2 text-[11px] text-ink-faint">
             {hasPunched
               ? 'Checking in again at another site starts a new stretch of the same day'
-              : `Uses a fresh GPS fix (≤${TARGET_ACCURACY_M}m) from your registered device`}
+              : qrEnabled
+                ? 'Use GPS, or scan the QR on your location display'
+                : `Uses a fresh GPS fix (≤${TARGET_ACCURACY_M}m) from your registered device`}
           </p>
         </div>
       )}
@@ -297,6 +344,53 @@ export function CheckInPanel() {
           )}
         </div>
       )}
+
+      <Dialog open={choosing} onOpenChange={setChoosing}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>How are you checking in?</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <button
+              className="flex w-full items-start gap-3 rounded-lg border border-line p-3 text-left hover:bg-canvas"
+              onClick={startGpsCheckIn}
+            >
+              <LocateFixed className="mt-0.5 h-4 w-4 shrink-0 text-primary-700" />
+              <span>
+                <span className="block text-sm font-medium">Use my location</span>
+                <span className="block text-xs text-ink-muted">
+                  Needs a fresh GPS fix inside your office geofence
+                </span>
+              </span>
+            </button>
+            <button
+              className="flex w-full items-start gap-3 rounded-lg border border-line p-3 text-left hover:bg-canvas"
+              onClick={() => {
+                setChoosing(false);
+                setScanError(null);
+                setScanning(true);
+              }}
+            >
+              <QrCode className="mt-0.5 h-4 w-4 shrink-0 text-primary-700" />
+              <span>
+                <span className="block text-sm font-medium">Scan the location QR</span>
+                <span className="block text-xs text-ink-muted">
+                  No location access needed{options?.location ? ` · ${options.location.name}` : ''}
+                </span>
+              </span>
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <QrScanDialog
+        open={scanning}
+        submitting={qrCheckIn.isPending}
+        error={scanError}
+        onClose={() => setScanning(false)}
+        onScanned={(qrCode) => qrCheckIn.mutate(qrCode)}
+        onUseGps={startGpsCheckIn}
+      />
     </Card>
   );
 }

@@ -6,6 +6,7 @@ import { Scopes } from '../../common/decorators/scopes.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import { AttendanceService } from './attendance.service';
+import { AttendanceQrService } from './attendance-qr.service';
 import {
   AssignShiftDto,
   CheckInDto,
@@ -34,13 +35,17 @@ import {
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
   UpsertHolidayDto,
+  UpsertQrDisplayDto,
 } from './dto/attendance.dto';
 
 @ApiTags('Attendance')
 @ApiBearerAuth()
 @Controller('attendance')
 export class AttendanceController {
-  constructor(private readonly attendance: AttendanceService) {}
+  constructor(
+    private readonly attendance: AttendanceService,
+    private readonly qr: AttendanceQrService,
+  ) {}
 
   @Post('check-in')
   @ApiOperation({ summary: 'Punch in for today' })
@@ -230,6 +235,37 @@ export class AttendanceController {
   @Scopes('attendance:read')
   captureSettings(@CurrentUser() user: AuthUser, @Query() q: ListCaptureSettingsDto) {
     return this.attendance.listCaptureSettings(user.tenantId, q.locationId);
+  }
+
+  @Get('check-in-options')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: 'Which check-in methods are available to the caller today' })
+  checkInOptions(@CurrentUser() user: AuthUser) {
+    return this.attendance.checkInOptions(user);
+  }
+
+  @Get('qr/displays')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:read')
+  @ApiOperation({ summary: 'Location QR displays' })
+  qrDisplays(@CurrentUser() user: AuthUser) {
+    return this.qr.listDisplays(user.tenantId);
+  }
+
+  @Post('qr/displays')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Provision a location QR display and return its pairing code' })
+  upsertQrDisplay(@CurrentUser() user: AuthUser, @Body() dto: UpsertQrDisplayDto) {
+    return this.qr.upsertDisplay(user.tenantId, dto, user.employeeId ?? undefined);
+  }
+
+  @Delete('qr/displays/:locationId')
+  @Roles('Super Admin', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({ summary: 'Revoke a location QR display' })
+  revokeQrDisplay(@CurrentUser() user: AuthUser, @Param('locationId') locationId: string) {
+    return this.qr.revokeDisplay(user.tenantId, locationId);
   }
 
   @Patch('capture-settings')
