@@ -94,6 +94,8 @@ interface DeviceRow {
   platform: string | null;
   registeredAt: string;
   lastSeenAt: string;
+  /** Set while a reset is waiting for the employee's next device to punch. */
+  replacementAllowedUntil: string | null;
 }
 
 export default function EmployeeProfilePage() {
@@ -130,6 +132,8 @@ export default function EmployeeProfilePage() {
     queryFn: () => api.get(`/email/employee/${id}/history`).then((r) => r.data),
     enabled: !!id,
   });
+  const awaitingNewDevice =
+    !!device?.replacementAllowedUntil && new Date(device.replacementAllowedUntil) > new Date();
   const resetDevice = useMutation({
     mutationFn: () => api.delete(`/attendance/device/${id}`),
     onSuccess: () => {
@@ -510,6 +514,12 @@ export default function EmployeeProfilePage() {
                       {formatDate(device.lastSeenAt)}
                     </p>
                   </div>
+                  {awaitingNewDevice && (
+                    <Badge variant="warning">
+                      Reset — awaiting a new device until{' '}
+                      {formatDate(device.replacementAllowedUntil as string)}
+                    </Badge>
+                  )}
                   <Button
                     size="sm"
                     variant="outline"
@@ -520,8 +530,9 @@ export default function EmployeeProfilePage() {
                     {resetDevice.isPending ? 'Resetting…' : 'Reset device binding'}
                   </Button>
                   <p className="text-[11px] text-ink-faint">
-                    Attendance punches only work from this device. Reset if they changed phones —
-                    their next punch registers the new one.
+                    {awaitingNewDevice
+                      ? 'The device above still works until a new one punches. Reset again to extend the window.'
+                      : 'Attendance punches only work from this device. Reset if they changed phones — their next punch registers the new one.'}
                   </p>
                 </div>
               ) : (

@@ -26,7 +26,8 @@ import { useState } from 'react';
 import type { ChangeEvent } from 'react';
 import { api } from '@/lib/api';
 import { downloadFile } from '@/lib/download';
-import { getDeviceInfo, requireDeviceId } from '@/lib/device';
+import { getDeviceInfo } from '@/lib/device';
+import { devicePunchFields } from '@/lib/device-punch';
 import { asArray, employeeLabel, employeeOptionsFrom, type EmployeeOption } from '@/lib/options';
 import {
   ATTENDANCE_IMPORT_TEMPLATE,
@@ -430,7 +431,7 @@ export default function AttendancePage() {
       const { fix, reason } = await captureFreshFix();
       return api
         .post('/attendance/check-in', {
-          deviceId: requireDeviceId(),
+          ...(await devicePunchFields()),
           ...getDeviceInfo(),
           ...(fix
             ? { geoLat: fix.lat, geoLng: fix.lng, geoAccuracy: fix.accuracy, fixAt: fix.timestamp }
@@ -461,7 +462,7 @@ export default function AttendancePage() {
       const { fix } = await captureFreshFix(CHECKOUT_FIX_WAIT_MS);
       return api
         .post('/attendance/check-out', {
-          deviceId: requireDeviceId(),
+          ...(await devicePunchFields()),
           ...(fix
             ? { geoLat: fix.lat, geoLng: fix.lng, geoAccuracy: fix.accuracy, fixAt: fix.timestamp }
             : {}),

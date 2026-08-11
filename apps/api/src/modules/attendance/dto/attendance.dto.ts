@@ -42,6 +42,24 @@ export class CheckInDto {
   @IsString()
   platform?: string;
 
+  @ApiPropertyOptional({
+    description:
+      "SPKI-encoded ECDSA P-256 public key (base64) for this device. Registers the key on a first punch and upgrades a device bound before key binding shipped.",
+  })
+  @IsOptional()
+  @IsString()
+  devicePublicKey?: string;
+
+  @ApiPropertyOptional({ description: 'The challenge this punch signed, from POST device/challenge' })
+  @IsOptional()
+  @IsString()
+  deviceChallenge?: string;
+
+  @ApiPropertyOptional({ description: 'Signature over deviceChallenge, raw r‖s, base64url' })
+  @IsOptional()
+  @IsString()
+  deviceSignature?: string;
+
   @ApiPropertyOptional({ description: 'Device latitude at punch time' })
   @IsOptional()
   @Type(() => Number)

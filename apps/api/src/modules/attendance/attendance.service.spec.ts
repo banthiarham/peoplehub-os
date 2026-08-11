@@ -1,15 +1,22 @@
 import { AuthUser } from '../../common/types/auth-user';
+import { ConfigService } from '@nestjs/config';
 import { AttendanceService } from './attendance.service';
+import { DeviceBindingService } from './device-binding.service';
 import { ShiftResolutionService } from './shift-resolution.service';
 
 /**
- * Both services share the same prisma double: `ShiftResolutionService` is the
- * single resolver attendance reads shifts and locations through, so stubbing it
+ * All three services share the same prisma double: `ShiftResolutionService` is
+ * the single resolver attendance reads shifts and locations through, and
+ * `DeviceBindingService` owns the punch device checks, so stubbing either
  * separately would let the tests drift from production behaviour.
  */
 function newAttendanceService(prisma: unknown): AttendanceService {
   const client = withPunchEvents(prisma as Record<string, any>);
-  return new AttendanceService(client as never, new ShiftResolutionService(client as never));
+  return new AttendanceService(
+    client as never,
+    new ShiftResolutionService(client as never),
+    new DeviceBindingService(client as never, new ConfigService()),
+  );
 }
 
 /**

@@ -21,6 +21,7 @@ import {
   SUPPORTED_ATTENDANCE_DATE_FORMATS,
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
+import { DeviceBindingService } from './device-binding.service';
 import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
 import { workedDayStatus } from './attendance-status';
 import {
@@ -189,6 +190,7 @@ export class AttendanceService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly shifts: ShiftResolutionService,
+    private readonly devices: DeviceBindingService,
   ) {}
 
   private requireEmployee(user: AuthUser): string {
@@ -681,7 +683,7 @@ export class AttendanceService {
       forcedSource === 'QR' ? AttendanceCaptureMode.QR : this.deriveInteractiveCaptureMode(dto);
 
     await this.assertCaptureModeAllowed(user.tenantId, captureMode, punchLocationId, dto, employeeId);
-    await this.validateDevice(user.tenantId, employeeId, dto);
+    await this.devices.verify(user.tenantId, employeeId, dto);
     await this.validateGeofence(user.tenantId, employeeId, dto, punchLocationId);
     await this.assertDayNotFinalized(employeeId, today);
 
@@ -728,49 +730,6 @@ export class AttendanceService {
     return this.checkIn(user, { ...dto, locationId: qrLocationId }, 'QR');
   }
 
-  /**
-   * One punch device per employee, one employee per device. The first punch
-   * binds the device; after that, punches from any other device are rejected
-   * until HR resets the binding. A device already bound to a colleague can
-   * never be used, which blocks credential sharing / buddy punching.
-   */
-  private async validateDevice(
-    tenantId: string,
-    employeeId: string,
-    dto: { deviceId: string; deviceName?: string; platform?: string },
-  ): Promise<void> {
-    const bound = await this.prisma.employeeDevice.findUnique({ where: { employeeId } });
-    if (bound) {
-      if (bound.deviceId !== dto.deviceId) {
-        throw new ForbiddenException(
-          'This is not your registered punch device. If you changed phones, ask HR to reset your device binding.',
-        );
-      }
-      await this.prisma.employeeDevice.update({
-        where: { employeeId },
-        data: { lastSeenAt: new Date() },
-      });
-      return;
-    }
-    const takenByOther = await this.prisma.employeeDevice.findUnique({
-      where: { tenantId_deviceId: { tenantId: tenantId, deviceId: dto.deviceId } },
-    });
-    if (takenByOther) {
-      throw new ForbiddenException(
-        'This device is already registered to another employee — punches must come from your own device.',
-      );
-    }
-    await this.prisma.employeeDevice.create({
-      data: {
-        tenantId,
-        employeeId,
-        deviceId: dto.deviceId,
-        deviceName: dto.deviceName,
-        platform: dto.platform,
-      },
-    });
-  }
-
   async myDevice(user: AuthUser) {
     const employeeId = this.requireEmployee(user);
     return this.prisma.employeeDevice.findUnique({
@@ -781,6 +740,7 @@ export class AttendanceService {
         platform: true,
         registeredAt: true,
         lastSeenAt: true,
+        replacementAllowedUntil: true,
       },
     });
   }
@@ -788,17 +748,27 @@ export class AttendanceService {
   async deviceOf(tenantId: string, employeeId: string) {
     return this.prisma.employeeDevice.findFirst({
       where: { employeeId, tenantId },
-      select: { deviceName: true, platform: true, registeredAt: true, lastSeenAt: true },
+      select: {
+        deviceName: true,
+        platform: true,
+        registeredAt: true,
+        lastSeenAt: true,
+        replacementAllowedUntil: true,
+      },
     });
   }
 
-  async resetDevice(tenantId: string, employeeId: string) {
-    const bound = await this.prisma.employeeDevice.findUnique({ where: { employeeId } });
-    if (!bound || bound.tenantId !== tenantId) {
-      throw new NotFoundException('No device registered for this employee');
-    }
-    await this.prisma.employeeDevice.delete({ where: { employeeId } });
-    return { reset: true };
+  /** Issues the challenge a punch from a key-bound device signs. */
+  async deviceChallenge(user: AuthUser) {
+    return this.devices.issueChallenge(this.requireEmployee(user));
+  }
+
+  /**
+   * Releases the binding so the employee's next device takes it over. Keeps
+   * the `{ reset: true }` response the HR screen already reads.
+   */
+  async resetDevice(tenantId: string, employeeId: string, actorUserId?: string) {
+    return this.devices.allowReplacement(tenantId, employeeId, actorUserId);
   }
 
   /**
@@ -874,7 +844,7 @@ export class AttendanceService {
    */
   async checkOut(user: AuthUser, dto: CheckOutDto) {
     const employeeId = this.requireEmployee(user);
-    await this.validateDevice(user.tenantId, employeeId, dto);
+    await this.devices.verify(user.tenantId, employeeId, dto);
     const today = dateOnly(new Date());
 
     // Check-in can only ever guess at PRESENT/LATE, because how long the day

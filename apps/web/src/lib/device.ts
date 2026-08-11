@@ -114,6 +114,141 @@ export function requireDeviceId(): string {
   return id;
 }
 
+const CREDENTIAL_DB = 'peoplehub-device';
+const CREDENTIAL_STORE = 'credential';
+const CREDENTIAL_ID = 'punch-v1';
+
+export interface DeviceCredential {
+  /** SPKI public key, base64 — what the server registers and verifies against. */
+  publicKey: string;
+  /**
+   * Generated non-extractable, so signing is the only thing anyone — script,
+   * devtools, or the employee — can do with it. This is what the device id on
+   * its own could never be: a proof that cannot be copied to a second phone.
+   */
+  privateKey: CryptoKey;
+}
+
+function toBase64(buffer: ArrayBuffer): string {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+}
+
+function toBase64Url(buffer: ArrayBuffer): string {
+  return toBase64(buffer).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Every step below resolves rather than rejects when the browser refuses.
+ * A device that cannot hold a key still punches — unsigned, exactly as it did
+ * before key binding shipped — instead of being locked out by a storage quirk.
+ */
+function openCredentialStore(): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    let request: IDBOpenDBRequest;
+    try {
+      request = indexedDB.open(CREDENTIAL_DB, 1);
+    } catch {
+      return resolve(null);
+    }
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(CREDENTIAL_STORE)) {
+        request.result.createObjectStore(CREDENTIAL_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
+  });
+}
+
+function readCredential(db: IDBDatabase): Promise<DeviceCredential | null> {
+  return new Promise((resolve) => {
+    try {
+      const request = db.transaction(CREDENTIAL_STORE, 'readonly').objectStore(CREDENTIAL_STORE).get(CREDENTIAL_ID);
+      request.onsuccess = () => resolve((request.result as DeviceCredential) ?? null);
+      request.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function writeCredential(db: IDBDatabase, credential: DeviceCredential): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const request = db.transaction(CREDENTIAL_STORE, 'readwrite').objectStore(CREDENTIAL_STORE).put(credential, CREDENTIAL_ID);
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function loadOrCreateCredential(): Promise<DeviceCredential | null> {
+  if (typeof indexedDB === 'undefined' || !globalThis.crypto?.subtle) return null;
+  const db = await openCredentialStore();
+  if (!db) return null;
+
+  const stored = await readCredential(db);
+  if (stored?.privateKey && typeof stored.publicKey === 'string') return stored;
+
+  // `extractable: false` applies to the private key; the public half of a
+  // generated pair is always exportable, which is the half the server needs.
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, [
+    'sign',
+    'verify',
+  ]);
+  const credential: DeviceCredential = {
+    publicKey: toBase64(await crypto.subtle.exportKey('spki', pair.publicKey)),
+    privateKey: pair.privateKey,
+  };
+  await writeCredential(db, credential);
+  // Best effort: reduces the chance the browser evicts the key under storage
+  // pressure and forces the employee through a device replacement.
+  try {
+    void navigator.storage?.persist?.();
+  } catch {
+    // Unsupported or blocked; the credential still stands.
+  }
+  return credential;
+}
+
+let credentialPromise: Promise<DeviceCredential | null> | null = null;
+
+/**
+ * This device's punch credential, generated once and reused. Concurrent callers
+ * share one generation, so a check-in and a challenge fetch racing on first use
+ * cannot mint two key pairs and register the wrong one.
+ */
+export function getDeviceCredential(): Promise<DeviceCredential | null> {
+  credentialPromise ??= loadOrCreateCredential()
+    .catch(() => null)
+    .then((result) => {
+      // A transient failure must not stick for the rest of the page session.
+      if (!result) credentialPromise = null;
+      return result;
+    });
+  return credentialPromise;
+}
+
+/** Signs a server challenge, or null when this device holds no credential. */
+export async function signDeviceChallenge(challenge: string): Promise<string | null> {
+  const credential = await getDeviceCredential();
+  if (!credential) return null;
+  try {
+    return toBase64Url(
+      await crypto.subtle.sign(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        credential.privateKey,
+        new TextEncoder().encode(challenge),
+      ),
+    );
+  } catch {
+    return null;
+  }
+}
+
 export function getDeviceInfo(): { deviceName: string; platform: string } {
   if (typeof navigator === 'undefined') return { deviceName: 'Unknown', platform: 'Unknown' };
   const ua = navigator.userAgent;

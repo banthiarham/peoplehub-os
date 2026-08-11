@@ -287,3 +287,169 @@ describe('the id identifies a storage bucket, not a device', () => {
     expect(loadDevice(store).getDeviceId()).toBe(bound);
   });
 });
+
+/**
+ * The signing credential. `deviceId` proves only that someone knows a string;
+ * the credential is what proves the punch came from this device, so what the
+ * browser produces has to be exactly what the API can verify — the round trip
+ * below signs here and verifies with the server's own primitive.
+ */
+describe('device credential', () => {
+  const realCrypto = globalThis.crypto;
+
+  /** Minimal in-memory IndexedDB: open, one store, get and put. */
+  function fakeIndexedDB(options: { open?: 'fail'; write?: 'fail' } = {}) {
+    const data = new Map<string, unknown>();
+    let created = false;
+
+    const request = <T>(produce: () => T) => {
+      const req: Record<string, any> = { onsuccess: null, onerror: null };
+      queueMicrotask(() => {
+        try {
+          req.result = produce();
+          req.onsuccess?.();
+        } catch {
+          req.onerror?.();
+        }
+      });
+      return req;
+    };
+
+    const store = {
+      get: (key: string) => request(() => data.get(key)),
+      put: (value: unknown, key: string) =>
+        request(() => {
+          if (options.write === 'fail') throw new Error('quota exceeded');
+          data.set(key, value);
+        }),
+    };
+    const db = {
+      objectStoreNames: { contains: () => created },
+      createObjectStore: () => {
+        created = true;
+        return store;
+      },
+      transaction: () => ({ objectStore: () => store }),
+    };
+
+    return {
+      data,
+      open: jest.fn(() => {
+        const req: Record<string, any> = {
+          result: db,
+          onupgradeneeded: null,
+          onsuccess: null,
+          onerror: null,
+          onblocked: null,
+        };
+        queueMicrotask(() => {
+          if (options.open === 'fail') return req.onerror?.();
+          if (!created) req.onupgradeneeded?.();
+          req.onsuccess?.();
+        });
+        return req;
+      }),
+    };
+  }
+
+  function withIndexedDB(db: unknown): void {
+    (globalThis as Record<string, unknown>).indexedDB = db;
+  }
+
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>).window;
+    delete (globalThis as Record<string, unknown>).indexedDB;
+    Object.defineProperty(globalThis, 'crypto', { value: realCrypto, configurable: true });
+    jest.restoreAllMocks();
+  });
+
+  it('generates one credential and reuses it for the page session', async () => {
+    const idb = fakeIndexedDB();
+    withIndexedDB(idb);
+    const device = loadDevice(storage());
+
+    const [first, second] = await Promise.all([
+      device.getDeviceCredential(),
+      device.getDeviceCredential(),
+    ]);
+
+    // Concurrent first callers must share one generation, or the key that gets
+    // registered is not the key the next punch signs with.
+    expect(first?.publicKey).toBe(second?.publicKey);
+    expect(idb.open).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers the same credential after a reload', async () => {
+    const idb = fakeIndexedDB();
+    withIndexedDB(idb);
+
+    const bound = await loadDevice(storage()).getDeviceCredential();
+    const presented = await loadDevice(storage()).getDeviceCredential();
+
+    expect(presented?.publicKey).toBe(bound?.publicKey);
+  });
+
+  it('signs a challenge the API can verify against the registered key', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { createPublicKey, verify } = require('crypto');
+    withIndexedDB(fakeIndexedDB());
+    const device = loadDevice(storage());
+
+    const credential = await device.getDeviceCredential();
+    const signature = await device.signDeviceChallenge('challenge-1');
+
+    const verified = verify(
+      'sha256',
+      Buffer.from('challenge-1'),
+      {
+        key: createPublicKey({
+          key: Buffer.from(credential!.publicKey, 'base64'),
+          format: 'der',
+          type: 'spki',
+        }),
+        // The encoding mismatch that would silently fail every punch: WebCrypto
+        // emits raw r‖s where Node reads DER by default.
+        dsaEncoding: 'ieee-p1363',
+      },
+      Buffer.from(signature!, 'base64url'),
+    );
+    expect(verified).toBe(true);
+  });
+
+  it('holds a private key that cannot be exported', async () => {
+    withIndexedDB(fakeIndexedDB());
+
+    const credential = await loadDevice(storage()).getDeviceCredential();
+
+    // The whole point of the credential over the id: copying it to a second
+    // phone has to be impossible, not merely inconvenient.
+    await expect(crypto.subtle.exportKey('pkcs8', credential!.privateKey)).rejects.toThrow();
+  });
+
+  it('punches on without a credential when the store cannot be opened', async () => {
+    withIndexedDB(fakeIndexedDB({ open: 'fail' }));
+    const device = loadDevice(storage());
+
+    await expect(device.getDeviceCredential()).resolves.toBeNull();
+    await expect(device.signDeviceChallenge('challenge-1')).resolves.toBeNull();
+    // The binding still works the way it did before keys existed.
+    expect(device.getDeviceId()).toMatch(UUID_V4);
+  });
+
+  it('punches on where the browser has no IndexedDB at all', async () => {
+    const device = loadDevice(storage());
+
+    await expect(device.getDeviceCredential()).resolves.toBeNull();
+    expect(device.getDeviceId()).toMatch(UUID_V4);
+  });
+
+  it('retries generation after a failed attempt instead of giving up for the session', async () => {
+    withIndexedDB(fakeIndexedDB({ open: 'fail' }));
+    const device = loadDevice(storage());
+    await device.getDeviceCredential();
+
+    withIndexedDB(fakeIndexedDB());
+
+    expect(await device.getDeviceCredential()).not.toBeNull();
+  });
+});
