@@ -1,7 +1,7 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { LocateFixed, MapPin, Pencil, Plus } from 'lucide-react';
+import { LocateFixed, MapPin, Pencil, Plus, QrCode } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
 import { captureFreshFix } from '@/lib/geo';
@@ -31,6 +31,15 @@ interface LocationRow {
   attendanceRadius: number | null;
   isActive: boolean;
   employees: number;
+}
+
+interface QrDisplayRow {
+  id: string;
+  locationId: string;
+  name: string;
+  verifyLocation: boolean;
+  isActive: boolean;
+  lastSeenAt: string | null;
 }
 
 interface FormState {
@@ -75,10 +84,42 @@ export function LocationsGeofencing() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [locating, setLocating] = useState(false);
   const [fixAccuracy, setFixAccuracy] = useState<number | null>(null);
+  const [qrLocation, setQrLocation] = useState<LocationRow | null>(null);
+  const [qrVerifyLocation, setQrVerifyLocation] = useState(false);
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
 
   const { data: locations, isLoading } = useQuery<LocationRow[]>({
     queryKey: ['locations'],
     queryFn: () => api.get('/locations').then((r) => r.data),
+  });
+  const { data: qrDisplays } = useQuery<QrDisplayRow[]>({
+    queryKey: ['attendance', 'qr-displays'],
+    queryFn: () => api.get('/attendance/qr/displays').then((r) => r.data),
+  });
+
+  const pairDisplay = useMutation({
+    mutationFn: () =>
+      api
+        .post('/attendance/qr/displays', {
+          locationId: qrLocation!.id,
+          verifyLocation: qrVerifyLocation,
+        })
+        .then((r) => r.data),
+    onSuccess: (display: QrDisplayRow & { pairingCode: string }) => {
+      queryClient.invalidateQueries({ queryKey: ['attendance', 'qr-displays'] });
+      setPairingCode(display.pairingCode);
+    },
+    onError: (err) => toast(apiError(err), 'error'),
+  });
+
+  const revokeDisplay = useMutation({
+    mutationFn: () => api.delete(`/attendance/qr/displays/${qrLocation!.id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['attendance', 'qr-displays'] });
+      toast('QR display revoked — that screen can no longer issue codes');
+      setQrLocation(null);
+    },
+    onError: (err) => toast(apiError(err), 'error'),
   });
 
   const save = useMutation({
@@ -129,6 +170,15 @@ export function LocationsGeofencing() {
   const set = (key: keyof FormState) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm((f) => ({ ...f, [key]: e.target.value }));
 
+  const displayFor = (locationId: string) =>
+    qrDisplays?.find((display) => display.locationId === locationId && display.isActive);
+
+  const openQrDialog = (loc: LocationRow) => {
+    setQrLocation(loc);
+    setQrVerifyLocation(displayFor(loc.id)?.verifyLocation ?? false);
+    setPairingCode(null);
+  };
+
   const geofenceCell = (loc: LocationRow) => {
     if (loc.geoLat == null || loc.geoLng == null) {
       return <Badge variant="outline">No coordinates</Badge>;
@@ -163,6 +213,7 @@ export function LocationsGeofencing() {
               <TH>Coordinates</TH>
               <TH>Geofence</TH>
               <TH className="text-right">Employees</TH>
+              <TH>QR display</TH>
               <TH></TH>
             </TR>
           </THead>
@@ -182,7 +233,23 @@ export function LocationsGeofencing() {
                 </TD>
                 <TD>{geofenceCell(loc)}</TD>
                 <TD className="text-right tabular-nums">{loc.employees}</TD>
+                <TD>
+                  {displayFor(loc.id) ? (
+                    <Badge variant="success">Paired</Badge>
+                  ) : (
+                    <Badge variant="outline">None</Badge>
+                  )}
+                </TD>
                 <TD className="text-right">
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={() => openQrDialog(loc)}
+                    aria-label={`QR display for ${loc.name}`}
+                  >
+                    <QrCode className="h-3.5 w-3.5" />
+                  </Button>
                   <Button
                     size="icon"
                     variant="ghost"
@@ -203,6 +270,78 @@ export function LocationsGeofencing() {
         Their check-in then requires a fresh GPS fix inside the radius. Set the radius to 0 to turn
         the fence off.
       </p>
+
+      <Dialog open={qrLocation !== null} onOpenChange={(open) => !open && setQrLocation(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>QR display — {qrLocation?.name}</DialogTitle>
+            <DialogDescription>
+              One screen per location. It shows a code that changes every 10 seconds; employees scan
+              it to check in without sharing their location.
+            </DialogDescription>
+          </DialogHeader>
+
+          {pairingCode ? (
+            <div className="space-y-3">
+              <div className="rounded-lg border border-line bg-canvas p-4 text-center">
+                <p className="text-[11px] uppercase tracking-wide text-ink-muted">Pairing code</p>
+                <p className="mt-1 font-mono text-3xl font-semibold tracking-[0.2em]">
+                  {pairingCode}
+                </p>
+              </div>
+              <p className="text-xs text-ink-muted">
+                On the display device, open <span className="font-medium">/qr-display</span> and
+                enter this code. It works once and expires in 10 minutes — it is not shown again.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={qrVerifyLocation}
+                  onChange={(e) => setQrVerifyLocation(e.target.checked)}
+                />
+                <span>
+                  Require the display to be on site
+                  <span className="block text-xs text-ink-muted">
+                    Codes are only issued while the display itself is inside this
+                    location&apos;s geofence. Needs coordinates and a radius set above.
+                  </span>
+                </span>
+              </label>
+              {displayFor(qrLocation?.id ?? '') && (
+                <p className="text-xs text-ink-muted">
+                  A display is already paired here. Pairing again issues a new code and stops the
+                  current screen from working.
+                </p>
+              )}
+            </div>
+          )}
+
+          <DialogFooter>
+            {displayFor(qrLocation?.id ?? '') && (
+              <Button
+                variant="outline"
+                className="mr-auto text-danger"
+                disabled={revokeDisplay.isPending}
+                onClick={() => revokeDisplay.mutate()}
+              >
+                Revoke
+              </Button>
+            )}
+            <Button variant="outline" onClick={() => setQrLocation(null)}>
+              {pairingCode ? 'Done' : 'Cancel'}
+            </Button>
+            {!pairingCode && (
+              <Button disabled={pairDisplay.isPending} onClick={() => pairDisplay.mutate()}>
+                {pairDisplay.isPending ? 'Generating…' : 'Generate pairing code'}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={editing !== null} onOpenChange={(open) => !open && closeDialog()}>
         <DialogContent className="max-w-md">

@@ -21,7 +21,9 @@ import {
   SUPPORTED_ATTENDANCE_DATE_FORMATS,
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
+import { AttendanceQrService } from './attendance-qr.service';
 import { DeviceBindingService } from './device-binding.service';
+import { haversineMeters } from './geo-distance';
 import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
 import { workedDayStatus } from './attendance-status';
 import {
@@ -173,16 +175,6 @@ function monthParts(month: string): { year: number; monthNumber: number; start: 
   return { year, monthNumber, start, endExclusive, endInclusive };
 }
 
-function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371000;
-  const rad = (d: number) => (d * Math.PI) / 180;
-  const dLat = rad(lat2 - lat1);
-  const dLng = rad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
 @Injectable()
 export class AttendanceService {
   private readonly logger = new Logger(AttendanceService.name);
@@ -191,6 +183,7 @@ export class AttendanceService {
     private readonly prisma: PrismaService,
     private readonly shifts: ShiftResolutionService,
     private readonly devices: DeviceBindingService,
+    private readonly qr: AttendanceQrService,
   ) {}
 
   private requireEmployee(user: AuthUser): string {
@@ -526,6 +519,8 @@ export class AttendanceService {
     effectiveLocationId: string | null;
     source: string;
     dto: CheckInDto;
+    /** Provenance for a QR punch: which display issued the code, and when. */
+    remarks?: string;
   }) {
     return this.prisma.$transaction(async (tx) => {
       const existing = await tx.attendancePunchEvent.findMany({
@@ -547,6 +542,7 @@ export class AttendanceService {
           geoLng: input.dto.geoLng,
           geoAccuracy: input.dto.geoAccuracy,
           deviceId: input.dto.deviceId,
+          remarks: input.remarks ?? null,
         },
       });
       return this.rebuildDayRecord(tx, {
@@ -655,7 +651,12 @@ export class AttendanceService {
     });
   }
 
-  async checkIn(user: AuthUser, dto: CheckInDto, forcedSource?: string) {
+  /**
+   * `forcedSource` is set only by {@link qrCheckIn}. A QR punch proves its
+   * location by the scan itself, so it is the one interactive punch that does
+   * not demand the employee's own GPS.
+   */
+  async checkIn(user: AuthUser, dto: CheckInDto, forcedSource?: string, qrRemarks?: string) {
     const employeeId = this.requireEmployee(user);
     const today = dateOnly(new Date());
     // The location and shift the *day* is evaluated against come from the one
@@ -684,7 +685,13 @@ export class AttendanceService {
 
     await this.assertCaptureModeAllowed(user.tenantId, captureMode, punchLocationId, dto, employeeId);
     await this.devices.verify(user.tenantId, employeeId, dto);
-    await this.validateGeofence(user.tenantId, employeeId, dto, punchLocationId);
+    // The scan already establishes where the employee is. The QR capture
+    // setting's `requiresGeofence` still applies through
+    // `assertCaptureModeAllowed`, so HR can opt a location back in; every other
+    // mode keeps the unconditional check it has always had.
+    if (captureMode !== AttendanceCaptureMode.QR) {
+      await this.validateGeofence(user.tenantId, employeeId, dto, punchLocationId);
+    }
     await this.assertDayNotFinalized(employeeId, today);
 
     return this.recordPunch({
@@ -698,15 +705,15 @@ export class AttendanceService {
       effectiveLocationId,
       source: forcedSource ?? captureMode,
       dto,
+      remarks: qrRemarks,
     });
   }
 
   async qrCheckIn(user: AuthUser, dto: QrPunchDto) {
-    const [, qrLocationId] = dto.qrCode.split(':');
-    if (!qrLocationId || !dto.qrCode.startsWith('PHUB:')) {
-      throw new BadRequestException('Invalid attendance QR code');
-    }
     const employeeId = this.requireEmployee(user);
+    // The location comes from the verified payload, never from the client.
+    const scanned = await this.qr.resolveScannedCode(user.tenantId, dto.qrCode);
+    const qrLocationId = scanned.locationId;
     // The QR code must name a location the employee may actually punch at:
     // wherever they are scheduled today, their base location, or any extra
     // authorized location. An employee with no extra locations still has to
@@ -727,7 +734,40 @@ export class AttendanceService {
     }
     // Scanning the code is the location claim, so the punch is pinned to it
     // rather than re-resolved from GPS.
-    return this.checkIn(user, { ...dto, locationId: qrLocationId }, 'QR');
+    return this.checkIn(
+      user,
+      { ...dto, locationId: qrLocationId },
+      'QR',
+      scanned.displayId ? `qr:${scanned.displayId}:${scanned.issuedAt ?? ''}` : undefined,
+    );
+  }
+
+  /**
+   * Advisory only — the punch path re-checks everything. Resolved through the
+   * same `captureSettingFor` the punch uses, so the two cannot disagree.
+   */
+  async checkInOptions(user: AuthUser) {
+    const employeeId = this.requireEmployee(user);
+    const today = dateOnly(new Date());
+    const locationId = await this.shifts.effectiveLocationId(user.tenantId, employeeId, today);
+    const [gps, qr] = await Promise.all([
+      this.captureSettingFor(user.tenantId, AttendanceCaptureMode.GPS, locationId),
+      this.captureSettingFor(user.tenantId, AttendanceCaptureMode.QR, locationId),
+    ]);
+    const location = locationId
+      ? await this.prisma.location.findFirst({
+          where: { id: locationId, tenantId: user.tenantId },
+          select: { id: true, name: true },
+        })
+      : null;
+
+    return {
+      location,
+      // WEB/MOBILE stay available whatever this says, so an employee is never
+      // left with no way to punch.
+      gps: { enabled: gps.enabled },
+      qr: { enabled: qr.enabled },
+    };
   }
 
   async myDevice(user: AuthUser) {

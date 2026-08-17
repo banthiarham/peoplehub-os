@@ -310,6 +310,7 @@ model Tenant {
   shifts                    Shift[]
   attendanceRules           AttendanceRule[]
   attendanceCaptureSettings AttendanceCaptureSetting[]
+  attendanceQrDisplays      AttendanceQrDisplay[]
   rosterUploads             RosterUpload[]
   attendanceFinalizations   AttendanceFinalization[]
   compOffGrants             CompOffGrant[]
@@ -406,6 +407,7 @@ model Location {
   shiftAssignments          ShiftAssignment[]
   authorizedEmployees       EmployeeLocation[]
   punchEvents               AttendancePunchEvent[]
+  qrDisplay                 AttendanceQrDisplay?
 
   @@index([tenantId])
   @@map("locations")
@@ -949,6 +951,36 @@ model AttendanceCaptureSetting {
   @@index([tenantId])
   @@index([locationId])
   @@map("attendance_capture_settings")
+}
+
+/// The screen at a location that renders its rotating attendance QR. One per
+/// location, so a code traces back to the device that displayed it. Its token
+/// is stored hashed, the way `ApiKey.keyHash` is.
+model AttendanceQrDisplay {
+  id               String    @id @default(cuid())
+  tenantId         String
+  locationId       String    @unique
+  name             String
+  tokenHash        String    @unique
+  /// Set while the display is waiting to be paired; cleared once it is.
+  pairingCodeHash  String?
+  pairingExpiresAt DateTime?
+  /// Refuse to issue codes unless the display itself is inside the geofence.
+  verifyLocation   Boolean   @default(false)
+  lastSeenAt       DateTime?
+  lastGeoLat       Float?
+  lastGeoLng       Float?
+  lastGeoAccuracy  Float?
+  isActive         Boolean   @default(true)
+  registeredById   String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("attendance_qr_displays")
 }
 
 model RosterUpload {

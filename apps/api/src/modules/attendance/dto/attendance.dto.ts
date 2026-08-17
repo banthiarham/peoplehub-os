@@ -14,6 +14,7 @@ import {
   IsString,
   Matches,
   Max,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -105,10 +106,63 @@ export class CheckInDto {
 }
 
 export class QrPunchDto extends CheckInDto {
-  @ApiProperty({ description: 'QR payload generated for the location, e.g. PHUB:<locationId>' })
+  @ApiProperty({
+    description: 'Signed QR payload scanned from a location display, e.g. PHUB2.<payload>.<signature>',
+  })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(1024)
   qrCode!: string;
+}
+
+export class UpsertQrDisplayDto {
+  @ApiProperty({ description: 'Location this display stands at. One display per location.' })
+  @IsString()
+  @IsNotEmpty()
+  locationId!: string;
+
+  @ApiPropertyOptional({ description: 'Defaults to "<location> display"' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  name?: string;
+
+  @ApiPropertyOptional({
+    default: false,
+    description: 'Refuse to issue codes unless the display is inside the location geofence',
+  })
+  @IsOptional()
+  @IsBoolean()
+  verifyLocation?: boolean;
+}
+
+export class PairQrDisplayDto {
+  @ApiProperty({ description: 'Single-use code issued when the display was provisioned' })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(32)
+  pairingCode!: string;
+}
+
+/** The display's own fix, sent only when it must prove it is on site. */
+export class QrDisplayTokenDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  geoLat?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  geoLng?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  geoAccuracy?: number;
 }
 
 /**

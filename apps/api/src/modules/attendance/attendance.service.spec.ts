@@ -2,20 +2,24 @@ import { AuthUser } from '../../common/types/auth-user';
 import { ConfigService } from '@nestjs/config';
 import { AttendanceService } from './attendance.service';
 import { DeviceBindingService } from './device-binding.service';
+import { AttendanceQrService } from './attendance-qr.service';
+import { signQrToken } from './qr-token';
 import { ShiftResolutionService } from './shift-resolution.service';
 
 /**
- * All three services share the same prisma double: `ShiftResolutionService` is
- * the single resolver attendance reads shifts and locations through, and
- * `DeviceBindingService` owns the punch device checks, so stubbing either
+ * Every collaborator shares the same prisma double: stubbing any of them
  * separately would let the tests drift from production behaviour.
  */
-function newAttendanceService(prisma: unknown): AttendanceService {
+function newAttendanceService(prisma: unknown, env?: Record<string, string>): AttendanceService {
   const client = withPunchEvents(prisma as Record<string, any>);
+  const config = env
+    ? ({ get: (key: string) => env[key] } as never as ConfigService)
+    : new ConfigService();
   return new AttendanceService(
     client as never,
     new ShiftResolutionService(client as never),
-    new DeviceBindingService(client as never, new ConfigService()),
+    new DeviceBindingService(client as never, config),
+    new AttendanceQrService(client as never, config),
   );
 }
 
@@ -3299,6 +3303,135 @@ describe('AttendanceService', () => {
       await expect(service.checkIn(user, atDelhi)).rejects.toThrow(
         /away from Bengaluru Office/,
       );
+    });
+
+    /**
+     * An OFFICE employee at a geofenced location: the combination that could
+     * not punch while the punch path ran the geofence on every check-in.
+     */
+    describe('QR check-in', () => {
+      const QR_SECRET = 'qr-secret';
+
+      function qrHarness(options?: { display?: Record<string, unknown> | null }) {
+        const display =
+          options?.display === undefined
+            ? { id: 'display-1', tenantId: 'tenant-1', locationId: DELHI.id, isActive: true }
+            : options.display;
+        const punches = punchEventTable();
+        return {
+          ...checkInHarness({ employeeLocationId: DELHI.id, assignments: [] }),
+          attendancePunchEvent: punches.model,
+          punchEventRows: punches.rows,
+          attendanceQrDisplay: { findFirst: jest.fn().mockResolvedValue(display) },
+        };
+      }
+
+      /** Built the way a display builds one, so the signature is genuine. */
+      const scanned = (locationId = DELHI.id, extra: Record<string, unknown> = {}) =>
+        ({
+          deviceId: 'device-1',
+          qrCode: signQrToken(
+            { t: 'tenant-1', l: locationId, d: 'display-1', ...extra },
+            QR_SECRET,
+          ),
+        }) as never;
+
+      const qrService = (prisma: unknown) =>
+        newAttendanceService(prisma, { ATTENDANCE_QR_SECRET: QR_SECRET });
+
+      it('checks in with no GPS at all, where a plain check-in could not', async () => {
+        const prisma = qrHarness();
+        atMidAfternoon();
+
+        const record = await qrService(prisma).qrCheckIn(user, scanned());
+
+        // Late because the harness punches mid-afternoon; the point is that it
+        // landed at all, with no fix.
+        expect(record).toMatchObject({ punchIn: expect.any(Date) });
+        expect(prisma.punchEventRows[0]).toMatchObject({
+          source: 'QR',
+          locationId: DELHI.id,
+          geoLat: undefined,
+        });
+      });
+
+      it('records which display issued the code', async () => {
+        const prisma = qrHarness();
+        atMidAfternoon();
+
+        await qrService(prisma).qrCheckIn(user, scanned());
+
+        expect(prisma.punchEventRows[0].remarks).toMatch(/^qr:display-1:/);
+      });
+
+      it('refuses a code for a location the employee is not assigned to', async () => {
+        const prisma = {
+          ...qrHarness({
+            display: { id: 'display-1', tenantId: 'tenant-1', locationId: BENGALURU.id, isActive: true },
+          }),
+        };
+        atMidAfternoon();
+
+        await expect(qrService(prisma).qrCheckIn(user, scanned(BENGALURU.id))).rejects.toThrow(
+          /does not match a location you are assigned to/i,
+        );
+      });
+
+      it('refuses an expired code', async () => {
+        const prisma = qrHarness();
+        atMidAfternoon();
+        const stale = scanned(DELHI.id, { i: Math.floor(Date.now() / 1000) - 300 });
+
+        await expect(qrService(prisma).qrCheckIn(user, stale)).rejects.toThrow(/expired/i);
+      });
+
+      it('refuses a code signed with the wrong secret', async () => {
+        const prisma = qrHarness();
+        atMidAfternoon();
+        const forged = {
+          deviceId: 'device-1',
+          qrCode: signQrToken({ t: 'tenant-1', l: DELHI.id, d: 'display-1' }, 'not-the-secret'),
+        } as never;
+
+        await expect(qrService(prisma).qrCheckIn(user, forged)).rejects.toThrow(/not a valid/i);
+      });
+
+      it('still enforces the device binding', async () => {
+        const prisma = qrHarness();
+        prisma.employeeDevice.findUnique = jest
+          .fn()
+          .mockResolvedValue({ employeeId: 'emp-1', deviceId: 'another-device', tenantId: 'tenant-1' });
+        atMidAfternoon();
+
+        await expect(qrService(prisma).qrCheckIn(user, scanned())).rejects.toThrow(
+          /not your registered punch device/i,
+        );
+      });
+
+      it('is refused when HR has turned the QR capture mode off', async () => {
+        const prisma = qrHarness();
+        prisma.attendanceCaptureSetting.findFirst = jest
+          .fn()
+          .mockResolvedValue({ mode: 'QR', enabled: false, requiresGps: false, requiresGeofence: false });
+        atMidAfternoon();
+
+        await expect(qrService(prisma).qrCheckIn(user, scanned())).rejects.toThrow(
+          /capture is disabled by HR/i,
+        );
+      });
+
+      it('applies the employee geofence when HR opts the QR mode back into it', async () => {
+        // The capture setting is the one switch that re-enables the fence.
+        const prisma = qrHarness();
+        prisma.attendanceCaptureSetting.findFirst = jest
+          .fn()
+          .mockResolvedValue({ mode: 'QR', enabled: true, requiresGps: false, requiresGeofence: true });
+        atMidAfternoon();
+
+        await expect(qrService(prisma).qrCheckIn(user, scanned())).rejects.toThrow(
+          /Location is required to check in at Delhi Office/i,
+        );
+      });
     });
   });
 
