@@ -4153,3 +4153,122 @@ describe('manual comp-off grants', () => {
     });
   });
 });
+
+/**
+ * `employeeId` is minted at login, so a token stays usable for the rest of its life after
+ * the employee is terminated or deactivated. These cover the punch paths re-reading the row
+ * instead of trusting the claim.
+ */
+describe('self-service punch paths re-check employment', () => {
+  const punchUser = { tenantId: 'tenant-1', employeeId: 'emp-1' } as any;
+
+  /**
+   * `employee.findFirst` honours the `status` and `tenantId` filters the guard sends, so a
+   * guard that stopped filtering fails these tests rather than passing on a truthy stub.
+   */
+  function harness(employee: { status: string; tenantId?: string } | null) {
+    const prisma = {
+      employee: {
+        findFirst: jest.fn(({ where }: any) => {
+          if (!employee) return Promise.resolve(null);
+          if (where.tenantId && where.tenantId !== (employee.tenantId ?? 'tenant-1')) {
+            return Promise.resolve(null);
+          }
+          const excluded: string[] = where.status?.notIn ?? [];
+          if (excluded.includes(employee.status)) return Promise.resolve(null);
+          return Promise.resolve({ id: 'emp-1', locationId: null, workMode: 'REMOTE', location: null });
+        }),
+      },
+      attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+      employeeDevice: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({}),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      attendanceRecord: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        upsert: jest.fn().mockImplementation(({ create }: any) => Promise.resolve(create)),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', startTime: '09:00' }) },
+      attendanceRule: { findFirst: jest.fn().mockResolvedValue(null) },
+      attendanceQrDisplay: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+    return { prisma, service: newAttendanceService(prisma) };
+  }
+
+  const refusal = /not active for attendance/;
+
+  describe.each(['EXITED', 'INACTIVE'])('a %s employee holding a valid token', (status) => {
+    it('cannot check in', async () => {
+      const { prisma, service } = harness({ status });
+
+      await expect(service.checkIn(punchUser, { deviceId: 'device-1' } as any)).rejects.toThrow(
+        refusal,
+      );
+      // Nothing was written: the refusal lands before the punch, not after it.
+      expect(prisma.attendanceRecord.upsert).not.toHaveBeenCalled();
+      expect((prisma as any).punchEventRows).toHaveLength(0);
+    });
+
+    it('cannot check out', async () => {
+      const { prisma, service } = harness({ status });
+
+      await expect(service.checkOut(punchUser, { deviceId: 'device-1' } as any)).rejects.toThrow(
+        refusal,
+      );
+      expect(prisma.attendanceRecord.update).not.toHaveBeenCalled();
+      expect((prisma as any).punchEventRows).toHaveLength(0);
+    });
+
+    it('cannot punch by QR, and is refused before the code is resolved', async () => {
+      const { prisma, service } = harness({ status });
+
+      await expect(
+        service.qrCheckIn(punchUser, { qrCode: 'anything', deviceId: 'device-1' } as any),
+      ).rejects.toThrow(refusal);
+      expect(prisma.attendanceQrDisplay.findFirst).not.toHaveBeenCalled();
+      expect((prisma as any).punchEventRows).toHaveLength(0);
+    });
+
+    it('cannot obtain a device challenge to sign a punch with', async () => {
+      const { service } = harness({ status });
+
+      await expect(service.deviceChallenge(punchUser)).rejects.toThrow(refusal);
+    });
+  });
+
+  it('still lets a working employee punch, including one serving notice', async () => {
+    for (const status of ['ACTIVE', 'ON_NOTICE', 'ON_PROBATION', 'CONFIRMED']) {
+      const { service } = harness({ status });
+      await expect(
+        service.checkIn(punchUser, { deviceId: 'device-1' } as any),
+      ).resolves.toMatchObject({ employeeId: 'emp-1' });
+    }
+  });
+
+  it('refuses a token whose employee belongs to another workspace', async () => {
+    const { service } = harness({ status: 'ACTIVE', tenantId: 'tenant-2' });
+
+    await expect(service.checkIn(punchUser, { deviceId: 'device-1' } as any)).rejects.toThrow(
+      refusal,
+    );
+  });
+
+  it('refuses a token whose employee record no longer exists', async () => {
+    const { service } = harness(null);
+
+    await expect(service.checkIn(punchUser, { deviceId: 'device-1' } as any)).rejects.toThrow(
+      refusal,
+    );
+  });
+
+  it('still refuses a token carrying no employee profile at all', async () => {
+    const { service } = harness({ status: 'ACTIVE' });
+
+    await expect(
+      service.checkIn({ tenantId: 'tenant-1' } as any, { deviceId: 'device-1' } as any),
+    ).rejects.toThrow(/No employee profile linked/);
+  });
+});

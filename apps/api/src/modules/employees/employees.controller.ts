@@ -13,6 +13,7 @@ import {
   CreateDocumentDto,
   CreateEmployeeDto,
   CreateLifecycleEventDto,
+  TerminateEmployeeDto,
   UpdateEmployeeDto,
 } from './dto/create-employee.dto';
 import { EmployeeSummaryQueryDto } from './dto/employee-summary.dto';
@@ -119,6 +120,20 @@ export class EmployeesController {
   @ApiOperation({ summary: 'Deactivate employee (soft delete)' })
   deactivate(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.employees.deactivate(user, id);
+  }
+
+  @Post(':id/terminate')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
+  @Scopes('employees:write')
+  @ApiOperation({
+    summary: 'Terminate employment immediately, skipping the offboarding clearance flow',
+  })
+  terminate(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: TerminateEmployeeDto,
+  ) {
+    return this.employees.terminate(user, id, dto);
   }
 
   @Get(':id/documents')
