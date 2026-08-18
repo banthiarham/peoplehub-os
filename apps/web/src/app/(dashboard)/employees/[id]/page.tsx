@@ -14,9 +14,17 @@ import {
   Phone,
   Send,
   Smartphone,
+  UserX,
   Users,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { allows, viewerFromSession } from '@/lib/authz';
+import {
+  canSubmitTermination,
+  employeeFullName,
+  isTerminalStatus,
+  type TerminationFormState,
+} from '@/lib/termination';
 import { formatDate } from '@/lib/utils';
 import { AttendanceLeaveSummary } from '@/components/employees/attendance-leave-summary';
 import { AuthorizedLocationsField } from '@/components/forms/authorized-locations-field';
@@ -71,6 +79,15 @@ const editInitial = {
   taxRegime: '',
 };
 
+/** Today in the yyyy-mm-dd shape a date input expects, in UTC to match the API's day check. */
+const todayInput = () => new Date().toISOString().slice(0, 10);
+
+const terminateInitial: TerminationFormState = {
+  effectiveDate: '',
+  reason: '',
+  confirmName: '',
+};
+
 interface DocumentRow {
   id: string;
   type: string;
@@ -105,6 +122,8 @@ export default function EmployeeProfilePage() {
   const toast = useToast();
   const [editOpen, setEditOpen] = useState(false);
   const [editForm, setEditForm] = useState(editInitial);
+  const [terminateOpen, setTerminateOpen] = useState(false);
+  const [terminateForm, setTerminateForm] = useState<TerminationFormState>(terminateInitial);
   // Held apart from `editForm`, whose values are all strings and get filtered
   // by `value !== ''` when the patch payload is built.
   const [authorizedLocationIds, setAuthorizedLocationIds] = useState<string[]>([]);
@@ -159,6 +178,34 @@ export default function EmployeeProfilePage() {
     },
     onError: () => toast('Could not update employee details', 'error'),
   });
+  const terminateEmployee = useMutation({
+    mutationFn: () =>
+      api
+        .post(`/employees/${id}/terminate`, {
+          effectiveDate: terminateForm.effectiveDate,
+          reason: terminateForm.reason.trim(),
+          confirmName: terminateForm.confirmName,
+        })
+        .then((r) => r.data),
+    onSuccess: () => {
+      toast('Employment terminated — the employee is exited and their login is disabled');
+      setTerminateOpen(false);
+      setTerminateForm(terminateInitial);
+      queryClient.invalidateQueries({ queryKey: ['employees'] });
+      queryClient.invalidateQueries({ queryKey: ['employees', id] });
+      queryClient.invalidateQueries({ queryKey: ['employees', id, 'device'] });
+    },
+    onError: (error: unknown) => {
+      // The API owns the guards (self-termination, last admin, future date), so its message
+      // is the useful one.
+      const message = (error as { response?: { data?: { message?: string | string[] } } })?.response
+        ?.data?.message;
+      toast(
+        Array.isArray(message) ? message[0] : message ?? 'Could not terminate this employee',
+        'error',
+      );
+    },
+  });
 
   useEffect(() => {
     if (!e) return;
@@ -208,6 +255,12 @@ export default function EmployeeProfilePage() {
   const canViewAttendanceSummary = (session?.user?.roles ?? []).some((role) =>
     ['Super Admin', 'HR Admin', 'Tenant Owner'].includes(role),
   );
+  const fullName = employeeFullName(e);
+  const alreadyTerminal = isTerminalStatus(e.status);
+  const canTerminate = allows(viewerFromSession(session), 'terminateEmployee') && !alreadyTerminal;
+  const terminateReady = canSubmitTermination(terminateForm, e, {
+    pending: terminateEmployee.isPending,
+  });
 
   return (
     <div className="space-y-4">
@@ -242,9 +295,100 @@ export default function EmployeeProfilePage() {
               <Edit3 className="h-4 w-4" /> Edit details
             </Button>
             <EmployeeSendEmailDialog employeeId={id} employeeName={name} workEmail={e.workEmail} />
+            {canTerminate && (
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  setTerminateForm({ ...terminateInitial, effectiveDate: todayInput() });
+                  setTerminateOpen(true);
+                }}
+              >
+                <UserX className="h-4 w-4" /> Terminate
+              </Button>
+            )}
           </div>
         </div>
       </Card>
+
+      <Dialog open={terminateOpen} onOpenChange={setTerminateOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Terminate {name}</DialogTitle>
+            <DialogDescription>
+              This ends employment immediately and skips the offboarding clearance flow. It
+              cannot be undone from here.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!terminateReady) return;
+              terminateEmployee.mutate();
+            }}
+            className="space-y-4"
+          >
+            <ul className="space-y-1 rounded-lg border border-danger/30 bg-danger/5 p-3 text-xs text-ink-muted">
+              <li>· Their status becomes EXITED and their exit date is recorded.</li>
+              <li>· Their login is disabled and their attendance device binding is removed.</li>
+              <li>· Any open exit request is closed and its remaining tasks are waived.</li>
+              <li>· Assets, direct reports and pending approvals are left as they are.</li>
+            </ul>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-ink" htmlFor="terminate-date">
+                Effective date
+              </label>
+              <Input
+                id="terminate-date"
+                type="date"
+                max={todayInput()}
+                value={terminateForm.effectiveDate}
+                onChange={(event) =>
+                  setTerminateForm((f) => ({ ...f, effectiveDate: event.target.value }))
+                }
+                required
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-ink" htmlFor="terminate-reason">
+                Reason
+              </label>
+              <Input
+                id="terminate-reason"
+                value={terminateForm.reason}
+                onChange={(event) => setTerminateForm((f) => ({ ...f, reason: event.target.value }))}
+                placeholder="Recorded on the lifecycle event and the audit log"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-ink" htmlFor="terminate-confirm">
+                Type <span className="font-mono font-semibold text-ink">{fullName}</span> to confirm
+              </label>
+              <Input
+                id="terminate-confirm"
+                value={terminateForm.confirmName}
+                onChange={(event) =>
+                  setTerminateForm((f) => ({ ...f, confirmName: event.target.value }))
+                }
+                autoComplete="off"
+                placeholder={fullName}
+              />
+            </div>
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setTerminateOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" variant="destructive" disabled={!terminateReady}>
+                {terminateEmployee.isPending ? 'Terminating…' : 'Terminate employment'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">

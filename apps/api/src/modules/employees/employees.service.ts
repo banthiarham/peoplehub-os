@@ -24,6 +24,7 @@ import {
   CreateDocumentDto,
   CreateEmployeeDto,
   CreateLifecycleEventDto,
+  TerminateEmployeeDto,
   UpdateEmployeeDto,
 } from './dto/create-employee.dto';
 import { ListEmployeesDto } from './dto/list-employees.dto';
@@ -38,6 +39,34 @@ const employeeListInclude = {
   manager: { select: { id: true, firstName: true, lastName: true } },
   user: { select: { email: true, avatarUrl: true, userRoles: { include: { role: true } } } },
 } satisfies Prisma.EmployeeInclude;
+
+/** Already out of the workforce; terminating again would only add noise to the timeline. */
+const TERMINAL_EMPLOYEE_STATUSES = new Set<string>(['EXITED', 'INACTIVE']);
+
+/**
+ * Roles whose last active holder must keep their login. Terminating them would leave the
+ * workspace with nobody able to administer it, and the flow disables the linked user.
+ */
+const WORKSPACE_ADMIN_ROLES = ['Tenant Owner', 'HR Admin'];
+
+/** Exit requests in these states are already finished, so a termination leaves them alone. */
+const SETTLED_EXIT_STATUSES = ['COMPLETED', 'CLOSED_ON_TERMINATION'];
+
+/** Midnight UTC of `date`, so an effective date compares by day rather than by instant. */
+function utcDayStart(date: Date): number {
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
+
+/**
+ * Normalizes a typed confirmation for comparison: surrounding and repeated whitespace is
+ * noise, capitalisation is not worth failing an HR admin over.
+ *
+ * The web dialog applies the same rule in `apps/web/src/lib/termination.ts`; the two must
+ * stay in step or the button enables on input the API then rejects.
+ */
+function normalizeConfirmationName(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
 
 const sensitiveFields = new Set([
   'bankDetails',
@@ -429,6 +458,172 @@ export class EmployeesService {
     });
     await this.audit(user.tenantId, user.userId, 'employee.deactivated', 'Employee', id, existing, updated);
     return updated;
+  }
+
+  /**
+   * Immediate termination: ends employment now, without the clearance ladder in
+   * `OnboardingService.createExit`/`updateExit`.
+   *
+   * `EXITED` is reused rather than a new status. Roughly twenty call sites across payroll,
+   * attendance, analytics, search and the org chart filter on
+   * `status notIn ['EXITED','INACTIVE']`, and a new enum member would have to be threaded
+   * through every one of them - miss one and a terminated employee quietly stays in a
+   * payroll run. The reason for leaving lives on the lifecycle event instead.
+   *
+   * Disabling the linked user is what makes this equivalent to a deactivation rather than a
+   * status label: login checks `User.isActive` and never reads employee status. Already
+   * issued JWTs still live until they expire, which is why the confirmation and the guards
+   * below are enforced here rather than only in the dialog.
+   */
+  async terminate(user: AuthUser, id: string, dto: TerminateEmployeeDto) {
+    const existing = await this.getRaw(user.tenantId, id);
+
+    if (TERMINAL_EMPLOYEE_STATUSES.has(existing.status)) {
+      throw new BadRequestException(
+        `${existing.firstName} ${existing.lastName} is already ${existing.status.toLowerCase()}`,
+      );
+    }
+
+    const effectiveDate = new Date(dto.effectiveDate);
+    if (Number.isNaN(effectiveDate.getTime())) {
+      throw new BadRequestException('Effective date is not a valid date');
+    }
+    if (utcDayStart(effectiveDate) > utcDayStart(new Date())) {
+      throw new BadRequestException(
+        'Termination takes effect immediately, so the effective date cannot be in the future',
+      );
+    }
+
+    const fullName = `${existing.firstName} ${existing.lastName}`;
+    if (normalizeConfirmationName(dto.confirmName) !== normalizeConfirmationName(fullName)) {
+      throw new BadRequestException(`Type "${fullName}" exactly to confirm this termination`);
+    }
+
+    if (user.employeeId === id || (existing.userId && existing.userId === user.userId)) {
+      throw new ForbiddenException('You cannot terminate your own employment');
+    }
+
+    // Read the linked user directly instead of leaning on `getRaw`'s include, which selects
+    // neither the id nor `isSuperAdmin`.
+    const linkedUser = existing.userId
+      ? await this.prisma.user.findFirst({
+          where: { id: existing.userId, tenantId: user.tenantId },
+          select: {
+            id: true,
+            isActive: true,
+            isSuperAdmin: true,
+            userRoles: { select: { role: { select: { name: true } } } },
+          },
+        })
+      : null;
+
+    if (linkedUser) {
+      const roles = linkedUser.userRoles.map((userRole) => userRole.role.name);
+      if (linkedUser.isSuperAdmin || roles.includes('Tenant Owner')) {
+        throw new ForbiddenException(
+          'The workspace owner cannot be terminated. Transfer ownership first.',
+        );
+      }
+      if (roles.some((role) => WORKSPACE_ADMIN_ROLES.includes(role))) {
+        const otherAdmins = await this.prisma.user.count({
+          where: {
+            tenantId: user.tenantId,
+            isActive: true,
+            id: { not: linkedUser.id },
+            OR: [
+              { isSuperAdmin: true },
+              { userRoles: { some: { role: { name: { in: WORKSPACE_ADMIN_ROLES } } } } },
+            ],
+          },
+        });
+        if (otherAdmins === 0) {
+          throw new ForbiddenException(
+            'This is the last active administrator in the workspace. Grant another user an admin role first.',
+          );
+        }
+      }
+    }
+
+    const terminatedAt = new Date();
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.employee.update({
+        where: { id },
+        data: { status: 'EXITED', exitDate: effectiveDate },
+      });
+
+      if (linkedUser) {
+        await tx.user.update({ where: { id: linkedUser.id }, data: { isActive: false } });
+      }
+
+      await tx.employeeLifecycleEvent.create({
+        data: {
+          employeeId: id,
+          eventType: 'TERMINATED',
+          fromStatus: existing.status,
+          toStatus: 'EXITED',
+          effectiveDate,
+          remarks: dto.reason,
+          createdById: user.userId,
+        },
+      });
+
+      // An in-flight resignation would otherwise sit on the offboarding board forever,
+      // waiting on approvals for someone who no longer works here.
+      const openExits = await tx.exitRequest.findMany({
+        where: { tenantId: user.tenantId, employeeId: id, status: { notIn: SETTLED_EXIT_STATUSES } },
+        select: { id: true },
+      });
+      let waivedTasks = 0;
+      if (openExits.length) {
+        const exitIds = openExits.map((exit) => exit.id);
+        await tx.exitRequest.updateMany({
+          where: { id: { in: exitIds } },
+          data: { status: 'CLOSED_ON_TERMINATION', completedAt: terminatedAt },
+        });
+        const waived = await tx.exitTask.updateMany({
+          where: {
+            tenantId: user.tenantId,
+            exitRequestId: { in: exitIds },
+            completedAt: null,
+            isWaived: false,
+          },
+          data: { isWaived: true },
+        });
+        waivedTasks = waived.count;
+      }
+
+      // The binding is a punch credential. It outlives the token, so it goes with the job.
+      const devices = await tx.employeeDevice.deleteMany({
+        where: { tenantId: user.tenantId, employeeId: id },
+      });
+
+      const summary = {
+        status: 'EXITED',
+        exitDate: effectiveDate.toISOString(),
+        reason: dto.reason,
+        userDisabled: !!linkedUser,
+        closedExitRequests: openExits.length,
+        waivedExitTasks: waivedTasks,
+        removedDeviceBindings: devices.count,
+      };
+      await tx.auditLog.create({
+        data: {
+          tenantId: user.tenantId,
+          actorId: user.userId,
+          action: 'employee.terminated',
+          objectType: 'Employee',
+          objectId: id,
+          oldValue: {
+            status: existing.status,
+            exitDate: existing.exitDate?.toISOString() ?? null,
+            userActive: linkedUser?.isActive ?? null,
+          },
+          newValue: summary,
+        },
+      });
+
+      return { employee: updated, ...summary };
+    });
   }
 
   async listDocuments(user: AuthUser, employeeId: string) {
