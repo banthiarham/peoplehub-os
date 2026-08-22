@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { LifeBuoy } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -21,11 +22,47 @@ interface TicketRow {
   _count?: { comments: number };
 }
 
+interface TicketComment {
+  id: string;
+  message: string;
+  createdAt: string;
+}
+
+interface TicketDetail extends TicketRow {
+  comments: TicketComment[];
+}
+
+function TicketReplies({ ticketId }: { ticketId: string }) {
+  const { data: ticket, isLoading } = useQuery<TicketDetail>({
+    queryKey: ['helpdesk', 'ticket', ticketId],
+    queryFn: () => api.get(`/helpdesk/tickets/${ticketId}`).then((r) => r.data),
+  });
+
+  if (isLoading) return <Skeleton className="mt-3 h-12" />;
+
+  const comments = ticket?.comments ?? [];
+  if (!comments.length) {
+    return <p className="mt-3 text-xs text-ink-muted">No replies yet.</p>;
+  }
+
+  return (
+    <div className="mt-3 space-y-2 border-t border-border pt-3">
+      {comments.map((comment) => (
+        <div key={comment.id} className="rounded-md bg-surface-muted p-2 text-xs">
+          <p className="text-ink-muted">{formatDate(comment.createdAt)}</p>
+          <p className="mt-0.5 leading-relaxed">{comment.message}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function MyTicketsPage() {
   const { data: tickets, isLoading } = useQuery<TicketRow[]>({
     queryKey: ['helpdesk', 'my-tickets'],
     queryFn: () => api.get('/helpdesk/tickets/me').then((r) => r.data),
   });
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   return (
     <div className="space-y-4">
@@ -42,21 +79,29 @@ export default function MyTicketsPage() {
         </div>
       ) : tickets?.length ? (
         <div className="space-y-2">
-          {tickets.map((ticket) => (
-            <Card key={ticket.id} className="p-4">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium">{ticket.subject}</p>
-                  <p className="mt-0.5 line-clamp-2 text-xs text-ink-muted">
-                    {ticket.category} · {ticket.priority} · {formatDate(ticket.createdAt)}
-                    {ticket._count?.comments ? ` · ${ticket._count.comments} comments` : ''}
-                  </p>
-                </div>
-                <Badge variant={statusVariant(ticket.status)}>{ticket.status.replace(/_/g, ' ')}</Badge>
-              </div>
-              <p className="mt-3 text-xs leading-relaxed text-ink-muted">{ticket.description}</p>
-            </Card>
-          ))}
+          {tickets.map((ticket) => {
+            const isExpanded = expandedId === ticket.id;
+            return (
+              <Card key={ticket.id} className="p-4">
+                <button
+                  type="button"
+                  onClick={() => setExpandedId(isExpanded ? null : ticket.id)}
+                  className="flex w-full items-start justify-between gap-3 text-left"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{ticket.subject}</p>
+                    <p className="mt-0.5 line-clamp-2 text-xs text-ink-muted">
+                      {ticket.category} · {ticket.priority} · {formatDate(ticket.createdAt)}
+                      {ticket._count?.comments ? ` · ${ticket._count.comments} comments` : ''}
+                    </p>
+                  </div>
+                  <Badge variant={statusVariant(ticket.status)}>{ticket.status.replace(/_/g, ' ')}</Badge>
+                </button>
+                <p className="mt-3 text-xs leading-relaxed text-ink-muted">{ticket.description}</p>
+                {isExpanded && <TicketReplies ticketId={ticket.id} />}
+              </Card>
+            );
+          })}
         </div>
       ) : (
         <EmptyState
