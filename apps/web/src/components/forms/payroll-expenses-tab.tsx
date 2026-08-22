@@ -15,6 +15,7 @@ import { Select } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toaster';
+import { ExpenseClaimDetailDialog } from './expense-claim-detail-dialog';
 import { PayrollNewExpenseDialog } from './payroll-new-expense-dialog';
 import { payrollApiError } from './payroll-run-action-button';
 
@@ -27,6 +28,7 @@ interface ExpenseRow {
   receiptKey?: string | null;
   reimbursementMethod: string;
   clarificationNote?: string | null;
+  clarificationResponse?: string | null;
   createdAt: string;
   employee: { firstName: string; lastName: string; employeeCode: string };
 }
@@ -44,6 +46,7 @@ export function PayrollExpensesTab() {
   const queryClient = useQueryClient();
   const toast = useToast();
   const [status, setStatus] = useState('SUBMITTED');
+  const [openClaimId, setOpenClaimId] = useState<string | null>(null);
 
   const { data, isLoading } = useQuery({
     queryKey: ['payroll', 'expenses', status],
@@ -128,51 +131,59 @@ export function PayrollExpensesTab() {
                   <span className="block">{r.description}</span>
                   <span className="block text-xs">{r.reimbursementMethod === 'DIRECT' ? 'Direct' : 'Through payroll'}</span>
                   {r.clarificationNote && <span className="block text-xs text-warning">{r.clarificationNote}</span>}
+                  {r.clarificationResponse && (
+                    <span className="block text-xs">Reply: {r.clarificationResponse}</span>
+                  )}
                 </TD>
-                <TD className="max-w-36 truncate text-xs text-ink-muted">{r.receiptKey ?? '—'}</TD>
+                <TD className="text-xs text-ink-muted">{r.receiptKey ? 'Attached' : '—'}</TD>
                 <TD>
                   <Badge variant={statusVariant(r.status)}>{r.status}</Badge>
                 </TD>
                 <TD>
-                  {r.status === 'SUBMITTED' && (
-                    <div className="flex gap-1.5">
+                  <div className="flex gap-1.5">
+                    <Button size="sm" variant="ghost" onClick={() => setOpenClaimId(r.id)}>
+                      View
+                    </Button>
+                    {r.status === 'SUBMITTED' && (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={act.isPending}
+                          onClick={() => act.mutate({ id: r.id, action: 'approve' })}
+                        >
+                          Approve
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-danger"
+                          disabled={act.isPending}
+                          onClick={() => act.mutate({ id: r.id, action: 'reject' })}
+                        >
+                          Reject
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={act.isPending}
+                          onClick={() => act.mutate({ id: r.id, action: 'clarify' })}
+                        >
+                          Clarify
+                        </Button>
+                      </>
+                    )}
+                    {r.status === 'APPROVED' && r.reimbursementMethod === 'DIRECT' && (
                       <Button
                         size="sm"
                         variant="secondary"
                         disabled={act.isPending}
-                        onClick={() => act.mutate({ id: r.id, action: 'approve' })}
+                        onClick={() => act.mutate({ id: r.id, action: 'reimburse' })}
                       >
-                        Approve
+                        Mark reimbursed
                       </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="text-danger"
-                        disabled={act.isPending}
-                        onClick={() => act.mutate({ id: r.id, action: 'reject' })}
-                      >
-                        Reject
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={act.isPending}
-                        onClick={() => act.mutate({ id: r.id, action: 'clarify' })}
-                      >
-                        Clarify
-                      </Button>
-                    </div>
-                  )}
-                  {r.status === 'APPROVED' && r.reimbursementMethod === 'DIRECT' && (
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={act.isPending}
-                      onClick={() => act.mutate({ id: r.id, action: 'reimburse' })}
-                    >
-                      Mark reimbursed
-                    </Button>
-                  )}
+                    )}
+                  </div>
                 </TD>
               </TR>
             ))}
@@ -181,6 +192,11 @@ export function PayrollExpensesTab() {
       ) : (
         <EmptyState icon={ReceiptText} title="No expense claims" description="Nothing here for this filter." />
       )}
+      <ExpenseClaimDetailDialog
+        id={openClaimId}
+        open={Boolean(openClaimId)}
+        onOpenChange={(next) => !next && setOpenClaimId(null)}
+      />
     </Card>
   );
 }

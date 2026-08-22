@@ -1,5 +1,11 @@
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { PayrollService } from './payroll.service';
+import { AuthUser } from '../../common/types/auth-user';
 
 type FinalizationFixture = {
   tenantId: string;
@@ -927,13 +933,10 @@ describe('PayrollService', () => {
   });
 
   it('blocks expenses above configured policy limits', async () => {
-    const service = new PayrollService({} as any, {} as any, {} as any);
+    const { service } = expenseHarness();
 
     await expect(
-      service.createExpense(
-        { tenantId: 'tenant-1', employeeId: 'emp-1' } as any,
-        { category: 'meals', amount: 6000 },
-      ),
+      service.createExpense(employeeUser(), { category: 'meals', amount: 6000 }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
@@ -962,5 +965,396 @@ describe('PayrollService', () => {
     expect(result.csv).toContain('Salary expense');
     expect(result.csv).toContain('TDS payable');
     expect(result.csv).toContain('Salary bank payable');
+  });
+});
+
+/** The AuthUser an Employee receives at login, plus any role or link under test. */
+function employeeUser(overrides: Partial<AuthUser> = {}): AuthUser {
+  return {
+    userId: 'user-1',
+    tenantId: 'tenant-1',
+    email: 'asha@example.com',
+    name: 'Asha',
+    isSuperAdmin: false,
+    employeeId: 'emp-1',
+    roles: ['Employee'],
+    scopes: ['payroll:read'],
+    authType: 'jwt',
+    ...overrides,
+  } as AuthUser;
+}
+
+/**
+ * Prisma double for the expense paths. `employee.findFirst` honours the real `where`, so
+ * the tenant and status predicates of the active-employee check are exercised rather than
+ * stubbed away.
+ */
+function expenseHarness(options: {
+  employee?: Record<string, unknown> | null;
+  claim?: Record<string, unknown>;
+} = {}) {
+  const employee = options.employee === undefined
+    ? { id: 'emp-1', tenantId: 'tenant-1', status: 'ACTIVE' }
+    : options.employee;
+  const claim = {
+    id: 'claim-1',
+    tenantId: 'tenant-1',
+    employeeId: 'emp-1',
+    category: 'MEALS',
+    amount: 900,
+    status: 'SUBMITTED',
+    ...options.claim,
+  };
+  const prisma = {
+    employee: {
+      findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+        Promise.resolve(
+          employee &&
+            employee.id === where.id &&
+            employee.tenantId === where.tenantId &&
+            (where.status?.in ?? []).includes(employee.status)
+            ? { id: employee.id }
+            : null,
+        ),
+      ),
+    },
+    expenseClaim: {
+      create: jest.fn((args: { data: Record<string, unknown> }) => Promise.resolve({ id: 'claim-1', ...args.data })),
+      findMany: jest.fn().mockResolvedValue([]),
+      count: jest.fn().mockResolvedValue(0),
+      findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+        Promise.resolve(
+          (where.id === undefined || where.id === claim.id) &&
+            (where.tenantId === undefined || where.tenantId === claim.tenantId) &&
+            (where.employeeId === undefined || where.employeeId === claim.employeeId)
+            ? claim
+            : null,
+        ),
+      ),
+      update: jest.fn(({ data }: { data: Record<string, unknown> }) => Promise.resolve({ ...claim, ...data })),
+      // Honours the status predicate, so a claim decided between the read and the write
+      // reports zero rows exactly as Postgres would.
+      updateMany: jest.fn(({ where }: { where: Record<string, any>; data: Record<string, any> }) =>
+        Promise.resolve({ count: where.status === undefined || where.status === claim.status ? 1 : 0 }),
+      ),
+      findFirstOrThrow: jest.fn().mockResolvedValue(claim),
+    },
+    auditLog: { create: jest.fn().mockResolvedValue({}) },
+  };
+  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any) };
+}
+
+describe('expense claims', () => {
+  it('files the claim against the employee the token is linked to', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.createExpense(employeeUser(), { category: 'travel', amount: 1200, description: 'Cab' });
+
+    expect(prisma.employee.findFirst.mock.calls[0][0].where).toMatchObject({
+      id: 'emp-1',
+      tenantId: 'tenant-1',
+    });
+    expect(prisma.expenseClaim.create.mock.calls[0][0].data).toMatchObject({
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+      category: 'TRAVEL',
+      status: 'SUBMITTED',
+    });
+  });
+
+  it('refuses a caller with no employee link', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await expect(
+      service.createExpense(employeeUser({ employeeId: null }), { category: 'travel', amount: 100 }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.expenseClaim.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an exited employee', { status: 'EXITED' }],
+    ['an employee in another tenant', { tenantId: 'tenant-2' }],
+  ])('refuses %s', async (_label, employee) => {
+    const { prisma, service } = expenseHarness({
+      employee: { id: 'emp-1', tenantId: 'tenant-1', status: 'ACTIVE', ...employee },
+    });
+
+    await expect(
+      service.createExpense(employeeUser(), { category: 'travel', amount: 100 }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.expenseClaim.create).not.toHaveBeenCalled();
+  });
+
+  it('returns only the caller own claims from the me route', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.myExpenses(employeeUser());
+
+    expect(prisma.expenseClaim.findMany.mock.calls[0][0].where).toEqual({
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+    });
+  });
+
+  it('refuses the me route without an employee link', async () => {
+    const { service } = expenseHarness();
+
+    await expect(service.myExpenses(employeeUser({ employeeId: null }))).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+  });
+
+  it('narrows the tenant-wide list to the caller own claims for an employee', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.listExpenses(employeeUser(), { status: 'SUBMITTED' } as any);
+
+    expect(prisma.expenseClaim.findMany.mock.calls[0][0].where).toEqual({
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+      status: 'SUBMITTED',
+    });
+  });
+
+  it('matches nothing when an unprivileged caller has no employee link', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.listExpenses(employeeUser({ employeeId: null }), {} as any);
+
+    expect(prisma.expenseClaim.findMany.mock.calls[0][0].where.employeeId).toBe('__none__');
+  });
+
+  it.each([
+    ['Payroll Admin', { roles: ['Payroll Admin'], scopes: ['payroll:read', 'payroll:write'] }],
+    ['Manager', { roles: ['Manager'], scopes: ['payroll:read'] }],
+    ['Finance Admin', { roles: ['Finance Admin'], scopes: ['payroll:read', 'payroll:approve'] }],
+    ['Auditor', { roles: ['Auditor'], scopes: ['payroll:read', 'payroll:export'] }],
+    ['a super admin', { roles: [], scopes: [], isSuperAdmin: true }],
+    ['an API key', { roles: [], scopes: ['payroll:read'], employeeId: null, authType: 'apiKey' }],
+  ])('keeps the tenant-wide list for %s', async (_label, overrides) => {
+    const { prisma, service } = expenseHarness();
+
+    await service.listExpenses(employeeUser(overrides as Partial<AuthUser>), {} as any);
+
+    expect(prisma.expenseClaim.findMany.mock.calls[0][0].where).toEqual({ tenantId: 'tenant-1' });
+  });
+
+  it('narrows the CSV export the same way as the list', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.exportExpensesCsv(employeeUser(), {} as any);
+    expect(prisma.expenseClaim.findMany.mock.calls[0][0].where).toEqual({
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+    });
+
+    await service.exportExpensesCsv(employeeUser({ roles: ['Payroll Admin'] }), {} as any);
+    expect(prisma.expenseClaim.findMany.mock.calls[1][0].where).toEqual({ tenantId: 'tenant-1' });
+  });
+
+  it.each([
+    ['REJECTED', 'APPROVED'],
+    ['PAID', 'REJECTED'],
+    ['APPROVED', 'APPROVED'],
+    ['APPROVED', 'CLARIFICATION_REQUESTED'],
+    ['DRAFT', 'APPROVED'],
+  ])('refuses a decision on a claim that is already %s', async (from, decision) => {
+    const { prisma, service } = expenseHarness({ claim: { status: from } });
+
+    await expect(
+      service.decideExpense('tenant-1', 'claim-1', decision as any, 'user-2'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.expenseClaim.update).not.toHaveBeenCalled();
+  });
+
+  it.each(['APPROVED', 'REJECTED', 'CLARIFICATION_REQUESTED'])(
+    'decides a submitted claim: %s',
+    async (decision) => {
+      const { prisma, service } = expenseHarness();
+
+      await service.decideExpense('tenant-1', 'claim-1', decision as any, 'user-2');
+
+      expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({
+        status: decision,
+        decidedById: 'user-2',
+      });
+    },
+  );
+
+  it('marks an approved claim paid once a run has picked it up', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: {
+        status: 'APPROVED',
+        reimbursementMethod: 'PAYROLL',
+        reimbursedInPayrollRunId: 'run-1',
+      },
+    });
+
+    await service.decideExpense('tenant-1', 'claim-1', 'PAID', 'user-2');
+
+    expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({ status: 'PAID' });
+  });
+
+  it('still refuses to pay an approved payroll claim that no run has picked up', async () => {
+    const { service } = expenseHarness({
+      claim: { status: 'APPROVED', reimbursementMethod: 'PAYROLL' },
+    });
+
+    await expect(
+      service.decideExpense('tenant-1', 'claim-1', 'PAID', 'user-2'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('expense claim detail and clarification replies', () => {
+  it('reads a claim the caller owns', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.getExpense(employeeUser(), 'claim-1');
+
+    expect(prisma.expenseClaim.findFirst.mock.calls[0][0].where).toEqual({
+      id: 'claim-1',
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+    });
+  });
+
+  it('hides another employee claim behind a 404', async () => {
+    const { service } = expenseHarness({ claim: { employeeId: 'emp-2' } });
+
+    await expect(service.getExpense(employeeUser(), 'claim-1')).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
+
+  it('lets an approver read any claim in the tenant', async () => {
+    const { prisma, service } = expenseHarness({ claim: { employeeId: 'emp-2' } });
+
+    await service.getExpense(employeeUser({ roles: ['Payroll Admin'] }), 'claim-1');
+
+    expect(prisma.expenseClaim.findFirst.mock.calls[0][0].where).toEqual({
+      id: 'claim-1',
+      tenantId: 'tenant-1',
+    });
+  });
+
+  it('sends an answered claim back to the approver as SUBMITTED', async () => {
+    const { prisma, service } = expenseHarness({ claim: { status: 'CLARIFICATION_REQUESTED' } });
+
+    await service.respondToClarification(employeeUser(), 'claim-1', {
+      response: 'Receipt attached now',
+      amount: 800,
+      receiptKey: 'tenant-1/receipt.pdf',
+    });
+
+    expect(prisma.expenseClaim.findFirst.mock.calls[0][0].where).toEqual({
+      id: 'claim-1',
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+    });
+    expect(prisma.expenseClaim.updateMany.mock.calls[0][0].where).toEqual({
+      id: 'claim-1',
+      tenantId: 'tenant-1',
+      employeeId: 'emp-1',
+      status: 'CLARIFICATION_REQUESTED',
+    });
+    expect(prisma.expenseClaim.updateMany.mock.calls[0][0].data).toMatchObject({
+      status: 'SUBMITTED',
+      clarificationResponse: 'Receipt attached now',
+      amount: 800,
+      receiptKey: 'tenant-1/receipt.pdf',
+      decidedById: null,
+      decidedAt: null,
+    });
+  });
+
+  it('keeps the approver question on the claim so the thread reads in order', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { status: 'CLARIFICATION_REQUESTED', clarificationNote: 'Which trip was this?' },
+    });
+
+    await service.respondToClarification(employeeUser(), 'claim-1', { response: 'Pune, 4 Aug' });
+
+    expect(prisma.expenseClaim.updateMany.mock.calls[0][0].data.clarificationNote).toBeUndefined();
+  });
+
+  it('clears a stale answer when a second clarification is requested', async () => {
+    const { prisma, service } = expenseHarness();
+
+    await service.decideExpense('tenant-1', 'claim-1', 'CLARIFICATION_REQUESTED', 'user-2', {
+      note: 'Still unclear',
+    });
+
+    expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({
+      clarificationResponse: null,
+    });
+  });
+
+  it('re-checks the policy cap against a corrected amount', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { status: 'CLARIFICATION_REQUESTED', category: 'MEALS' },
+    });
+
+    await expect(
+      service.respondToClarification(employeeUser(), 'claim-1', { response: 'Corrected', amount: 6000 }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.expenseClaim.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each(['SUBMITTED', 'APPROVED', 'REJECTED', 'PAID'])(
+    'refuses a resubmit of a claim that is %s',
+    async (status) => {
+      const { prisma, service } = expenseHarness({ claim: { status } });
+
+      await expect(
+        service.respondToClarification(employeeUser(), 'claim-1', { response: 'Anything' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.expenseClaim.updateMany).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses a resubmit of a claim belonging to someone else', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { status: 'CLARIFICATION_REQUESTED', employeeId: 'emp-2' },
+    });
+
+    await expect(
+      service.respondToClarification(employeeUser(), 'claim-1', { response: 'Not mine' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.expenseClaim.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses a resubmit from an employee who is no longer active', async () => {
+    const { prisma, service } = expenseHarness({
+      employee: { id: 'emp-1', tenantId: 'tenant-1', status: 'EXITED' },
+      claim: { status: 'CLARIFICATION_REQUESTED' },
+    });
+
+    await expect(
+      service.respondToClarification(employeeUser(), 'claim-1', { response: 'Answer' }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.expenseClaim.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('reports a conflict when the claim is decided while the reply is in flight', async () => {
+    const { prisma, service } = expenseHarness({ claim: { status: 'CLARIFICATION_REQUESTED' } });
+    // The approver's decision lands between the read and the write, so the guarded write
+    // matches nothing and the reply must not revert it.
+    prisma.expenseClaim.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    await expect(
+      service.respondToClarification(employeeUser(), 'claim-1', { response: 'Answer', amount: 500 }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('lets the approver decide the resubmitted claim normally', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { status: 'SUBMITTED', clarificationResponse: 'Receipt attached now' },
+    });
+
+    await service.decideExpense('tenant-1', 'claim-1', 'APPROVED', 'user-2');
+
+    expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({ status: 'APPROVED' });
   });
 });

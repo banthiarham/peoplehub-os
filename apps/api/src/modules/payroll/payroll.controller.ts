@@ -4,6 +4,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Scopes } from '../../common/decorators/scopes.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
+import { SelfService } from '../../common/decorators/self-service.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import {
   AssignSalaryDto,
@@ -16,6 +17,7 @@ import {
   OverrideWarningsDto,
   PageDto,
   PreviewSalaryStructureDto,
+  RespondExpenseClarificationDto,
   UpsertSalaryStructureDto,
   WaiveLoanDto,
 } from './dto/payroll.dto';
@@ -312,10 +314,22 @@ export class PayrollController {
     return this.payroll.createPayrollInput(user.tenantId, user.userId, dto);
   }
 
+  // The result set narrows to the caller: `PayrollService.listExpenses` returns only the
+  // caller's own claims unless they hold an administrative or approver grant. Employees
+  // hold `payroll:read` (their `OWN_DATA` scope type is lost when scopes are derived), so
+  // the guard alone cannot keep this route from listing the whole tenant.
   @Get('expenses')
   @Scopes('payroll:read')
   listExpenses(@CurrentUser() user: AuthUser, @Query() q: ListExpensesDto) {
-    return this.payroll.listExpenses(user.tenantId, q);
+    return this.payroll.listExpenses(user, q);
+  }
+
+  @Get('expenses/me')
+  @ApiOperation({ summary: 'Expense claims you have raised' })
+  @SelfService()
+  @Scopes('payroll:read')
+  myExpenses(@CurrentUser() user: AuthUser) {
+    return this.payroll.myExpenses(user);
   }
 
   @Get('expenses/export')
@@ -326,16 +340,46 @@ export class PayrollController {
     @Query() q: ListExpensesDto,
     @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const { csv, period } = await this.payroll.exportExpensesCsv(user.tenantId, q);
+    const { csv, period } = await this.payroll.exportExpensesCsv(user, q);
     res.header('Content-Type', 'text/csv; charset=utf-8');
     res.header('Content-Disposition', `attachment; filename="expense-report-${period}.csv"`);
     return csv;
   }
 
+  // Static segments win over `:id` in the router, so `expenses/me` and `expenses/export`
+  // stay reachable. Scoping is the service's: claimant or tenant-wide reader, else 404.
+  @Get('expenses/:id')
+  @ApiOperation({ summary: 'One expense claim with its receipt and clarification thread' })
+  @SelfService()
+  @Scopes('payroll:read')
+  getExpense(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.payroll.getExpense(user, id);
+  }
+
+  // Self-service as well as administrative: the claim is always raised for the caller's own
+  // employee record - `CreateExpenseDto` carries no `employeeId` and the service resolves
+  // the claimant from the token - so an employee's own link authorises it. The existing
+  // `payroll:write` scope is kept so admin and API-key access is unchanged.
   @Post('expenses')
+  @ApiOperation({ summary: 'Raise an expense claim for yourself' })
+  @SelfService()
   @Scopes('payroll:write')
   createExpense(@CurrentUser() user: AuthUser, @Body() dto: CreateExpenseDto) {
     return this.payroll.createExpense(user, dto);
+  }
+
+  // Self-service only: the claimant answers the clarification and the claim goes back to
+  // SUBMITTED for the approver. `PayrollService` matches the claim against the caller's own
+  // employee record, so this can never reach someone else's claim.
+  @Patch('expenses/:id/respond')
+  @ApiOperation({ summary: 'Answer a clarification request and resubmit your claim' })
+  @SelfService()
+  respondToExpenseClarification(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: RespondExpenseClarificationDto,
+  ) {
+    return this.payroll.respondToClarification(user, id, dto);
   }
 
   @Patch('expenses/:id/approve')

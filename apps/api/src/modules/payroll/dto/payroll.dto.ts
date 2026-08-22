@@ -293,6 +293,29 @@ export class OverrideWarningsDto {
   reason!: string;
 }
 
+export class RespondExpenseClarificationDto {
+  @ApiProperty({ description: 'Answer to the approver clarification request' })
+  @IsString()
+  @IsNotEmpty()
+  response!: string;
+
+  @ApiPropertyOptional({ description: 'Corrected amount, when the clarification was about it' })
+  @IsOptional()
+  @IsNumber()
+  @Min(0.01)
+  amount?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  description?: string;
+
+  @ApiPropertyOptional({ description: 'File object key for a replacement receipt' })
+  @IsOptional()
+  @IsString()
+  receiptKey?: string;
+}
+
 export class ExpenseDecisionDto {
   @ApiPropertyOptional()
   @IsOptional()

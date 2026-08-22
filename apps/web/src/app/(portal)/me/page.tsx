@@ -3,7 +3,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { useSession } from 'next-auth/react';
 import Link from 'next/link';
-import { CalendarDays, ChevronRight, Clock, LifeBuoy, ReceiptText, User } from 'lucide-react';
+import { CalendarDays, ChevronRight, Clock, LifeBuoy, ReceiptText, Wallet, User } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatDate, formatINR } from '@/lib/utils';
 import { CheckInPanel } from '@/components/portal/check-in-panel';
@@ -39,6 +39,11 @@ interface TicketRow {
   status: string;
 }
 
+interface ExpenseRow {
+  id: string;
+  status: string;
+}
+
 export default function PortalHomePage() {
   const { data: session } = useSession();
   const firstName = session?.user?.name?.split(' ')[0] ?? 'there';
@@ -67,6 +72,10 @@ export default function PortalHomePage() {
     queryKey: ['helpdesk', 'my-tickets'],
     queryFn: () => api.get('/helpdesk/tickets/me').then((r) => r.data),
   });
+  const { data: expenses } = useQuery<ExpenseRow[]>({
+    queryKey: ['payroll', 'my-expenses'],
+    queryFn: () => api.get('/payroll/expenses/me').then((r) => r.data),
+  });
 
   const totalLeave = balances?.reduce((s, b) => s + b.balance, 0);
   const lastSlip = payslips?.[0];
@@ -74,6 +83,9 @@ export default function PortalHomePage() {
   const pendingLeave = leaveRequests?.filter((request) => request.status === 'PENDING').length ?? 0;
   const openTickets = tickets?.filter((ticket) => !['RESOLVED', 'CLOSED'].includes(ticket.status)).length ?? 0;
   const nextHoliday = holidays?.find((holiday) => new Date(holiday.date) >= new Date());
+  const openExpenses =
+    expenses?.filter((claim) => ['SUBMITTED', 'CLARIFICATION_REQUESTED', 'APPROVED'].includes(claim.status))
+      .length ?? 0;
 
   return (
     <div className="space-y-4">
@@ -131,6 +143,25 @@ export default function PortalHomePage() {
               <p className="text-sm font-medium">HR tickets</p>
               <p className="text-xs text-ink-muted">
                 {openTickets ? `${openTickets} open request${openTickets === 1 ? '' : 's'}` : 'Raise or track a request'}
+              </p>
+            </div>
+          </div>
+          <ChevronRight className="h-4 w-4 text-ink-faint" />
+        </Card>
+      </Link>
+
+      <Link href="/me/expenses" className="block">
+        <Card className="flex items-center justify-between p-4">
+          <div className="flex items-center gap-3">
+            <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-50">
+              <Wallet className="h-5 w-5 text-primary-700" />
+            </span>
+            <div>
+              <p className="text-sm font-medium">Expenses</p>
+              <p className="text-xs text-ink-muted">
+                {openExpenses
+                  ? `${openExpenses} claim${openExpenses === 1 ? '' : 's'} in progress`
+                  : 'Raise or track a claim'}
               </p>
             </div>
           </div>

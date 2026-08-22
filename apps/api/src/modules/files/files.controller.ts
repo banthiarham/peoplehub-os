@@ -27,7 +27,11 @@ export class FilesController {
 
   @Get('download-url')
   @ApiOperation({ summary: 'Presigned download URL for a stored file (15 min validity)' })
-  downloadUrl(@CurrentUser() user: AuthUser, @Query('key') key: string) {
-    return this.files.downloadUrl(user.tenantId, key);
+  downloadUrl(
+    @CurrentUser() user: AuthUser,
+    @Query('key') key: string,
+    @Query('disposition') disposition?: string,
+  ) {
+    return this.files.downloadUrl(user.tenantId, key, disposition === 'inline');
   }
 }

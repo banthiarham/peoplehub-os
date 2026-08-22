@@ -195,6 +195,58 @@ describe('RolesGuard: payroll run lifecycle', () => {
     });
   }
 
+  it('lets an Employee raise and read their own expense claims', () => {
+    const employee = userFor('Employee');
+    expect(allowed(PayrollController, 'createExpense', employee)).toBe(true);
+    expect(allowed(PayrollController, 'myExpenses', employee)).toBe(true);
+  });
+
+  it('admits a machine token to expense creation on its scope, never on self-service', () => {
+    // `@SelfService()` never admits an API key - it carries no employee link - so the
+    // scope is the only way in, exactly as before the decorator was added.
+    const readOnlyKey = { ...userFor('Employee'), authType: 'apiKey', employeeId: null } as AuthUser;
+    expect(allowed(PayrollController, 'createExpense', readOnlyKey)).toBe(false);
+
+    const writeKey = { ...readOnlyKey, scopes: ['payroll:read', 'payroll:write'] } as AuthUser;
+    expect(allowed(PayrollController, 'createExpense', writeKey)).toBe(true);
+  });
+
+  it('refuses expense creation to a user whose employee link is missing', () => {
+    const unlinked = { ...userFor('Employee'), employeeId: null } as AuthUser;
+    expect(allowed(PayrollController, 'createExpense', unlinked)).toBe(false);
+    // `payroll:read` still opens the me route at the guard; `PayrollService.myExpenses`
+    // is what refuses a caller with no employee link and pins the rest to their own id.
+    expect(allowed(PayrollController, 'myExpenses', unlinked)).toBe(true);
+  });
+
+  it('lets an Employee open their own claim and answer a clarification', () => {
+    const employee = userFor('Employee');
+    expect(allowed(PayrollController, 'getExpense', employee)).toBe(true);
+    expect(allowed(PayrollController, 'respondToExpenseClarification', employee)).toBe(true);
+  });
+
+  it('keeps the clarification reply off machine tokens and unlinked users', () => {
+    // The reply route carries no scope at all, so the employee link is the only way in.
+    const apiKey = { ...userFor('Payroll Admin'), authType: 'apiKey', employeeId: null } as AuthUser;
+    expect(allowed(PayrollController, 'respondToExpenseClarification', apiKey)).toBe(false);
+
+    const unlinked = { ...userFor('Employee'), employeeId: null } as AuthUser;
+    expect(allowed(PayrollController, 'respondToExpenseClarification', unlinked)).toBe(false);
+  });
+
+  it('lets an approver open any claim to review its receipt', () => {
+    for (const roleName of ['Tenant Owner', 'Payroll Admin', 'Finance Admin', 'Manager']) {
+      expect(allowed(PayrollController, 'getExpense', userFor(roleName))).toBe(true);
+    }
+  });
+
+  it('keeps expense creation and listing open to payroll administrators', () => {
+    for (const roleName of ['Tenant Owner', 'Payroll Admin', 'HR Admin']) {
+      expect(allowed(PayrollController, 'createExpense', userFor(roleName))).toBe(true);
+      expect(allowed(PayrollController, 'listExpenses', userFor(roleName))).toBe(true);
+    }
+  });
+
   it('keeps expense approval working for Finance Admin and Manager', () => {
     expect(allowed(PayrollController, 'approveExpense', userFor('Finance Admin'))).toBe(true);
     expect(allowed(PayrollController, 'approveExpense', userFor('Manager'))).toBe(true);

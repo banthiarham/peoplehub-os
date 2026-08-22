@@ -18,7 +18,15 @@ export function DialogContent({
       <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-ink/40 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in" />
       <DialogPrimitive.Content
         className={cn(
-          'fixed left-1/2 top-1/2 z-50 w-full max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-line bg-white p-6 shadow-xl focus:outline-none',
+          // A gutter rather than `w-full`: on a phone - and in the employee portal, which is
+          // always narrow - a full-width panel sits edge to edge with the screen. The height
+          // cap keeps a long form scrollable instead of running off the viewport; call sites
+          // still override any of this through `className`.
+          //
+          // Padding stays a single unprefixed `p-6`: `tailwind-merge` resolves conflicts per
+          // variant, so a responsive `sm:p-*` here would survive a call site's `p-0` and
+          // re-pad the dialogs that are deliberately full-bleed.
+          'fixed left-1/2 top-1/2 z-50 max-h-[85vh] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-line bg-white p-6 shadow-xl focus:outline-none',
           className,
         )}
         {...props}
