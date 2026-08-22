@@ -20,8 +20,22 @@ import { payrollApiError } from './payroll-run-action-button';
 
 const CATEGORIES = ['TRAVEL', 'MEALS', 'INTERNET', 'SUPPLIES', 'OTHER'] as const;
 
-/** "New claim" button + dialog to submit an expense claim. */
-export function PayrollNewExpenseDialog() {
+interface PayrollNewExpenseDialogProps {
+  /** Query key invalidated once a claim is submitted. Defaults to the payroll admin tab. */
+  invalidateKey?: readonly unknown[];
+  /**
+   * How the receipt is supplied. `'key'` keeps the administrative object-key field;
+   * `'upload'` posts the file through `/files/upload` and attaches the key it returns, so
+   * an employee never has to know that object keys exist.
+   */
+  receiptInput?: 'key' | 'upload';
+}
+
+/** "New claim" button + dialog to submit an expense claim for yourself. */
+export function PayrollNewExpenseDialog({
+  invalidateKey = ['payroll'],
+  receiptInput = 'key',
+}: PayrollNewExpenseDialogProps = {}) {
   const queryClient = useQueryClient();
   const toast = useToast();
   const [open, setOpen] = useState(false);
@@ -29,24 +43,41 @@ export function PayrollNewExpenseDialog() {
   const [amount, setAmount] = useState('');
   const [description, setDescription] = useState('');
   const [receiptKey, setReceiptKey] = useState('');
+  const [receiptFile, setReceiptFile] = useState<File | null>(null);
   const [reimbursementMethod, setReimbursementMethod] = useState('PAYROLL');
 
   const create = useMutation({
-    mutationFn: () =>
-      api.post('/payroll/expenses', {
+    mutationFn: async () => {
+      // Upload the receipt to object storage first, then attach the key it returns - the
+      // same two-step the document upload uses.
+      let key = receiptKey.trim() || undefined;
+      if (receiptInput === 'upload') {
+        key = undefined;
+        if (receiptFile) {
+          const data = new FormData();
+          data.append('file', receiptFile);
+          const uploaded = await api
+            .post('/files/upload', data, { headers: { 'Content-Type': 'multipart/form-data' } })
+            .then((r) => r.data as { key: string });
+          key = uploaded.key;
+        }
+      }
+      return api.post('/payroll/expenses', {
         category,
         amount: Number(amount),
         description,
-        receiptKey: receiptKey.trim() || undefined,
+        receiptKey: key,
         reimbursementMethod,
-      }),
+      });
+    },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['payroll'] });
+      queryClient.invalidateQueries({ queryKey: [...invalidateKey] });
       toast('Expense claim submitted', 'success');
       setOpen(false);
       setAmount('');
       setDescription('');
       setReceiptKey('');
+      setReceiptFile(null);
     },
     onError: (err: unknown) => toast(payrollApiError(err), 'error'),
   });
@@ -98,14 +129,26 @@ export function PayrollNewExpenseDialog() {
               onChange={(e) => setDescription(e.target.value)}
             />
           </label>
-          <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
-            Receipt file key
-            <Input
-              placeholder="file_objects key or S3 key"
-              value={receiptKey}
-              onChange={(e) => setReceiptKey(e.target.value)}
-            />
-          </label>
+          {receiptInput === 'upload' ? (
+            <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+              Receipt (optional)
+              <Input
+                type="file"
+                accept="image/*,application/pdf"
+                capture="environment"
+                onChange={(e) => setReceiptFile(e.target.files?.[0] ?? null)}
+              />
+            </label>
+          ) : (
+            <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+              Receipt file key
+              <Input
+                placeholder="file_objects key or S3 key"
+                value={receiptKey}
+                onChange={(e) => setReceiptKey(e.target.value)}
+              />
+            </label>
+          )}
           <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
             Reimbursement
             <Select
