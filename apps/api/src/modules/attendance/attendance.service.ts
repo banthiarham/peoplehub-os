@@ -21,6 +21,7 @@ import {
   SUPPORTED_ATTENDANCE_DATE_FORMATS,
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
+import { NON_WORKING_ATTENDANCE_STATUSES } from '../../common/utils/employment-status';
 import { AttendanceQrService } from './attendance-qr.service';
 import { DeviceBindingService } from './device-binding.service';
 import { haversineMeters } from './geo-distance';
@@ -191,6 +192,34 @@ export class AttendanceService {
       throw new ForbiddenException('No employee profile linked to this user');
     }
     return user.employeeId;
+  }
+
+  /**
+   * Resolves the caller's own employee record for a punch, or refuses.
+   *
+   * Mirrors `LeaveService.requireActiveEmployee`, and for the same reason: `employeeId` is
+   * minted at login, so a token outlives a termination, a deactivation or a move to another
+   * tenant. Trusting the claim alone let someone who no longer works here keep punching
+   * until their token expired. The `tenantId` filter is what stops a stale or forged token
+   * reaching another workspace's employee.
+   *
+   * Returns the caller's own `employeeId` rather than the row's, so the punch keeps
+   * transacting against the identity the rest of the path already resolved.
+   */
+  private async requireActiveEmployee(user: AuthUser): Promise<string> {
+    const employeeId = this.requireEmployee(user);
+    const active = await this.prisma.employee.findFirst({
+      where: {
+        id: employeeId,
+        tenantId: user.tenantId,
+        status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
+      },
+      select: { id: true },
+    });
+    if (!active) {
+      throw new ForbiddenException('This employee profile is not active for attendance');
+    }
+    return employeeId;
   }
 
   private async currentShiftAt(tenantId: string, employeeId: string, at: Date) {
@@ -657,7 +686,7 @@ export class AttendanceService {
    * not demand the employee's own GPS.
    */
   async checkIn(user: AuthUser, dto: CheckInDto, forcedSource?: string, qrRemarks?: string) {
-    const employeeId = this.requireEmployee(user);
+    const employeeId = await this.requireActiveEmployee(user);
     const today = dateOnly(new Date());
     // The location and shift the *day* is evaluated against come from the one
     // resolver: the assignment covering today when it pins a location
@@ -710,7 +739,9 @@ export class AttendanceService {
   }
 
   async qrCheckIn(user: AuthUser, dto: QrPunchDto) {
-    const employeeId = this.requireEmployee(user);
+    // Checked here as well as in the `checkIn` it delegates to, so a terminated employee is
+    // turned away before a QR code is resolved rather than after.
+    const employeeId = await this.requireActiveEmployee(user);
     // The location comes from the verified payload, never from the client.
     const scanned = await this.qr.resolveScannedCode(user.tenantId, dto.qrCode);
     const qrLocationId = scanned.locationId;
@@ -798,9 +829,12 @@ export class AttendanceService {
     });
   }
 
-  /** Issues the challenge a punch from a key-bound device signs. */
+  /**
+   * Issues the challenge a punch from a key-bound device signs. Part of the punch
+   * handshake, so it is gated the same way the punch itself is.
+   */
   async deviceChallenge(user: AuthUser) {
-    return this.devices.issueChallenge(this.requireEmployee(user));
+    return this.devices.issueChallenge(await this.requireActiveEmployee(user));
   }
 
   /**
@@ -883,7 +917,7 @@ export class AttendanceService {
    * the location of the check-in being closed, exactly as before.
    */
   async checkOut(user: AuthUser, dto: CheckOutDto) {
-    const employeeId = this.requireEmployee(user);
+    const employeeId = await this.requireActiveEmployee(user);
     await this.devices.verify(user.tenantId, employeeId, dto);
     const today = dateOnly(new Date());
 
@@ -947,7 +981,7 @@ export class AttendanceService {
     const date = dateOnly(requestedDate);
     const [employees, records, onLeave, holidaySet] = await Promise.all([
       this.prisma.employee.findMany({
-        where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] } },
+        where: { tenantId, status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] } },
         select: {
           id: true,
           firstName: true,
@@ -2588,7 +2622,7 @@ export class AttendanceService {
     const { start, endExclusive, year, monthNumber } = monthParts(dto.month);
     const whereEmployee: Prisma.EmployeeWhereInput = {
       tenantId,
-      status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] },
+      status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
       ...(dto.locationId && { locationId: dto.locationId }),
     };
     const [employees, records, pendingLeave] = await Promise.all([
@@ -2650,7 +2684,7 @@ export class AttendanceService {
     const employees = await this.prisma.employee.findMany({
       where: {
         tenantId,
-        status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] },
+        status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
         ...(dto.locationId && { locationId: dto.locationId }),
       },
       select: { id: true, employeeCode: true, locationId: true },

@@ -257,6 +257,28 @@ export class CreateLifecycleEventDto {
   remarks?: string;
 }
 
+export class TerminateEmployeeDto {
+  @ApiProperty({
+    description:
+      'Date the employment ends. Termination is immediate, so a future date is rejected.',
+  })
+  @IsDateString()
+  effectiveDate!: string;
+
+  @ApiProperty({ description: 'Why the employee is being terminated. Stored on the lifecycle event and the audit log.' })
+  @IsString()
+  @IsNotEmpty()
+  reason!: string;
+
+  @ApiProperty({
+    description:
+      "The employee's full name, typed by the caller to confirm. Compared case-insensitively after collapsing whitespace.",
+  })
+  @IsString()
+  @IsNotEmpty()
+  confirmName!: string;
+}
+
 export class BulkImportEmployeesDto {
   @ApiProperty({ type: [CreateEmployeeDto] })
   @IsArray()

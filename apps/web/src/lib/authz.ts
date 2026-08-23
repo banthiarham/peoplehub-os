@@ -150,6 +150,8 @@ export const CAPABILITY = {
   setup: { roles: [ROLE.tenantOwner, ROLE.hrAdmin, ROLE.payrollAdmin] },
   settings: { roles: [ROLE.tenantOwner, ROLE.hrAdmin, ROLE.payrollAdmin, ROLE.auditor, ROLE.integrationAdmin, ROLE.developer] },
   employees: { roles: [...READ_ALL, ROLE.recruiter, ROLE.manager], scopes: ['employees:read'] },
+  /** Mirrors the @Roles guard on POST /employees/:id/terminate. Deliberately narrow. */
+  terminateEmployee: { roles: [ROLE.tenantOwner, ROLE.hrAdmin] },
   attendance: { roles: [...READ_ALL, ROLE.manager, ROLE.integrationAdmin], scopes: ['attendance:read'] },
   leave: { roles: [...READ_ALL, ROLE.manager], scopes: ['leave:read'] },
   onboarding: { roles: [...READ_ALL, ROLE.recruiter, ROLE.manager] },

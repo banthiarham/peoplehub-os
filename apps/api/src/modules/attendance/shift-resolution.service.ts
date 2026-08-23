@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
+import { NON_WORKING_ATTENDANCE_STATUSES } from '../../common/utils/employment-status';
 
 /**
  * The authoritative resolver for "which shift, and at which location, does this
@@ -242,12 +243,12 @@ export class ShiftResolutionService {
   async activeShiftCounts(tenantId: string, at: Date): Promise<Map<string, number>> {
     const [employees, assignments, fallback] = await Promise.all([
       this.prisma.employee.findMany({
-        where: { tenantId, status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] } },
+        where: { tenantId, status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] } },
         select: { id: true },
       }),
       this.prisma.shiftAssignment.findMany({
         where: {
-          employee: { tenantId, status: { notIn: ['EXITED', 'INACTIVE', 'CANDIDATE', 'PREBOARDING'] } },
+          employee: { tenantId, status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] } },
           effectiveFrom: { lte: at },
           OR: [{ effectiveTo: null }, { effectiveTo: { gte: at } }],
         },
