@@ -96,7 +96,7 @@ export class HelpdeskController {
   @Get('tickets/:id')
   @Scopes('helpdesk:read')
   get(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.helpdesk.get(user.tenantId, id);
+    return this.helpdesk.get(user.tenantId, id, user);
   }
 
   @Post('tickets')

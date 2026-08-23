@@ -105,7 +105,7 @@ export class HelpdeskService {
     return Promise.all(tickets.map((ticket) => this.withSla(user.tenantId, ticket)));
   }
 
-  async get(tenantId: string, id: string) {
+  async get(tenantId: string, id: string, viewer?: AuthUser) {
     const ticket = await this.prisma.ticket.findFirst({
       where: { id, tenantId },
       include: {
@@ -114,7 +114,14 @@ export class HelpdeskService {
       },
     });
     if (!ticket) throw new NotFoundException('Ticket not found');
-    return this.withSla(tenantId, ticket);
+
+    const isEmployeeOnly = !!viewer && viewer.roles.length === 1 && viewer.roles.includes('Employee');
+    if (isEmployeeOnly) {
+      if (ticket.employeeId !== viewer.employeeId) throw new NotFoundException('Ticket not found');
+    }
+    const comments = isEmployeeOnly ? ticket.comments.filter((comment) => !comment.isInternal) : ticket.comments;
+
+    return this.withSla(tenantId, { ...ticket, comments });
   }
 
   async create(
