@@ -94,8 +94,14 @@ export class FilesService implements OnModuleInit {
     return { id: record.id, key, name: record.name, sizeBytes: file.buffer.length };
   }
 
-  /** Short-lived presigned download URL for a tenant-owned file. */
-  async downloadUrl(tenantId: string, key: string): Promise<{ url: string; name: string }> {
+  /**
+   * Short-lived presigned download URL for a tenant-owned file.
+   *
+   * `inline` asks the browser to render the file in a tab instead of saving it, which is
+   * what a receipt preview needs. It only changes the response header on the presigned
+   * URL; who may read the file is unchanged.
+   */
+  async downloadUrl(tenantId: string, key: string, inline = false): Promise<{ url: string; name: string }> {
     const record = await this.prisma.fileObject.findFirst({ where: { key, tenantId } });
     if (!record) throw new NotFoundException('File not found');
     const url = await getSignedUrl(
@@ -103,7 +109,7 @@ export class FilesService implements OnModuleInit {
       new GetObjectCommand({
         Bucket: record.bucket,
         Key: record.key,
-        ResponseContentDisposition: `attachment; filename="${record.name.replace(/"/g, '')}"`,
+        ResponseContentDisposition: `${inline ? 'inline' : 'attachment'}; filename="${record.name.replace(/"/g, '')}"`,
       }),
       { expiresIn: 900 },
     );

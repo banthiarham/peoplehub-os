@@ -1515,6 +1515,7 @@ model ExpenseClaim {
   ocrData                  Json?
   reimbursementMethod      ExpenseReimbursementMethod @default(PAYROLL)
   clarificationNote        String?
+  clarificationResponse    String?
   decidedById              String?
   decidedAt                DateTime?
   status                   ExpenseStatus              @default(DRAFT)

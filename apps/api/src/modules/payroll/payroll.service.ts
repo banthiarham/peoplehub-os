@@ -1,4 +1,10 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { AgeCategory, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
@@ -15,10 +21,62 @@ import {
   OverrideWarningsDto,
   PageDto,
   PreviewSalaryStructureDto,
+  RespondExpenseClarificationDto,
   UpsertSalaryStructureDto,
   WaiveLoanDto,
 } from './dto/payroll.dto';
 import { PayrollCalculatorService } from './payroll-calculator.service';
+
+/**
+ * Employee statuses that may file a claim. Same set leave self-service accepts, so a
+ * person who can apply for leave can also claim an expense and nobody else can.
+ */
+const EXPENSE_SELF_SERVICE_STATUSES = [
+  'ACTIVE',
+  'ON_PROBATION',
+  'CONFIRMED',
+  'ON_NOTICE',
+  'CONTRACTOR',
+  'INTERN',
+] as const;
+
+/**
+ * Roles that may read expense claims other than their own.
+ *
+ * `scopesForPermissions()` discards `ScopeType`, so the Employee grant
+ * `payroll: [VIEW] OWN_DATA` derives the same `payroll:read` scope the tenant-wide roles
+ * hold - which is why the list and export endpoints cannot tell the two apart from the
+ * scope alone and used to return every claim in the tenant to anyone. Until data scope is
+ * resolved server-side, the role name is the honest discriminator: everyone outside this
+ * list sees only their own claims.
+ */
+const EXPENSE_ALL_CLAIMS_ROLES = [
+  'Super Admin',
+  'Tenant Owner',
+  'Payroll Admin',
+  'HR Admin',
+  'Finance Admin',
+  'Manager',
+  'Auditor',
+  'Read-only Leadership User',
+];
+
+/** Payroll scopes that only an administrative grant produces - `payroll:read` is not one. */
+const EXPENSE_ALL_CLAIMS_SCOPES = ['payroll:write', 'payroll:approve', 'payroll:export'];
+
+/**
+ * Expense decisions that may be taken from a given status. A claim that is already
+ * rejected, paid or approved-and-awaiting-payment cannot be re-decided: doing so used to
+ * silently overwrite `decidedById` / `decidedAt` and erase the first decision.
+ */
+const EXPENSE_DECISION_TRANSITIONS: Record<string, string[]> = {
+  DRAFT: [],
+  SUBMITTED: ['APPROVED', 'REJECTED', 'CLARIFICATION_REQUESTED'],
+  CLARIFICATION_REQUESTED: ['APPROVED', 'REJECTED'],
+  APPROVED: ['PAID'],
+  REJECTED: [],
+  PAID: [],
+};
 
 const EXPENSE_POLICY_LIMITS: Record<string, number> = {
   TRAVEL: 50000,
@@ -1880,11 +1938,36 @@ export class PayrollService {
   }
 
   // ── Expenses ──────────────────────────────────────────────────────────────
-  async listExpenses(tenantId: string, q: ListExpensesDto) {
+
+  /**
+   * True when the caller may see claims other than their own.
+   *
+   * Machine tokens are treated as tenant-wide: an API key belongs to the workspace and
+   * never carries an employee link, so narrowing one to "own claims" would return an
+   * empty list to every existing integration rather than protecting anybody.
+   */
+  private canReadAllExpenses(user: AuthUser): boolean {
+    if (user.isSuperAdmin) return true;
+    if (user.authType === 'apiKey') return true;
+    if ((user.roles ?? []).some((role) => EXPENSE_ALL_CLAIMS_ROLES.includes(role))) return true;
+    return (user.scopes ?? []).some((scope) => EXPENSE_ALL_CLAIMS_SCOPES.includes(scope));
+  }
+
+  /**
+   * Tenant filter for the expense read paths, narrowed to the caller's own claims unless
+   * they hold an administrative or approver grant. A caller with neither is pinned to
+   * their own `employeeId`; one with no employee link at all matches nothing.
+   */
+  private expenseVisibilityWhere(user: AuthUser): Prisma.ExpenseClaimWhereInput {
+    if (this.canReadAllExpenses(user)) return { tenantId: user.tenantId };
+    return { tenantId: user.tenantId, employeeId: user.employeeId ?? '__none__' };
+  }
+
+  async listExpenses(user: AuthUser, q: ListExpensesDto) {
     const page = q.page ?? 1;
     const pageSize = q.pageSize ?? 20;
     const where: Prisma.ExpenseClaimWhereInput = {
-      tenantId,
+      ...this.expenseVisibilityWhere(user),
       ...(q.status && { status: q.status }),
     };
     const [data, total] = await Promise.all([
@@ -1902,9 +1985,12 @@ export class PayrollService {
     return { data, meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
   }
 
-  async exportExpensesCsv(tenantId: string, q: ListExpensesDto): Promise<{ csv: string; period: string }> {
+  async exportExpensesCsv(user: AuthUser, q: ListExpensesDto): Promise<{ csv: string; period: string }> {
+    // `@Roles` on the export route is not a restriction - `RolesGuard` combines roles and
+    // scopes with OR - so the same visibility filter as the list is what keeps the CSV
+    // from handing every claim in the tenant to a `payroll:read` holder.
     const where: Prisma.ExpenseClaimWhereInput = {
-      tenantId,
+      ...this.expenseVisibilityWhere(user),
       ...(q.status && { status: q.status }),
     };
     const rows = await this.prisma.expenseClaim.findMany({
@@ -1930,21 +2016,70 @@ export class PayrollService {
     return { csv, period: new Date().toISOString().slice(0, 10) };
   }
 
-  async createExpense(user: AuthUser, dto: CreateExpenseDto) {
+  /**
+   * One claim with its receipt and clarification thread. Visibility is the same predicate
+   * as the list, so a claimant reads their own and an approver reads any in the tenant;
+   * anything else is a 404 rather than a 403, so ids cannot be probed.
+   */
+  async getExpense(user: AuthUser, id: string) {
+    const claim = await this.prisma.expenseClaim.findFirst({
+      where: { id, ...this.expenseVisibilityWhere(user) },
+      include: {
+        employee: { select: { id: true, firstName: true, lastName: true, employeeCode: true } },
+      },
+    });
+    if (!claim) throw new NotFoundException('Expense claim not found');
+    return claim;
+  }
+
+  /** The caller's own claims. `employeeId` comes from the token, never from the request. */
+  async myExpenses(user: AuthUser) {
     if (!user.employeeId) throw new ForbiddenException('No employee profile linked');
-    const category = dto.category.trim().toUpperCase().replace(/\s+/g, '_');
+    return this.prisma.expenseClaim.findMany({
+      where: { tenantId: user.tenantId, employeeId: user.employeeId },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+  }
+
+  /**
+   * Resolves the claimant from the token and refuses a link that is stale, cross-tenant or
+   * no longer employed. The route is reachable by any employee, so the id carried in the
+   * token is not on its own proof that the person may file a claim in this workspace.
+   */
+  private async requireActiveEmployee(user: AuthUser) {
+    if (!user.employeeId) throw new ForbiddenException('No employee profile linked');
+    const employee = await this.prisma.employee.findFirst({
+      where: {
+        id: user.employeeId,
+        tenantId: user.tenantId,
+        status: { in: [...EXPENSE_SELF_SERVICE_STATUSES] },
+      },
+      select: { id: true },
+    });
+    if (!employee) throw new ForbiddenException('No active employee profile linked to this user');
+    return employee;
+  }
+
+  private assertWithinPolicy(category: string, amount: number) {
     const limit = EXPENSE_POLICY_LIMITS[category];
-    if (limit != null && dto.amount > limit) {
+    if (limit != null && amount > limit) {
       throw new BadRequestException(
         `${category.replace(/_/g, ' ')} claims are capped at ${limit}. Split the claim or request a finance exception.`,
       );
     }
+  }
+
+  async createExpense(user: AuthUser, dto: CreateExpenseDto) {
+    const { id: employeeId } = await this.requireActiveEmployee(user);
+    const category = dto.category.trim().toUpperCase().replace(/\s+/g, '_');
+    this.assertWithinPolicy(category, dto.amount);
     const created = await this.prisma.expenseClaim.create({
       data: {
         ...dto,
         category,
         tenantId: user.tenantId,
-        employeeId: user.employeeId,
+        employeeId,
         status: 'SUBMITTED',
         reimbursementMethod: dto.reimbursementMethod ?? 'PAYROLL',
         ocrData: dto.receiptKey ? { status: 'READY_FOR_EXTRACTION', receiptKey: dto.receiptKey } : undefined,
@@ -1952,6 +2087,66 @@ export class PayrollService {
     });
     await this.audit(user.tenantId, user.userId, 'EXPENSE_SUBMITTED', 'ExpenseClaim', created.id, undefined, created);
     return created;
+  }
+
+  /**
+   * The claimant answers an approver's clarification request, optionally correcting the
+   * claim, and puts it back in front of the approver: `CLARIFICATION_REQUESTED` →
+   * `SUBMITTED`. `employeeId` is part of the lookup, so another employee's claim reads as
+   * not found, and any other status is refused - an approved, rejected or paid claim can
+   * never be edited through this route.
+   */
+  async respondToClarification(user: AuthUser, id: string, dto: RespondExpenseClarificationDto) {
+    const { id: employeeId } = await this.requireActiveEmployee(user);
+    const claim = await this.prisma.expenseClaim.findFirst({
+      where: { id, tenantId: user.tenantId, employeeId },
+    });
+    if (!claim) throw new NotFoundException('Expense claim not found');
+    if (claim.status !== 'CLARIFICATION_REQUESTED') {
+      throw new BadRequestException(
+        `Only a claim awaiting clarification can be resubmitted - this one is ${claim.status.toLowerCase().replace(/_/g, ' ')}`,
+      );
+    }
+    if (dto.amount != null) this.assertWithinPolicy(claim.category, dto.amount);
+
+    // The status is part of the `where`, not just of the check above: an approver deciding
+    // between the read and the write would otherwise have their decision reverted - and the
+    // amount rewritten - by a reply that was already in flight. Postgres row locks make the
+    // predicate atomic, so `count` is the answer to "did we still own this transition?".
+    const { count } = await this.prisma.expenseClaim.updateMany({
+      where: { id, tenantId: user.tenantId, employeeId, status: 'CLARIFICATION_REQUESTED' },
+      data: {
+        status: 'SUBMITTED',
+        clarificationResponse: dto.response,
+        ...(dto.amount != null && { amount: dto.amount }),
+        ...(dto.description != null && { description: dto.description }),
+        ...(dto.receiptKey && {
+          receiptKey: dto.receiptKey,
+          ocrData: { status: 'READY_FOR_EXTRACTION', receiptKey: dto.receiptKey },
+        }),
+        // The claim is pending again, so the previous decision is no longer the state of
+        // the record - the audit log keeps who asked for the clarification.
+        decidedById: null,
+        decidedAt: null,
+      },
+    });
+    if (count === 0) {
+      throw new ConflictException(
+        'This claim was decided while you were answering. Reload it to see where it stands.',
+      );
+    }
+    const updated = await this.prisma.expenseClaim.findFirstOrThrow({ where: { id } });
+    await this.audit(
+      user.tenantId,
+      user.userId,
+      'EXPENSE_CLARIFICATION_ANSWERED',
+      'ExpenseClaim',
+      id,
+      claim,
+      updated,
+      dto.response,
+    );
+    return updated;
   }
 
   async decideExpense(
@@ -1963,6 +2158,12 @@ export class PayrollService {
   ) {
     const claim = await this.prisma.expenseClaim.findFirst({ where: { id, tenantId } });
     if (!claim) throw new NotFoundException('Expense claim not found');
+    const allowed = EXPENSE_DECISION_TRANSITIONS[claim.status] ?? [];
+    if (!allowed.includes(status)) {
+      throw new BadRequestException(
+        `An expense claim that is ${claim.status.toLowerCase().replace(/_/g, ' ')} cannot be ${status.toLowerCase().replace(/_/g, ' ')}`,
+      );
+    }
     if (status === 'PAID' && claim.reimbursementMethod === 'PAYROLL' && !claim.reimbursedInPayrollRunId) {
       throw new BadRequestException('Payroll reimbursement claims are marked paid when the linked payroll run is published');
     }
@@ -1971,6 +2172,8 @@ export class PayrollService {
       data: {
         status,
         clarificationNote: dto?.note,
+        // A fresh question invalidates the answer to the previous one.
+        ...(status === 'CLARIFICATION_REQUESTED' && { clarificationResponse: null }),
         decidedById: actorId,
         decidedAt: new Date(),
       },
