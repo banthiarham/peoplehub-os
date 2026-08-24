@@ -2,6 +2,7 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 import {
   ApplyLeaveDto,
   DecideLeaveDto,
@@ -345,11 +346,13 @@ export class LeaveService {
   async decide(user: AuthUser, id: string, decision: 'APPROVED' | 'REJECTED', dto: DecideLeaveDto) {
     const request = await this.prisma.leaveRequest.findFirst({
       where: { id, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true } } },
     });
     if (!request) throw new NotFoundException('Leave request not found');
     if (request.status !== 'PENDING') {
       throw new BadRequestException(`Request already ${request.status.toLowerCase()}`);
     }
+    assertCanDecideApproval(user, request.employeeId, request.employee.managerId);
 
     const updated = await this.prisma.leaveRequest.update({
       where: { id },

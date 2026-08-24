@@ -2,6 +2,7 @@ import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/commo
 import { Prisma, ScopeType, TicketPriority, TicketStatus } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 
 @Injectable()
 export class HelpdeskService {
@@ -210,7 +211,12 @@ export class HelpdeskService {
   }
 
   async escalate(user: AuthUser, id: string, assignedTo?: string, reason?: string) {
-    const ticket = await this.get(user.tenantId, id);
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true } } },
+    });
+    if (!ticket) throw new NotFoundException('Ticket not found');
+    assertCanDecideApproval(user, ticket.employeeId, ticket.employee.managerId);
     const queue = assignedTo ?? (await this.routeFor(user.tenantId, ticket.category, ticket.priority));
     await this.prisma.ticketComment.create({
       data: {

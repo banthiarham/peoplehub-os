@@ -386,28 +386,28 @@ export class PayrollController {
   @Roles(...PAYROLL_ROLES, 'Manager')
   @Scopes('payroll:approve')
   approveExpense(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ExpenseDecisionDto) {
-    return this.payroll.decideExpense(user.tenantId, id, 'APPROVED', user.userId, dto);
+    return this.payroll.decideExpense(user, id, 'APPROVED', dto);
   }
 
   @Patch('expenses/:id/reject')
   @Roles(...PAYROLL_ROLES, 'Manager')
   @Scopes('payroll:approve')
   rejectExpense(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ExpenseDecisionDto) {
-    return this.payroll.decideExpense(user.tenantId, id, 'REJECTED', user.userId, dto);
+    return this.payroll.decideExpense(user, id, 'REJECTED', dto);
   }
 
   @Patch('expenses/:id/clarify')
   @Roles(...PAYROLL_ROLES, 'Manager')
   @Scopes('payroll:approve')
   clarifyExpense(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ExpenseDecisionDto) {
-    return this.payroll.decideExpense(user.tenantId, id, 'CLARIFICATION_REQUESTED', user.userId, dto);
+    return this.payroll.decideExpense(user, id, 'CLARIFICATION_REQUESTED', dto);
   }
 
   @Patch('expenses/:id/reimburse')
   @Roles(...PAYROLL_ROLES)
   @Scopes('payroll:approve')
   reimburseExpense(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ExpenseDecisionDto) {
-    return this.payroll.decideExpense(user.tenantId, id, 'PAID', user.userId, dto);
+    return this.payroll.decideExpense(user, id, 'PAID', dto);
   }
 
   @Get('loans')

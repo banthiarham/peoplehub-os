@@ -1,4 +1,5 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { AuthUser } from '../../common/types/auth-user';
 import { HelpdeskService } from './helpdesk.service';
 
 describe('HelpdeskService', () => {
@@ -236,5 +237,124 @@ describe('HelpdeskService', () => {
 
       await expect(service.stats(user)).resolves.toBeDefined();
     });
+  });
+});
+
+/**
+ * `escalate()` is the closest thing helpdesk has to an approval/decision action, and it
+ * used to have no per-ticket authorization at all - anyone whose role/scope admitted them
+ * to the route could escalate any ticket in the tenant, including their own. These pin the
+ * `assertCanDecideApproval` checks that close that gap, mirroring leave/timesheets/payroll.
+ */
+describe('HelpdeskService: escalate authorization', () => {
+  function user(overrides: Partial<AuthUser> = {}): AuthUser {
+    return {
+      userId: 'user-1',
+      tenantId: 'tenant-1',
+      email: 'x@example.com',
+      name: 'X',
+      isSuperAdmin: false,
+      employeeId: 'emp-caller',
+      roles: ['Manager'],
+      ...overrides,
+    } as AuthUser;
+  }
+
+  function harness(ticket: Record<string, unknown> | null) {
+    const prisma = {
+      ticket: {
+        findFirst: jest.fn().mockResolvedValue(ticket),
+        update: jest.fn().mockImplementation(({ data }: any) => Promise.resolve({ ...ticket, ...data })),
+      },
+      ticketComment: {
+        create: jest.fn().mockResolvedValue({ id: 'comment-1' }),
+      },
+      helpdeskSlaRule: {
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
+    };
+    return { prisma, service: new HelpdeskService(prisma as any) };
+  }
+
+  const ticket = (overrides: Record<string, unknown> = {}) => ({
+    id: 'ticket-1',
+    tenantId: 'tenant-1',
+    employeeId: 'emp-target',
+    category: 'IT',
+    priority: 'MEDIUM',
+    employee: { managerId: 'emp-manager' },
+    ...overrides,
+  });
+
+  it('denies a caller escalating their own ticket', async () => {
+    const { prisma, service } = harness(ticket({ employeeId: 'emp-caller' }));
+
+    await expect(
+      service.escalate(user({ roles: ['HR Admin'] }), 'ticket-1'),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.ticket.update).not.toHaveBeenCalled();
+    expect(prisma.ticketComment.create).not.toHaveBeenCalled();
+  });
+
+  it('denies a Manager escalating a ticket outside their team', async () => {
+    const { prisma, service } = harness(ticket({ employee: { managerId: 'someone-else' } }));
+
+    await expect(
+      service.escalate(user({ employeeId: 'emp-manager', roles: ['Manager'] }), 'ticket-1'),
+    ).rejects.toThrow('You can only approve requests from employees who report to you.');
+    expect(prisma.ticket.update).not.toHaveBeenCalled();
+  });
+
+  it('lets a Manager escalate a direct report ticket', async () => {
+    const { prisma, service } = harness(ticket({ employee: { managerId: 'emp-manager' } }));
+
+    const result = await service.escalate(user({ employeeId: 'emp-manager', roles: ['Manager'] }), 'ticket-1');
+
+    expect(result).toMatchObject({ status: 'ESCALATED' });
+    expect(prisma.ticket.update).toHaveBeenCalled();
+  });
+
+  it.each(['HR Admin', 'Payroll Admin', 'Tenant Owner'])(
+    'lets %s escalate any employee ticket regardless of manager',
+    async (role) => {
+      const { prisma, service } = harness(ticket({ employee: { managerId: 'someone-else' } }));
+
+      const result = await service.escalate(
+        user({ employeeId: 'emp-admin', roles: [role] }),
+        'ticket-1',
+      );
+
+      expect(result).toMatchObject({ status: 'ESCALATED' });
+      expect(prisma.ticket.update).toHaveBeenCalled();
+    },
+  );
+
+  it('lets Super Admin escalate any employee ticket', async () => {
+    const { prisma, service } = harness(ticket({ employee: { managerId: 'someone-else' } }));
+
+    const result = await service.escalate(
+      user({ employeeId: 'emp-super', roles: [], isSuperAdmin: true }),
+      'ticket-1',
+    );
+
+    expect(result).toMatchObject({ status: 'ESCALATED' });
+    expect(prisma.ticket.update).toHaveBeenCalled();
+  });
+
+  it('still denies Super Admin escalating their own ticket', async () => {
+    const { prisma, service } = harness(ticket({ employeeId: 'emp-super' }));
+
+    await expect(
+      service.escalate(user({ employeeId: 'emp-super', roles: [], isSuperAdmin: true }), 'ticket-1'),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.ticket.update).not.toHaveBeenCalled();
+  });
+
+  it('404s when the ticket does not exist', async () => {
+    const { service } = harness(null);
+
+    await expect(service.escalate(user({ roles: ['HR Admin'] }), 'missing')).rejects.toThrow(
+      'Ticket not found',
+    );
   });
 });

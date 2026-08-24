@@ -984,6 +984,16 @@ function employeeUser(overrides: Partial<AuthUser> = {}): AuthUser {
   } as AuthUser;
 }
 
+function approverUser(overrides: Partial<AuthUser> = {}): AuthUser {
+  return employeeUser({
+    userId: 'user-2',
+    employeeId: 'emp-approver',
+    roles: ['Payroll Admin'],
+    scopes: ['payroll:approve'],
+    ...overrides,
+  });
+}
+
 /**
  * Prisma double for the expense paths. `employee.findFirst` honours the real `where`, so
  * the tenant and status predicates of the active-employee check are exercised rather than
@@ -1003,6 +1013,7 @@ function expenseHarness(options: {
     category: 'MEALS',
     amount: 900,
     status: 'SUBMITTED',
+    employee: { managerId: null },
     ...options.claim,
   };
   const prisma = {
@@ -1162,7 +1173,7 @@ describe('expense claims', () => {
     const { prisma, service } = expenseHarness({ claim: { status: from } });
 
     await expect(
-      service.decideExpense('tenant-1', 'claim-1', decision as any, 'user-2'),
+      service.decideExpense(approverUser(), 'claim-1', decision as any),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(prisma.expenseClaim.update).not.toHaveBeenCalled();
   });
@@ -1172,7 +1183,7 @@ describe('expense claims', () => {
     async (decision) => {
       const { prisma, service } = expenseHarness();
 
-      await service.decideExpense('tenant-1', 'claim-1', decision as any, 'user-2');
+      await service.decideExpense(approverUser(), 'claim-1', decision as any);
 
       expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({
         status: decision,
@@ -1190,7 +1201,7 @@ describe('expense claims', () => {
       },
     });
 
-    await service.decideExpense('tenant-1', 'claim-1', 'PAID', 'user-2');
+    await service.decideExpense(approverUser(), 'claim-1', 'PAID');
 
     expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({ status: 'PAID' });
   });
@@ -1201,7 +1212,7 @@ describe('expense claims', () => {
     });
 
     await expect(
-      service.decideExpense('tenant-1', 'claim-1', 'PAID', 'user-2'),
+      service.decideExpense(approverUser(), 'claim-1', 'PAID'),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
@@ -1281,7 +1292,7 @@ describe('expense claim detail and clarification replies', () => {
   it('clears a stale answer when a second clarification is requested', async () => {
     const { prisma, service } = expenseHarness();
 
-    await service.decideExpense('tenant-1', 'claim-1', 'CLARIFICATION_REQUESTED', 'user-2', {
+    await service.decideExpense(approverUser(), 'claim-1', 'CLARIFICATION_REQUESTED', {
       note: 'Still unclear',
     });
 
@@ -1353,8 +1364,63 @@ describe('expense claim detail and clarification replies', () => {
       claim: { status: 'SUBMITTED', clarificationResponse: 'Receipt attached now' },
     });
 
-    await service.decideExpense('tenant-1', 'claim-1', 'APPROVED', 'user-2');
+    await service.decideExpense(approverUser(), 'claim-1', 'APPROVED');
 
     expect(prisma.expenseClaim.update.mock.calls[0][0].data).toMatchObject({ status: 'APPROVED' });
+  });
+});
+
+describe('expense claim approval authorization', () => {
+  it('denies an employee approving their own expense claim', async () => {
+    const { prisma, service } = expenseHarness({ claim: { employeeId: 'emp-1' } });
+
+    await expect(
+      service.decideExpense(employeeUser({ roles: ['Manager'] }), 'claim-1', 'APPROVED'),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.expenseClaim.update).not.toHaveBeenCalled();
+  });
+
+  it('denies a Tenant Owner approving their own expense claim', async () => {
+    const { prisma, service } = expenseHarness({ claim: { employeeId: 'emp-owner' } });
+
+    await expect(
+      service.decideExpense(
+        employeeUser({ employeeId: 'emp-owner', roles: ['Tenant Owner'] }),
+        'claim-1',
+        'APPROVED',
+      ),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.expenseClaim.update).not.toHaveBeenCalled();
+  });
+
+  it('lets a Manager approve a direct report claim', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { employee: { managerId: 'emp-approver' } },
+    });
+
+    await service.decideExpense(approverUser({ roles: ['Manager'] }), 'claim-1', 'APPROVED');
+
+    expect(prisma.expenseClaim.update).toHaveBeenCalled();
+  });
+
+  it('denies a Manager approving a claim outside their team', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { employee: { managerId: 'someone-else' } },
+    });
+
+    await expect(
+      service.decideExpense(approverUser({ roles: ['Manager'] }), 'claim-1', 'APPROVED'),
+    ).rejects.toThrow('You can only approve requests from employees who report to you.');
+    expect(prisma.expenseClaim.update).not.toHaveBeenCalled();
+  });
+
+  it('lets Payroll Admin approve any employee claim', async () => {
+    const { prisma, service } = expenseHarness({
+      claim: { employee: { managerId: 'someone-else' } },
+    });
+
+    await service.decideExpense(approverUser(), 'claim-1', 'APPROVED');
+
+    expect(prisma.expenseClaim.update).toHaveBeenCalled();
   });
 });

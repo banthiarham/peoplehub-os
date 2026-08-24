@@ -14,6 +14,7 @@ import { Input, Select } from '@/components/ui/input';
 import { PageHeader } from '@/components/ui/page-header';
 import { StatCard } from '@/components/ui/stat-card';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
+import { useToast } from '@/components/ui/toaster';
 import { OpsTextarea } from '@/components/forms/ops-textarea';
 
 type Tab = 'Tickets' | 'Knowledge Base' | 'AI Assistant' | 'SLA Rules';
@@ -79,8 +80,15 @@ const tabs: Tab[] = ['Tickets', 'Knowledge Base', 'AI Assistant', 'SLA Rules'];
 const employeeName = (employee?: Option | { firstName?: string; lastName?: string }) =>
   `${employee?.firstName ?? ''} ${employee?.lastName ?? ''}`.trim() || 'Employee';
 
+function apiError(err: unknown): string {
+  const e = err as { response?: { data?: { message?: string | string[] } } };
+  const m = e?.response?.data?.message;
+  return Array.isArray(m) ? m.join(', ') : (m ?? 'Something went wrong');
+}
+
 export default function HelpdeskPage() {
   const qc = useQueryClient();
+  const toast = useToast();
   const [activeTab, setActiveTab] = useState<Tab>('Tickets');
   const [status, setStatus] = useState('');
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null);
@@ -149,6 +157,7 @@ export default function HelpdeskPage() {
   const updateTicket = useMutation({
     mutationFn: () => api.patch(`/helpdesk/tickets/${selectedTicketId}`, { status: detailForm.status, assignedTo: detailForm.assignedTo || undefined }),
     onSuccess: () => invalidate(),
+    onError: (err) => toast(apiError(err), 'error'),
   });
   const addComment = useMutation({
     mutationFn: () =>
@@ -160,6 +169,7 @@ export default function HelpdeskPage() {
       setDetailForm((f) => ({ ...f, note: '' }));
       invalidate();
     },
+    onError: (err) => toast(apiError(err), 'error'),
   });
   const escalate = useMutation({
     mutationFn: () =>
@@ -168,6 +178,7 @@ export default function HelpdeskPage() {
         reason: detailForm.escalateReason || undefined,
       }),
     onSuccess: () => invalidate(),
+    onError: (err) => toast(apiError(err), 'error'),
   });
   const askAi = useMutation({
     mutationFn: () => api.post('/helpdesk/ai-answer', { question: aiQuestion, category: aiCategory || undefined }).then((r) => r.data),

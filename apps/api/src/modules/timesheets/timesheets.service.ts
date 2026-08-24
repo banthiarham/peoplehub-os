@@ -2,6 +2,7 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 import {
   CreateClientDto,
   CreateProjectDto,
@@ -256,9 +257,13 @@ export class TimesheetsService {
     });
   }
 
-  async decide(tenantId: string, id: string, decision: 'APPROVED' | 'REJECTED') {
-    const ts = await this.prisma.timesheet.findFirst({ where: { id, tenantId } });
+  async decide(user: AuthUser, id: string, decision: 'APPROVED' | 'REJECTED') {
+    const ts = await this.prisma.timesheet.findFirst({
+      where: { id, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true } } },
+    });
     if (!ts) throw new NotFoundException('Timesheet not found');
+    assertCanDecideApproval(user, ts.employeeId, ts.employee.managerId);
     return this.prisma.timesheet.update({ where: { id }, data: { status: decision } });
   }
 
