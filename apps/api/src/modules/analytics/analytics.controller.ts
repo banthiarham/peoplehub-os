@@ -5,6 +5,15 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthUser } from '../../common/types/auth-user';
 import { AnalyticsService } from './analytics.service';
 import { redactDashboard } from './dashboard-visibility';
+import { Roles } from '../../common/decorators/roles.decorator';
+
+// Mirrors CAPABILITY.reports in apps/web/src/lib/authz.ts. These routes return raw,
+// unredacted tenant-wide figures (unlike `dashboard`, which already blanks widget
+// groups the caller may not see via `redactDashboard`). Gated on role only, not
+// `@Scopes('reports:read')`: Manager also holds that scope (at DIRECT_REPORTS), and
+// `RolesGuard` matches roles OR scopes, so adding the scope would let Manager bypass
+// this role list even though CAPABILITY.reports deliberately excludes them.
+const REPORTS_ROLES = ['Super Admin', 'Tenant Owner', 'HR Admin', 'Payroll Admin', 'Finance Admin', 'Auditor', 'Read-only Leadership User', 'Recruiter'];
 
 @ApiTags('Analytics')
 @ApiBearerAuth()
@@ -35,6 +44,7 @@ export class AnalyticsController {
   }
 
   @Get('headcount-trend')
+  @Roles(...REPORTS_ROLES)
   headcountTrend(
     @CurrentUser() user: AuthUser,
     @Query('months') months?: string,
@@ -52,6 +62,7 @@ export class AnalyticsController {
   }
 
   @Get('attrition')
+  @Roles(...REPORTS_ROLES)
   attrition(
     @CurrentUser() user: AuthUser,
     @Query('months') months?: string,
@@ -69,6 +80,7 @@ export class AnalyticsController {
   }
 
   @Get('demographics')
+  @Roles(...REPORTS_ROLES)
   demographics(
     @CurrentUser() user: AuthUser,
     @Query('departmentId') departmentId?: string,
@@ -81,6 +93,7 @@ export class AnalyticsController {
   }
 
   @Get('reports/builder')
+  @Roles(...REPORTS_ROLES)
   reportBuilder(
     @CurrentUser() user: AuthUser,
     @Query('report') report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets' = 'employees',
@@ -106,6 +119,7 @@ export class AnalyticsController {
   }
 
   @Get('reports/builder/export')
+  @Roles(...REPORTS_ROLES)
   async reportBuilderExport(
     @CurrentUser() user: AuthUser,
     @Query()

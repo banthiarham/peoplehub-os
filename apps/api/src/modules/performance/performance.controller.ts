@@ -19,9 +19,17 @@ import {
   UpdateReviewCycleDto,
 } from './dto/performance.dto';
 import { PerformanceService } from './performance.service';
+import { Roles } from '../../common/decorators/roles.decorator';
+
+// Mirrors CAPABILITY.performance in apps/web/src/lib/authz.ts. The RBAC catalog has no
+// `performance:*` scope namespace that would exclude Employee (Employee holds
+// `performance:read`/`write` at OWN_DATA, same scope string as everyone else), so this
+// module gates on role alone, matching the frontend's own capability boundary exactly.
+const PERFORMANCE_ROLES = ['Super Admin', 'Tenant Owner', 'HR Admin', 'Manager', 'Auditor', 'Read-only Leadership User'];
 
 @ApiTags('Performance')
 @ApiBearerAuth()
+@Roles(...PERFORMANCE_ROLES)
 @Controller('performance')
 export class PerformanceController {
   constructor(private readonly performance: PerformanceService) {}
