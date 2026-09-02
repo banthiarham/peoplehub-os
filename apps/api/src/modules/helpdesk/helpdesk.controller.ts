@@ -37,7 +37,7 @@ export class HelpdeskController {
   @Get('stats')
   @Scopes('helpdesk:read')
   stats(@CurrentUser() user: AuthUser) {
-    return this.helpdesk.stats(user.tenantId);
+    return this.helpdesk.stats(user);
   }
 
   @Get('sla-rules')
@@ -108,7 +108,7 @@ export class HelpdeskController {
   @Patch('tickets/:id')
   @Scopes('helpdesk:write')
   update(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateTicketDto) {
-    return this.helpdesk.update(user.tenantId, id, dto);
+    return this.helpdesk.update(user, id, dto);
   }
 
   @Post('tickets/:id/comments')

@@ -115,12 +115,12 @@ export class TimesheetsController {
   @Patch(':id/approve')
   @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   approve(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.timesheets.decide(user.tenantId, id, 'APPROVED');
+    return this.timesheets.decide(user, id, 'APPROVED');
   }
 
   @Patch(':id/reject')
   @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   reject(@CurrentUser() user: AuthUser, @Param('id') id: string) {
-    return this.timesheets.decide(user.tenantId, id, 'REJECTED');
+    return this.timesheets.decide(user, id, 'REJECTED');
   }
 }

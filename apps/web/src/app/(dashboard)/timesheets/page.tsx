@@ -99,6 +99,12 @@ function buildWeekEntries(start: string): WeeklyEntry[] {
   });
 }
 
+function apiError(err: unknown): string {
+  const e = err as { response?: { data?: { message?: string | string[] } } };
+  const m = e?.response?.data?.message;
+  return Array.isArray(m) ? m.join(', ') : (m ?? 'Something went wrong');
+}
+
 export default function TimesheetsPage() {
   const queryClient = useQueryClient();
   const toast = useToast();
@@ -204,6 +210,7 @@ export default function TimesheetsPage() {
       toast('Timesheet approved', 'success');
       await queryClient.invalidateQueries({ queryKey: ['timesheets'] });
     },
+    onError: (err) => toast(apiError(err), 'error'),
   });
 
   const rejectTimesheet = useMutation({
@@ -212,6 +219,7 @@ export default function TimesheetsPage() {
       toast('Timesheet rejected', 'success');
       await queryClient.invalidateQueries({ queryKey: ['timesheets'] });
     },
+    onError: (err) => toast(apiError(err), 'error'),
   });
 
   const createClient = useMutation({

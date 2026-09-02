@@ -7,6 +7,18 @@ import { SmtpConfigService } from './smtp-config.service';
 import { EmailTemplateService } from './email-template.service';
 import { SendToEmployeeDto } from './dto/send-to-employee.dto';
 import { SmtpEncryption } from '@prisma/client';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { Scopes } from '../../common/decorators/scopes.decorator';
+import { SelfService } from '../../common/decorators/self-service.decorator';
+
+// The RBAC catalog has no dedicated "email" module — SMTP config, templates and
+// delivery all derive from the `notifications` module's CONFIGURE/EDIT grants, which
+// is the scope namespace `@Scopes` matches on below (see permission-scopes.ts).
+// Role list mirrors CAPABILITY.communications in apps/web/src/lib/authz.ts: Employee,
+// Manager, Recruiter, Payroll Admin, Finance Admin hold `notifications:read` only (or
+// nothing), so the admin/config/send/log routes must gate on the write-tier scope, not
+// just authentication, to keep Employee out.
+const EMAIL_ADMIN_ROLES = ['Super Admin', 'Tenant Owner', 'HR Admin', 'Integration Admin'];
 
 // All routes resolve the tenant (and acting user) from the JWT — a caller can
 // never read or send as another tenant by passing ids in the query/body.
@@ -23,12 +35,16 @@ export class EmailController {
   // ── SMTP Config ────────────────────────────────────────────────────────────
 
   @Get('smtp-config')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:configure')
   @ApiOperation({ summary: 'List SMTP configurations' })
   listSmtp(@CurrentUser() user: AuthUser) {
     return this.smtpConfigService.list(user.tenantId);
   }
 
   @Post('smtp-config')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:configure')
   @ApiOperation({ summary: 'Create SMTP configuration' })
   createSmtp(
     @CurrentUser() user: AuthUser,
@@ -52,6 +68,8 @@ export class EmailController {
   }
 
   @Patch('smtp-config/:id')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:configure')
   @ApiOperation({ summary: 'Update SMTP configuration' })
   updateSmtp(
     @CurrentUser() user: AuthUser,
@@ -74,18 +92,24 @@ export class EmailController {
   }
 
   @Post('smtp-config/:id/test')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:configure')
   @ApiOperation({ summary: 'Send test email to verify SMTP configuration' })
   testSmtp(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.smtpConfigService.sendTest(user.tenantId, id, user.userId);
   }
 
   @Post('smtp-config/:id/activate')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:configure')
   @ApiOperation({ summary: 'Activate this SMTP configuration as the active provider' })
   activateSmtp(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.smtpConfigService.activate(user.tenantId, id);
   }
 
   @Post('smtp-config/:id/deactivate')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:configure')
   @ApiOperation({ summary: 'Deactivate SMTP configuration' })
   deactivateSmtp(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.smtpConfigService.deactivate(user.tenantId, id);
@@ -94,18 +118,24 @@ export class EmailController {
   // ── Email Templates ────────────────────────────────────────────────────────
 
   @Get('templates')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'List email templates' })
   listTemplates(@CurrentUser() user: AuthUser, @Query('module') module?: string) {
     return this.templateService.list(user.tenantId, module);
   }
 
   @Get('templates/:id')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Get email template with version history' })
   getTemplate(@Param('id') id: string) {
     return this.templateService.findById(id);
   }
 
   @Post('templates')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Create email template' })
   createTemplate(
     @CurrentUser() user: AuthUser,
@@ -115,6 +145,8 @@ export class EmailController {
   }
 
   @Patch('templates/:id')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Update email template (archives previous version)' })
   updateTemplate(
     @Param('id') id: string,
@@ -124,6 +156,8 @@ export class EmailController {
   }
 
   @Post('templates/:id/preview')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Preview rendered template with sample variables' })
   previewTemplate(@Param('id') id: string, @Body() body: { vars: Record<string, string> }) {
     return this.templateService.findById(id).then((tpl) => ({
@@ -133,6 +167,8 @@ export class EmailController {
   }
 
   @Post('templates/:id/clone')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Clone a template for tenant customization' })
   cloneTemplate(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.templateService.clone(id, user.tenantId, user.userId);
@@ -141,6 +177,8 @@ export class EmailController {
   // ── Email Sending ──────────────────────────────────────────────────────────
 
   @Post('send')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Queue a raw email' })
   send(
     @CurrentUser() user: AuthUser,
@@ -150,6 +188,8 @@ export class EmailController {
   }
 
   @Post('employee/:employeeId')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: "Send a one-off email to an employee's work address (tenant-scoped)" })
   sendToEmployee(
     @CurrentUser() user: AuthUser,
@@ -160,12 +200,16 @@ export class EmailController {
   }
 
   @Get('employee/:employeeId/history')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Emails sent to this employee (delivery log)' })
   employeeHistory(@CurrentUser() user: AuthUser, @Param('employeeId') employeeId: string) {
     return this.emailService.employeeEmailHistory(user.tenantId, employeeId);
   }
 
   @Post('send-template')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Queue a template-based transactional email' })
   sendTemplate(
     @CurrentUser() user: AuthUser,
@@ -189,6 +233,8 @@ export class EmailController {
   }
 
   @Post('send-bulk')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Queue bulk emails (one queue entry per recipient)' })
   async sendBulk(
     @CurrentUser() user: AuthUser,
@@ -211,12 +257,16 @@ export class EmailController {
   }
 
   @Post('queue/:id/retry')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Manually retry a failed email' })
   retryQueue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.emailService.retry(user.tenantId, id).then(() => ({ retried: true }));
   }
 
   @Post('queue/:id/cancel')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Cancel a queued email' })
   cancelQueue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.emailService.cancel(user.tenantId, id).then(() => ({ cancelled: true }));
@@ -225,6 +275,8 @@ export class EmailController {
   // ── Email Logs ─────────────────────────────────────────────────────────────
 
   @Get('logs')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'List email delivery logs with filters' })
   getLogs(
     @CurrentUser() user: AuthUser,
@@ -246,6 +298,8 @@ export class EmailController {
   }
 
   @Get('logs/:id')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Get single delivery log with error details' })
   getLog(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.emailService['prisma'].emailDeliveryLog.findFirst({
@@ -254,6 +308,8 @@ export class EmailController {
   }
 
   @Post('logs/:id/retry')
+  @Roles(...EMAIL_ADMIN_ROLES)
+  @Scopes('notifications:write')
   @ApiOperation({ summary: 'Retry from delivery log entry' })
   async retryLog(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     const log = await this.emailService['prisma'].emailDeliveryLog.findFirst({
@@ -266,12 +322,14 @@ export class EmailController {
   // ── Email Preferences ──────────────────────────────────────────────────────
 
   @Get('preferences')
+  @SelfService()
   @ApiOperation({ summary: 'Get own email preferences' })
   getPreferences(@CurrentUser() user: AuthUser) {
     return this.emailService.getPreferences(user.tenantId, user.employeeId ?? '');
   }
 
   @Patch('preferences')
+  @SelfService()
   @ApiOperation({ summary: 'Update own email preferences' })
   updatePreferences(
     @CurrentUser() user: AuthUser,

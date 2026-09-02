@@ -4121,17 +4121,22 @@ describe('manual comp-off grants', () => {
     ).rejects.toThrow('Employee not found');
   });
 
+  const hrAdminUser = {
+    userId: 'user-hr', tenantId: 'tenant-1', email: 'hr@x.com', name: 'HR', isSuperAdmin: false,
+    employeeId: 'emp-hr', roles: ['HR Admin'],
+  } as AuthUser;
+
   it('only moves a grant that is still available', async () => {
     const { prisma, service } = compOffHarness({
       compOffGrant: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
+        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED', employeeId: 'emp-1', employee: { managerId: 'mgr-1' } }),
         create: jest.fn(),
         update: jest.fn(),
       },
     });
 
     await expect(
-      service.decideCompOff('tenant-1', 'grant-1', { status: 'CANCELLED' as never }),
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('already used');
     expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
   });
@@ -4139,18 +4144,156 @@ describe('manual comp-off grants', () => {
   it('marks an available grant used', async () => {
     const { prisma, service } = compOffHarness({
       compOffGrant: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'AVAILABLE' }),
+        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-1', employee: { managerId: 'mgr-1' } }),
         create: jest.fn(),
         update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
       },
     });
 
-    await service.decideCompOff('tenant-1', 'grant-1', { status: 'USED' as never });
+    await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never });
 
     expect(prisma.compOffGrant.update).toHaveBeenCalledWith({
       where: { id: 'grant-1' },
       data: { status: 'USED' },
     });
+  });
+});
+
+describe('decideCompOff authorization', () => {
+  function compOffHarness(overrides: Record<string, any> = {}) {
+    const prisma = {
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+      },
+      ...overrides,
+    };
+    return { prisma, service: newAttendanceService(prisma) };
+  }
+
+  function manager(overrides: Partial<AuthUser> = {}): AuthUser {
+    return {
+      userId: 'user-mgr', tenantId: 'tenant-1', email: 'm@x.com', name: 'Mgr', isSuperAdmin: false,
+      employeeId: 'emp-mgr', roles: ['Manager'], ...overrides,
+    } as AuthUser;
+  }
+
+  it('denies a Manager approving their own comp-off', async () => {
+    const { prisma, service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-mgr', employee: { managerId: 'emp-grandmgr' },
+        }),
+        update: jest.fn(),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(manager(), 'grant-1', { status: 'CANCELLED' as never }),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+  });
+
+  it('denies a Manager deciding a comp-off outside their team', async () => {
+    const { prisma, service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-target', employee: { managerId: 'someone-else' },
+        }),
+        update: jest.fn(),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(manager(), 'grant-1', { status: 'CANCELLED' as never }),
+    ).rejects.toThrow('You can only approve requests from employees who report to you.');
+    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+  });
+
+  it('lets a Manager decide a direct report comp-off', async () => {
+    const { prisma, service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-target', employee: { managerId: 'emp-mgr' },
+        }),
+        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+      },
+    });
+
+    await service.decideCompOff(manager(), 'grant-1', { status: 'USED' as never });
+
+    expect(prisma.compOffGrant.update).toHaveBeenCalled();
+  });
+});
+
+describe('decideShiftSwap authorization', () => {
+  function shiftSwapHarness(overrides: Record<string, any> = {}) {
+    const prisma = {
+      shiftSwapRequest: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+      },
+      shiftAssignment: { create: jest.fn() },
+      ...overrides,
+    };
+    return { prisma, service: newAttendanceService(prisma) };
+  }
+
+  function manager(overrides: Partial<AuthUser> = {}): AuthUser {
+    return {
+      userId: 'user-mgr', tenantId: 'tenant-1', email: 'm@x.com', name: 'Mgr', isSuperAdmin: false,
+      employeeId: 'emp-mgr', roles: ['Manager'], ...overrides,
+    } as AuthUser;
+  }
+
+  const request = (overrides: Record<string, unknown> = {}) => ({
+    id: 'swap-1',
+    tenantId: 'tenant-1',
+    requesterEmployeeId: 'emp-target',
+    status: 'REQUESTED',
+    requester: { managerId: 'emp-mgr' },
+    ...overrides,
+  });
+
+  it('denies a Manager approving their own shift swap', async () => {
+    const { prisma, service } = shiftSwapHarness({
+      shiftSwapRequest: {
+        findFirst: jest.fn().mockResolvedValue(request({ requesterEmployeeId: 'emp-mgr' })),
+        update: jest.fn(),
+      },
+    });
+
+    await expect(
+      service.decideShiftSwap(manager(), 'swap-1', { status: 'APPROVED' as never }),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.shiftSwapRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('denies a Manager deciding a shift swap outside their team', async () => {
+    const { prisma, service } = shiftSwapHarness({
+      shiftSwapRequest: {
+        findFirst: jest.fn().mockResolvedValue(request({ requester: { managerId: 'someone-else' } })),
+        update: jest.fn(),
+      },
+    });
+
+    await expect(
+      service.decideShiftSwap(manager(), 'swap-1', { status: 'REJECTED' as never }),
+    ).rejects.toThrow('You can only approve requests from employees who report to you.');
+    expect(prisma.shiftSwapRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('lets a Manager decide a direct report shift swap', async () => {
+    const { prisma, service } = shiftSwapHarness({
+      shiftSwapRequest: {
+        findFirst: jest.fn().mockResolvedValue(request()),
+        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+      },
+    });
+
+    await service.decideShiftSwap(manager(), 'swap-1', { status: 'REJECTED' as never });
+
+    expect(prisma.shiftSwapRequest.update).toHaveBeenCalled();
   });
 });
 

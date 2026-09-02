@@ -472,3 +472,106 @@ describe('LeaveService: self-service ownership', () => {
     });
   });
 });
+
+/**
+ * `decide()` is reachable directly by anyone the `@Roles`/`@Scopes` guard admits to the
+ * route - self-approval and manager-scope have to be enforced here, not just hidden by the
+ * UI, since nothing about the guard sees which employee the request belongs to.
+ */
+describe('LeaveService: approval authorization', () => {
+  function prismaForDecide(request: Record<string, unknown>) {
+    return {
+      leaveRequest: {
+        findFirst: jest.fn().mockResolvedValue(request),
+        update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...request, ...data })),
+      },
+      leaveBalance: { upsert: jest.fn() },
+    };
+  }
+
+  const pendingRequest = (overrides: Record<string, unknown> = {}) => ({
+    id: 'req-1',
+    tenantId: 'tenant-1',
+    employeeId: 'emp-target',
+    leaveTypeId: 'lt-1',
+    fromDate: new Date('2026-07-27T00:00:00.000Z'),
+    days: 1,
+    status: 'PENDING',
+    employee: { managerId: 'emp-manager' },
+    ...overrides,
+  });
+
+  it('denies an employee approving their own leave request', async () => {
+    const prisma = prismaForDecide(pendingRequest({ employeeId: 'emp-1' }));
+    const service = newLeaveService(prisma);
+    const self = { tenantId: 'tenant-1', employeeId: 'emp-1', userId: 'user-1', roles: ['Manager'], isSuperAdmin: false };
+
+    await expect(
+      service.decide(self as any, 'req-1', 'APPROVED', {} as any),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.leaveRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('denies HR Admin approving their own leave request', async () => {
+    const prisma = prismaForDecide(pendingRequest({ employeeId: 'emp-hr' }));
+    const service = newLeaveService(prisma);
+    const self = { tenantId: 'tenant-1', employeeId: 'emp-hr', userId: 'user-hr', roles: ['HR Admin'], isSuperAdmin: false };
+
+    await expect(
+      service.decide(self as any, 'req-1', 'APPROVED', {} as any),
+    ).rejects.toThrow('You cannot approve your own request.');
+    expect(prisma.leaveRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('denies Tenant Owner approving their own leave request', async () => {
+    const prisma = prismaForDecide(pendingRequest({ employeeId: 'emp-owner' }));
+    const service = newLeaveService(prisma);
+    const self = { tenantId: 'tenant-1', employeeId: 'emp-owner', userId: 'user-owner', roles: ['Tenant Owner'], isSuperAdmin: false };
+
+    await expect(
+      service.decide(self as any, 'req-1', 'APPROVED', {} as any),
+    ).rejects.toThrow('You cannot approve your own request.');
+  });
+
+  it('lets a Manager approve a direct report', async () => {
+    const prisma = prismaForDecide(pendingRequest({ employee: { managerId: 'emp-manager' } }));
+    const service = newLeaveService(prisma);
+    const manager = { tenantId: 'tenant-1', employeeId: 'emp-manager', userId: 'user-mgr', roles: ['Manager'], isSuperAdmin: false };
+
+    await expect(service.decide(manager as any, 'req-1', 'APPROVED', {} as any)).resolves.toMatchObject({
+      status: 'APPROVED',
+    });
+    expect(prisma.leaveRequest.update).toHaveBeenCalled();
+  });
+
+  it('denies a Manager approving an employee outside their team', async () => {
+    const prisma = prismaForDecide(pendingRequest({ employee: { managerId: 'someone-else' } }));
+    const service = newLeaveService(prisma);
+    const manager = { tenantId: 'tenant-1', employeeId: 'emp-manager', userId: 'user-mgr', roles: ['Manager'], isSuperAdmin: false };
+
+    await expect(
+      service.decide(manager as any, 'req-1', 'APPROVED', {} as any),
+    ).rejects.toThrow('You can only approve requests from employees who report to you.');
+    expect(prisma.leaveRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('denies a role with no approval authority', async () => {
+    const prisma = prismaForDecide(pendingRequest());
+    const service = newLeaveService(prisma);
+    const bystander = { tenantId: 'tenant-1', employeeId: 'emp-other', userId: 'user-other', roles: ['Employee'], isSuperAdmin: false };
+
+    await expect(
+      service.decide(bystander as any, 'req-1', 'APPROVED', {} as any),
+    ).rejects.toThrow('You are not authorized to approve this request.');
+  });
+
+  it('lets HR Admin approve any employee leave request', async () => {
+    const prisma = prismaForDecide(pendingRequest({ employee: { managerId: 'someone-else' } }));
+    const service = newLeaveService(prisma);
+    const hrAdmin = { tenantId: 'tenant-1', employeeId: 'emp-hr', userId: 'user-hr', roles: ['HR Admin'], isSuperAdmin: false };
+
+    await expect(service.decide(hrAdmin as any, 'req-1', 'APPROVED', {} as any)).resolves.toMatchObject({
+      status: 'APPROVED',
+    });
+  });
+});

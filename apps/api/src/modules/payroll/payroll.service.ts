@@ -8,6 +8,7 @@ import {
 import { AgeCategory, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 import { toCsv } from '../../common/utils/csv';
 import { TdsCalculationResult, TdsEngineService } from '../tax/tds-engine.service';
 import {
@@ -2150,13 +2151,15 @@ export class PayrollService {
   }
 
   async decideExpense(
-    tenantId: string,
+    user: AuthUser,
     id: string,
     status: 'APPROVED' | 'REJECTED' | 'PAID' | 'CLARIFICATION_REQUESTED',
-    actorId?: string,
     dto?: ExpenseDecisionDto,
   ) {
-    const claim = await this.prisma.expenseClaim.findFirst({ where: { id, tenantId } });
+    const claim = await this.prisma.expenseClaim.findFirst({
+      where: { id, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true } } },
+    });
     if (!claim) throw new NotFoundException('Expense claim not found');
     const allowed = EXPENSE_DECISION_TRANSITIONS[claim.status] ?? [];
     if (!allowed.includes(status)) {
@@ -2167,6 +2170,8 @@ export class PayrollService {
     if (status === 'PAID' && claim.reimbursementMethod === 'PAYROLL' && !claim.reimbursedInPayrollRunId) {
       throw new BadRequestException('Payroll reimbursement claims are marked paid when the linked payroll run is published');
     }
+    assertCanDecideApproval(user, claim.employeeId, claim.employee.managerId);
+    const actorId = user.userId;
     const updated = await this.prisma.expenseClaim.update({
       where: { id },
       data: {
@@ -2178,7 +2183,7 @@ export class PayrollService {
         decidedAt: new Date(),
       },
     });
-    await this.audit(tenantId, actorId, `EXPENSE_${status}`, 'ExpenseClaim', id, claim, updated, dto?.note);
+    await this.audit(user.tenantId, actorId, `EXPENSE_${status}`, 'ExpenseClaim', id, claim, updated, dto?.note);
     return updated;
   }
 

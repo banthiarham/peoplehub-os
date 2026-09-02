@@ -198,3 +198,80 @@ describe('WorkflowsService', () => {
     });
   });
 });
+
+/**
+ * `decide()` is the mutation endpoint, unlike `listApprovals` it never filtered by
+ * `approverId` - anyone whose role/scope admitted them to the route could decide any
+ * pending request in the tenant, including their own. These pin the two checks that close
+ * that gap.
+ */
+describe('WorkflowsService: decide authorization', () => {
+  const pendingRequest = (overrides: Record<string, unknown> = {}) => ({
+    id: 'approval-1',
+    tenantId: 'tenant-1',
+    requesterId: 'emp-requester',
+    approverId: 'emp-approver',
+    module: 'expenses',
+    objectType: 'ExpenseClaim',
+    objectId: 'exp-1',
+    currentStep: 1,
+    status: 'PENDING',
+    comments: [],
+    workflow: null,
+    ...overrides,
+  });
+
+  function prismaForDecide(request: Record<string, unknown>) {
+    const tx = {
+      approvalRequestHistory: { create: jest.fn() },
+      approvalRequest: {
+        update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...request, ...data })),
+      },
+    };
+    return {
+      approvalRequest: { findFirst: jest.fn().mockResolvedValue(request) },
+      $transaction: jest.fn((fn: any) => fn(tx)),
+    };
+  }
+
+  it('denies the requester approving their own workflow request', async () => {
+    const prisma = prismaForDecide(pendingRequest({ requesterId: 'emp-1', approverId: 'emp-1' }));
+    const service = new WorkflowsService(prisma as any);
+    const self = { tenantId: 'tenant-1', employeeId: 'emp-1', userId: 'user-1', roles: ['Manager'], isSuperAdmin: false };
+
+    await expect(service.decide(self as any, 'approval-1', 'APPROVED')).rejects.toThrow(
+      'You cannot approve your own request.',
+    );
+  });
+
+  it('denies a caller who is not the resolved approver', async () => {
+    const prisma = prismaForDecide(pendingRequest());
+    const service = new WorkflowsService(prisma as any);
+    const bystander = { tenantId: 'tenant-1', employeeId: 'emp-someone-else', userId: 'user-2', roles: ['Manager'], isSuperAdmin: false };
+
+    await expect(service.decide(bystander as any, 'approval-1', 'APPROVED')).rejects.toThrow(
+      'You are not authorized to approve this request.',
+    );
+  });
+
+  it('lets the resolved approver decide the request', async () => {
+    const request = pendingRequest();
+    const prisma = prismaForDecide(request);
+    const service = new WorkflowsService(prisma as any);
+    const resolvedApprover = { tenantId: 'tenant-1', employeeId: 'emp-approver', userId: 'user-3', roles: ['Manager'], isSuperAdmin: false };
+
+    await expect(service.decide(resolvedApprover as any, 'approval-1', 'REJECTED')).resolves.toMatchObject({
+      status: 'REJECTED',
+    });
+  });
+
+  it('lets HR Admin decide a request even when not the resolved approver', async () => {
+    const prisma = prismaForDecide(pendingRequest());
+    const service = new WorkflowsService(prisma as any);
+    const hrAdmin = { tenantId: 'tenant-1', employeeId: 'emp-hr', userId: 'user-4', roles: ['HR Admin'], isSuperAdmin: false };
+
+    await expect(service.decide(hrAdmin as any, 'approval-1', 'REJECTED')).resolves.toMatchObject({
+      status: 'REJECTED',
+    });
+  });
+});

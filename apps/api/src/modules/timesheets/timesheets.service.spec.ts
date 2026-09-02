@@ -1,3 +1,4 @@
+import { AuthUser } from '../../common/types/auth-user';
 import { TimesheetsService } from './timesheets.service';
 
 describe('TimesheetsService', () => {
@@ -130,5 +131,74 @@ describe('TimesheetsService', () => {
         ],
       }),
     );
+  });
+});
+
+describe('TimesheetsService: decide authorization', () => {
+  function user(overrides: Partial<AuthUser> = {}): AuthUser {
+    return {
+      userId: 'user-1',
+      tenantId: 'tenant-1',
+      email: 'x@example.com',
+      name: 'X',
+      isSuperAdmin: false,
+      employeeId: 'emp-mgr',
+      roles: ['Manager'],
+      ...overrides,
+    } as AuthUser;
+  }
+
+  function prismaFor(ts: Record<string, unknown>) {
+    return {
+      timesheet: {
+        findFirst: jest.fn().mockResolvedValue(ts),
+        update: jest.fn().mockImplementation(({ data }: any) => Promise.resolve({ ...ts, ...data })),
+      },
+    };
+  }
+
+  const timesheet = (overrides: Record<string, unknown> = {}) => ({
+    id: 'ts-1',
+    tenantId: 'tenant-1',
+    employeeId: 'emp-target',
+    status: 'SUBMITTED',
+    employee: { managerId: 'emp-mgr' },
+    ...overrides,
+  });
+
+  it('denies a Manager approving their own timesheet', async () => {
+    const prisma = prismaFor(timesheet({ employeeId: 'emp-mgr', employee: { managerId: 'emp-grandmgr' } }));
+    const service = new TimesheetsService(prisma as any);
+
+    await expect(service.decide(user(), 'ts-1', 'APPROVED')).rejects.toThrow(
+      'You cannot approve your own request.',
+    );
+    expect(prisma.timesheet.update).not.toHaveBeenCalled();
+  });
+
+  it('lets a Manager approve a direct report timesheet', async () => {
+    const prisma = prismaFor(timesheet());
+    const service = new TimesheetsService(prisma as any);
+
+    await expect(service.decide(user(), 'ts-1', 'APPROVED')).resolves.toMatchObject({ status: 'APPROVED' });
+  });
+
+  it('denies a Manager approving a timesheet outside their team', async () => {
+    const prisma = prismaFor(timesheet({ employee: { managerId: 'someone-else' } }));
+    const service = new TimesheetsService(prisma as any);
+
+    await expect(service.decide(user(), 'ts-1', 'APPROVED')).rejects.toThrow(
+      'You can only approve requests from employees who report to you.',
+    );
+    expect(prisma.timesheet.update).not.toHaveBeenCalled();
+  });
+
+  it('lets HR Admin approve any timesheet', async () => {
+    const prisma = prismaFor(timesheet({ employee: { managerId: 'someone-else' } }));
+    const service = new TimesheetsService(prisma as any);
+
+    await expect(
+      service.decide(user({ employeeId: 'emp-hr', roles: ['HR Admin'] }), 'ts-1', 'APPROVED'),
+    ).resolves.toMatchObject({ status: 'APPROVED' });
   });
 });

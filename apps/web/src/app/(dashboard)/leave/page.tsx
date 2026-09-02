@@ -14,6 +14,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { Input, Select } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
+import { useToast } from '@/components/ui/toaster';
 
 interface LeaveRow {
   id: string;
@@ -104,8 +105,15 @@ function LeaveMetric({
   );
 }
 
+function apiError(err: unknown): string {
+  const e = err as { response?: { data?: { message?: string | string[] } } };
+  const m = e?.response?.data?.message;
+  return Array.isArray(m) ? m.join(', ') : (m ?? 'Something went wrong');
+}
+
 export default function LeavePage() {
   const queryClient = useQueryClient();
+  const toast = useToast();
   const [status, setStatus] = useState('PENDING');
   const [tab, setTab] = useState<'requests' | 'types' | 'policies' | 'calendar'>('requests');
 
@@ -123,6 +131,7 @@ export default function LeavePage() {
     mutationFn: ({ id, action }: { id: string; action: 'approve' | 'reject' }) =>
       api.patch(`/leave/requests/${id}/${action}`, {}),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ['leave'] }),
+    onError: (err) => toast(apiError(err), 'error'),
   });
 
   return (

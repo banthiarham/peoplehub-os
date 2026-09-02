@@ -1,11 +1,44 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, TicketPriority, TicketStatus } from '@prisma/client';
+import { Prisma, ScopeType, TicketPriority, TicketStatus } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 
 @Injectable()
 export class HelpdeskService {
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Whether `user` may only see/act on their own tickets, decided from the ACTUAL
+   * granted scope of their roles' `helpdesk` VIEW permission rather than role-name
+   * string matching.
+   *
+   * The previous check (`user.roles.length === 1 && user.roles.includes('Employee')`)
+   * broke for two real cases: a user holding `Employee` plus any second role (length
+   * !== 1, narrowing silently skipped even though neither role granted anything
+   * broader), and a tenant's custom role that grants `helpdesk` at OWN_DATA under a
+   * name other than `Employee` (never matched, so it got unrestricted tenant-wide
+   * access). Looking up the real `scopeType` behind the caller's roles is immune to
+   * both: it reflects what was actually granted, not what the role happens to be
+   * called.
+   *
+   * Super Admin and machine (API key) callers are never narrowed here — `RolesGuard`
+   * already decides their access before this runs.
+   */
+  private async isOwnTicketsOnly(tenantId: string, user: AuthUser): Promise<boolean> {
+    if (user.isSuperAdmin || !user.employeeId) return false;
+    if (!user.roles.length) return true;
+    const grants = await this.prisma.permission.findMany({
+      where: {
+        module: 'helpdesk',
+        permissionType: 'VIEW',
+        role: { tenantId, name: { in: user.roles } },
+      },
+      select: { scopeType: true },
+    });
+    if (!grants.length) return true;
+    return !grants.some((g) => g.scopeType !== ScopeType.OWN_DATA);
+  }
 
   private slaHours(priority: TicketPriority): number {
     return { URGENT: 4, HIGH: 8, MEDIUM: 24, LOW: 72 }[priority] ?? 24;
@@ -65,11 +98,10 @@ export class HelpdeskService {
   ) {
     const page = q.page ?? 1;
     const pageSize = q.pageSize ?? 20;
+    const ownOnly = await this.isOwnTicketsOnly(tenantId, user);
     const where: Prisma.TicketWhereInput = {
       tenantId,
-      ...(user.roles.length === 1 && user.roles.includes('Employee') && user.employeeId
-        ? { employeeId: user.employeeId }
-        : {}),
+      ...(ownOnly && user.employeeId ? { employeeId: user.employeeId } : {}),
       ...(q.status && { status: q.status }),
       ...(q.priority && { priority: q.priority }),
       ...(q.category && { category: q.category }),
@@ -115,11 +147,11 @@ export class HelpdeskService {
     });
     if (!ticket) throw new NotFoundException('Ticket not found');
 
-    const isEmployeeOnly = !!viewer && viewer.roles.length === 1 && viewer.roles.includes('Employee');
-    if (isEmployeeOnly) {
-      if (ticket.employeeId !== viewer.employeeId) throw new NotFoundException('Ticket not found');
+    const isOwnOnly = !!viewer && (await this.isOwnTicketsOnly(tenantId, viewer));
+    if (isOwnOnly && ticket.employeeId !== viewer!.employeeId) {
+      throw new NotFoundException('Ticket not found');
     }
-    const comments = isEmployeeOnly ? ticket.comments.filter((comment) => !comment.isInternal) : ticket.comments;
+    const comments = isOwnOnly ? ticket.comments.filter((comment) => !comment.isInternal) : ticket.comments;
 
     return this.withSla(tenantId, { ...ticket, comments });
   }
@@ -146,14 +178,19 @@ export class HelpdeskService {
   }
 
   async update(
-    tenantId: string,
+    user: AuthUser,
     id: string,
     data: { status?: TicketStatus; priority?: TicketPriority; assignedTo?: string },
   ) {
-    await this.get(tenantId, id);
+    // `get()` 404s an own-only caller off a ticket that isn't theirs, which is what
+    // keeps this route to "your own tickets" for them. Previously this called
+    // `get(tenantId, id)` with no viewer at all, so ANY caller holding `helpdesk:write`
+    // (which includes Employee, at OWN_DATA) could update status/priority/assignedTo on
+    // any ticket in the tenant.
+    const ticket = await this.get(user.tenantId, id, user);
     const priority = data.priority;
     return this.prisma.ticket.update({
-      where: { id },
+      where: { id: ticket.id },
       data: {
         ...data,
         ...(priority && { slaBreached: false }),
@@ -164,14 +201,22 @@ export class HelpdeskService {
   }
 
   async comment(user: AuthUser, id: string, message: string, isInternal = false) {
-    await this.get(user.tenantId, id);
+    const ticket = await this.get(user.tenantId, id, user);
+    // An own-only caller may comment on their own ticket (it already 404'd otherwise)
+    // but never as an internal note — that visibility is for agents/admins.
+    const internal = isInternal && !(await this.isOwnTicketsOnly(user.tenantId, user));
     return this.prisma.ticketComment.create({
-      data: { ticketId: id, authorId: user.userId, message, isInternal },
+      data: { ticketId: ticket.id, authorId: user.userId, message, isInternal: internal },
     });
   }
 
   async escalate(user: AuthUser, id: string, assignedTo?: string, reason?: string) {
-    const ticket = await this.get(user.tenantId, id);
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true } } },
+    });
+    if (!ticket) throw new NotFoundException('Ticket not found');
+    assertCanDecideApproval(user, ticket.employeeId, ticket.employee.managerId);
     const queue = assignedTo ?? (await this.routeFor(user.tenantId, ticket.category, ticket.priority));
     await this.prisma.ticketComment.create({
       data: {
@@ -323,7 +368,15 @@ export class HelpdeskService {
     return { answer, citations };
   }
 
-  async stats(tenantId: string) {
+  async stats(user: AuthUser) {
+    const tenantId = user.tenantId;
+    // `@Scopes('helpdesk:read')` on the route admits Employee (their OWN_DATA grant
+    // matches the same scope string), but this payload is tenant-wide aggregate data —
+    // never an individual's own tickets — so an own-only caller is refused outright
+    // rather than narrowed.
+    if (await this.isOwnTicketsOnly(tenantId, user)) {
+      throw new ForbiddenException('You are not authorized to view tenant-wide helpdesk stats');
+    }
     const now = new Date();
     const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000);
     const [byStatus, byCategory, resolvedThisWeek, resolved, openTickets] = await Promise.all([

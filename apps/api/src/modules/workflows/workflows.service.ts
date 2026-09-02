@@ -320,6 +320,15 @@ export class WorkflowsService {
     if (!['PENDING', 'ESCALATED'].includes(request.status)) {
       throw new BadRequestException(`Request already ${request.status.toLowerCase()}`);
     }
+    if (request.requesterId === user.employeeId) {
+      throw new ForbiddenException('You cannot approve your own request.');
+    }
+    // Mirrors the admin bypass in `listApprovals`: everyone else must be the approver the
+    // workflow's own hierarchy resolved this request to (`request.approverId`).
+    const isAdminOverride = user.isSuperAdmin || user.roles.some((r) => ['HR Admin', 'Payroll Admin'].includes(r));
+    if (!isAdminOverride && request.approverId !== user.employeeId) {
+      throw new ForbiddenException('You are not authorized to approve this request.');
+    }
 
     return this.prisma.$transaction(async (tx) => {
       if (decision === 'REJECTED') {

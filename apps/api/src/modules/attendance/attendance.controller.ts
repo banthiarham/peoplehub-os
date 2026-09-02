@@ -399,7 +399,7 @@ export class AttendanceController {
   @Scopes('attendance:write')
   @ApiOperation({ summary: 'Mark a comp-off used, cancelled or expired' })
   decideCompOff(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DecideCompOffDto) {
-    return this.attendance.decideCompOff(user.tenantId, id, dto);
+    return this.attendance.decideCompOff(user, id, dto);
   }
 
   @Get('shift-swaps')
@@ -418,7 +418,7 @@ export class AttendanceController {
   @Roles('Super Admin', 'HR Admin', 'Manager')
   @Scopes('attendance:approve')
   decideShiftSwap(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DecideShiftSwapDto) {
-    return this.attendance.decideShiftSwap(user.tenantId, user.employeeId ?? undefined, id, dto);
+    return this.attendance.decideShiftSwap(user, id, dto);
   }
 
   @Get('holidays')

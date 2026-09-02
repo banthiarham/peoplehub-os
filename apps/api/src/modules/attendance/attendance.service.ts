@@ -15,6 +15,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 import {
   parseAttendanceDate,
   parseAttendanceDateOrError,
@@ -2916,12 +2917,16 @@ export class AttendanceService {
   }
 
   /** Marks a grant used, cancelled or expired. Only an available grant can move. */
-  async decideCompOff(tenantId: string, id: string, dto: DecideCompOffDto) {
-    const grant = await this.prisma.compOffGrant.findFirst({ where: { id, tenantId } });
+  async decideCompOff(user: AuthUser, id: string, dto: DecideCompOffDto) {
+    const grant = await this.prisma.compOffGrant.findFirst({
+      where: { id, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true } } },
+    });
     if (!grant) throw new NotFoundException('Comp-off not found');
     if (grant.status !== CompOffStatus.AVAILABLE) {
       throw new BadRequestException(`This comp-off is already ${grant.status.toLowerCase()}`);
     }
+    assertCanDecideApproval(user, grant.employeeId, grant.employee.managerId);
     return this.prisma.compOffGrant.update({
       where: { id },
       data: { status: dto.status, ...(dto.notes && { notes: dto.notes }) },
@@ -2978,19 +2983,22 @@ export class AttendanceService {
   }
 
   async decideShiftSwap(
-    tenantId: string,
-    approverId: string | undefined,
+    user: AuthUser,
     id: string,
     dto: DecideShiftSwapDto,
   ) {
-    const request = await this.prisma.shiftSwapRequest.findFirst({ where: { id, tenantId } });
+    const request = await this.prisma.shiftSwapRequest.findFirst({
+      where: { id, tenantId: user.tenantId },
+      include: { requester: { select: { managerId: true } } },
+    });
     if (!request) throw new NotFoundException('Shift swap request not found');
     if (request.status !== 'REQUESTED') throw new BadRequestException('Shift swap already decided');
+    assertCanDecideApproval(user, request.requesterEmployeeId, request.requester.managerId);
     const updated = await this.prisma.shiftSwapRequest.update({
       where: { id },
       data: {
         status: dto.status,
-        approverId,
+        approverId: user.employeeId ?? undefined,
         decidedAt: new Date(),
         decisionNote: dto.note,
       },
