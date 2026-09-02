@@ -150,6 +150,69 @@ function buildProcessRunHarness(options: {
   return { prisma, service, calculator, entryFor };
 }
 
+/** Minimal prisma double for `assignSalary` / `deleteSalary`. */
+function salaryHarness(
+  options: {
+    existingSalary?: Record<string, unknown> | null;
+    runs?: Array<Record<string, unknown>>;
+    otherRevisions?: Array<{ id: string; effectiveFrom: Date; effectiveTo: Date | null }>;
+  } = {},
+) {
+  const employee = { id: 'emp-1', tenantId: 'tenant-1' };
+  const structure = {
+    id: 'structure-1',
+    tenantId: 'tenant-1',
+    isActive: true,
+    components: [
+      {
+        name: 'Basic',
+        code: 'BASIC',
+        type: 'EARNING',
+        calculationType: 'PERCENTAGE_OF_GROSS',
+        value: 40,
+        isTaxable: true,
+        isStatutory: false,
+        statutoryType: null,
+        sequence: 1,
+      },
+    ],
+  };
+  const existing = options.existingSalary === undefined ? null : options.existingSalary;
+  const runs = options.runs ?? [];
+  const otherRevisions = options.otherRevisions ?? [];
+  const prisma = {
+    employee: { findFirst: jest.fn().mockResolvedValue(employee) },
+    salaryStructure: { findFirst: jest.fn().mockResolvedValue(structure) },
+    employeeSalary: {
+      findFirst: jest.fn().mockResolvedValue(existing),
+      findMany: jest.fn(({ where }: { where: { id?: { not: string } } }) =>
+        Promise.resolve(otherRevisions.filter((r) => !where.id || r.id !== where.id.not)),
+      ),
+      update: jest.fn(({ where, data }: { where: { id: string }; data: Record<string, unknown> }) =>
+        Promise.resolve({ ...existing, ...data, id: where.id }),
+      ),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      create: jest.fn(({ data }: { data: Record<string, unknown> }) => Promise.resolve({ id: 'salary-new', ...data })),
+      delete: jest.fn(({ where }: { where: { id: string } }) => Promise.resolve({ id: where.id })),
+    },
+    payrollRun: {
+      findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+        Promise.resolve(
+          runs.find(
+            (run) =>
+              run.tenantId === where.tenantId &&
+              run.month === where.month &&
+              run.year === where.year &&
+              (where.status.in as string[]).includes(run.status as string),
+          ) ?? null,
+        ),
+      ),
+    },
+    auditLog: { create: jest.fn().mockResolvedValue({}) },
+  };
+  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any) };
+}
+
 describe('PayrollService', () => {
   it('rejects salary structures without a BASIC earning component', async () => {
     const service = new PayrollService({} as any, {} as any, {} as any);
@@ -197,6 +260,522 @@ describe('PayrollService', () => {
         ]),
       }),
     );
+  });
+
+  describe('assignSalary', () => {
+    it('updates the existing revision when assigned again with the same effectiveFrom', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-old',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({ existingSalary: existing });
+
+      const result = await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1200000,
+        effectiveFrom: '2026-07-01',
+      } as any);
+
+      expect(prisma.employeeSalary.update).toHaveBeenCalledWith({
+        where: { id: 'salary-1' },
+        data: { salaryStructureId: 'structure-1', ctc: 1200000, components: expect.anything() },
+      });
+      // effectiveTo was omitted from the request, so it must not appear in the update payload
+      // at all - Prisma leaves the column untouched, preserving the existing value.
+      expect(Object.prototype.hasOwnProperty.call(prisma.employeeSalary.update.mock.calls[0][0].data, 'effectiveTo')).toBe(false);
+      expect(prisma.employeeSalary.create).not.toHaveBeenCalled();
+      expect(prisma.employeeSalary.updateMany).not.toHaveBeenCalled();
+      expect(result.id).toBe('salary-1');
+    });
+
+    it('creates a new revision and closes the previously open one for a different effectiveFrom', async () => {
+      const { prisma, service } = salaryHarness({ existingSalary: null });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1500000,
+        effectiveFrom: '2026-08-01',
+      } as any);
+
+      expect(prisma.employeeSalary.updateMany).toHaveBeenCalledWith({
+        where: { employeeId: 'emp-1', effectiveTo: null },
+        data: { effectiveTo: new Date('2026-08-01') },
+      });
+      expect(prisma.employeeSalary.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ effectiveFrom: new Date('2026-08-01'), effectiveTo: null }),
+        }),
+      );
+      expect(prisma.employeeSalary.update).not.toHaveBeenCalled();
+    });
+
+    it('preserves the existing effectiveTo when the request omits it entirely', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: new Date('2026-08-01'),
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({ existingSalary: existing });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1000000,
+        effectiveFrom: '2026-07-01',
+        // effectiveTo intentionally omitted
+      } as any);
+
+      const data = prisma.employeeSalary.update.mock.calls[0][0].data;
+      expect(Object.prototype.hasOwnProperty.call(data, 'effectiveTo')).toBe(false);
+    });
+
+    it('clears effectiveTo (open-ended) when explicitly passed null', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: new Date('2026-08-01'),
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({ existingSalary: existing });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1000000,
+        effectiveFrom: '2026-07-01',
+        effectiveTo: null,
+      } as any);
+
+      expect(prisma.employeeSalary.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ effectiveTo: null }) }),
+      );
+    });
+
+    it('updates effectiveTo to the given date when one is provided', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({ existingSalary: existing });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1000000,
+        effectiveFrom: '2026-07-01',
+        effectiveTo: '2026-07-16',
+      } as any);
+
+      expect(prisma.employeeSalary.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ effectiveTo: new Date('2026-07-16') }) }),
+      );
+    });
+
+    it('does not affect a brand new revision when effectiveTo is omitted (still open-ended)', async () => {
+      const { prisma, service } = salaryHarness({ existingSalary: null });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1500000,
+        effectiveFrom: '2026-09-01',
+        // effectiveTo intentionally omitted
+      } as any);
+
+      expect(prisma.employeeSalary.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ effectiveTo: null }) }),
+      );
+    });
+
+    it('does not touch unrelated salary history rows when editing one revision by effectiveFrom', async () => {
+      const existing = {
+        id: 'salary-2',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-16'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({ existingSalary: existing });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1300000,
+        effectiveFrom: '2026-07-16',
+      } as any);
+
+      expect(prisma.employeeSalary.updateMany).not.toHaveBeenCalled();
+      expect(prisma.employeeSalary.create).not.toHaveBeenCalled();
+      expect(prisma.employeeSalary.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses to edit a revision once payroll for its period is locked', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({
+        existingSalary: existing,
+        runs: [{ tenantId: 'tenant-1', month: 7, year: 2026, status: 'LOCKED' }],
+      });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1300000,
+          effectiveFrom: '2026-07-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.update).not.toHaveBeenCalled();
+    });
+
+    it.each(['PUBLISHED', 'CLOSED'])('also refuses to edit once the run is %s', async (status) => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({
+        existingSalary: existing,
+        runs: [{ tenantId: 'tenant-1', month: 7, year: 2026, status }],
+      });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1300000,
+          effectiveFrom: '2026-07-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.update).not.toHaveBeenCalled();
+    });
+
+    it('still allows editing while payroll for its period has not reached LOCKED (e.g. REVIEW)', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({
+        existingSalary: existing,
+        runs: [{ tenantId: 'tenant-1', month: 7, year: 2026, status: 'REVIEW' }],
+      });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1300000,
+        effectiveFrom: '2026-07-01',
+      } as any);
+
+      expect(prisma.employeeSalary.update).toHaveBeenCalled();
+    });
+
+    it('does not lock-check a brand new revision (no existing row at that effectiveFrom)', async () => {
+      const { prisma, service } = salaryHarness({
+        existingSalary: null,
+        runs: [{ tenantId: 'tenant-1', month: 8, year: 2026, status: 'LOCKED' }],
+      });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1500000,
+        effectiveFrom: '2026-08-01',
+      } as any);
+
+      expect(prisma.employeeSalary.create).toHaveBeenCalled();
+    });
+
+    it('rejects effectiveFrom after effectiveTo when creating a new revision', async () => {
+      const { prisma, service } = salaryHarness({ existingSalary: null });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1000000,
+          effectiveFrom: '2026-08-01',
+          effectiveTo: '2026-07-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects effectiveFrom after effectiveTo when editing an existing revision', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({ existingSalary: existing });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1000000,
+          effectiveFrom: '2026-07-01',
+          effectiveTo: '2026-06-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a new revision that overlaps an existing closed revision', async () => {
+      const { prisma, service } = salaryHarness({
+        existingSalary: null,
+        otherRevisions: [
+          { id: 'salary-old', effectiveFrom: new Date('2026-01-01'), effectiveTo: new Date('2026-06-01') },
+        ],
+      });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1000000,
+          effectiveFrom: '2026-03-01',
+          effectiveTo: '2026-09-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.create).not.toHaveBeenCalled();
+    });
+
+    it('allows a new revision that starts exactly when a prior closed revision ends (contiguous, not overlapping)', async () => {
+      const { prisma, service } = salaryHarness({
+        existingSalary: null,
+        otherRevisions: [
+          { id: 'salary-old', effectiveFrom: new Date('2026-01-01'), effectiveTo: new Date('2026-06-01') },
+        ],
+      });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1000000,
+        effectiveFrom: '2026-06-01',
+      } as any);
+
+      expect(prisma.employeeSalary.create).toHaveBeenCalled();
+    });
+
+    it('allows the everyday case: a new revision after the currently open-ended one (auto-close, not overlap)', async () => {
+      const { prisma, service } = salaryHarness({
+        existingSalary: null,
+        otherRevisions: [
+          { id: 'salary-current', effectiveFrom: new Date('2026-01-01'), effectiveTo: null },
+        ],
+      });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 1500000,
+        effectiveFrom: '2026-08-01',
+      } as any);
+
+      expect(prisma.employeeSalary.create).toHaveBeenCalled();
+    });
+
+    it('rejects a new revision inserted before the currently open-ended one (would corrupt it on auto-close)', async () => {
+      const { prisma, service } = salaryHarness({
+        existingSalary: null,
+        otherRevisions: [
+          { id: 'salary-current', effectiveFrom: new Date('2026-08-01'), effectiveTo: null },
+        ],
+      });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1000000,
+          effectiveFrom: '2026-03-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.create).not.toHaveBeenCalled();
+    });
+
+    it('allows a genuinely historical backfill entirely before the currently open-ended revision', async () => {
+      const { prisma, service } = salaryHarness({
+        existingSalary: null,
+        otherRevisions: [
+          { id: 'salary-current', effectiveFrom: new Date('2026-08-01'), effectiveTo: null },
+        ],
+      });
+
+      await service.assignSalary('tenant-1', {
+        employeeId: 'emp-1',
+        salaryStructureId: 'structure-1',
+        ctc: 800000,
+        effectiveFrom: '2026-01-01',
+        effectiveTo: '2026-03-01',
+      } as any);
+
+      expect(prisma.employeeSalary.create).toHaveBeenCalled();
+    });
+
+    it('rejects updating an existing revision to a new effectiveTo that overlaps another revision', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: new Date('2026-08-01'),
+        components: [],
+      };
+      const { prisma, service } = salaryHarness({
+        existingSalary: existing,
+        otherRevisions: [
+          existing,
+          { id: 'salary-2', effectiveFrom: new Date('2026-08-01'), effectiveTo: null },
+        ],
+      });
+
+      await expect(
+        service.assignSalary('tenant-1', {
+          employeeId: 'emp-1',
+          salaryStructureId: 'structure-1',
+          ctc: 1000000,
+          effectiveFrom: '2026-07-01',
+          effectiveTo: '2026-09-01',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deleteSalary', () => {
+    function salaryHarnessWithExisting(existing: Record<string, unknown> | null, runs: Array<Record<string, unknown>> = []) {
+      return salaryHarness({ existingSalary: existing, runs });
+    }
+
+    it('deletes a salary revision when payroll for its period is not locked', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarnessWithExisting(existing);
+
+      const result = await service.deleteSalary('tenant-1', 'salary-1', 'user-1');
+
+      expect(prisma.employeeSalary.delete).toHaveBeenCalledWith({ where: { id: 'salary-1' } });
+      expect(result).toEqual({ success: true });
+    });
+
+    it('blocks deletion once payroll for the revision period is locked', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarnessWithExisting(existing, [
+        { tenantId: 'tenant-1', month: 7, year: 2026, status: 'LOCKED' },
+      ]);
+
+      await expect(service.deleteSalary('tenant-1', 'salary-1', 'user-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.delete).not.toHaveBeenCalled();
+    });
+
+    it.each(['PUBLISHED', 'CLOSED'])('also blocks deletion once the run is %s', async (status) => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarnessWithExisting(existing, [
+        { tenantId: 'tenant-1', month: 7, year: 2026, status },
+      ]);
+
+      await expect(service.deleteSalary('tenant-1', 'salary-1', 'user-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.employeeSalary.delete).not.toHaveBeenCalled();
+    });
+
+    it('still allows deletion while payroll for its period has not reached LOCKED (e.g. REVIEW)', async () => {
+      const existing = {
+        id: 'salary-1',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-01'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarnessWithExisting(existing, [
+        { tenantId: 'tenant-1', month: 7, year: 2026, status: 'REVIEW' },
+      ]);
+
+      await service.deleteSalary('tenant-1', 'salary-1', 'user-1');
+
+      expect(prisma.employeeSalary.delete).toHaveBeenCalled();
+    });
+
+    it('404s for a salary revision that does not exist (or belongs to another tenant)', async () => {
+      const { prisma, service } = salaryHarnessWithExisting(null);
+
+      await expect(service.deleteSalary('tenant-1', 'missing-id', 'user-1')).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.employeeSalary.delete).not.toHaveBeenCalled();
+    });
+
+    it('does not touch other salary history rows when deleting one revision', async () => {
+      const existing = {
+        id: 'salary-2',
+        employeeId: 'emp-1',
+        ctc: 1000000,
+        effectiveFrom: new Date('2026-07-16'),
+        effectiveTo: null,
+        components: [],
+      };
+      const { prisma, service } = salaryHarnessWithExisting(existing);
+
+      await service.deleteSalary('tenant-1', 'salary-2', 'user-1');
+
+      expect(prisma.employeeSalary.updateMany).not.toHaveBeenCalled();
+      expect(prisma.employeeSalary.update).not.toHaveBeenCalled();
+      expect(prisma.employeeSalary.delete).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('blocks payroll approval when processed entries contain critical errors', async () => {
@@ -938,6 +1517,202 @@ describe('PayrollService', () => {
     await expect(
       service.createExpense(employeeUser(), { category: 'meals', amount: 6000 }),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  describe('payroll input approval workflow', () => {
+    function inputHarness(input: Record<string, unknown>, options: { existingRuns?: Array<Record<string, unknown>> } = {}) {
+      const record = { id: 'input-1', tenantId: 'tenant-1', status: 'DRAFT', label: 'OT', amount: 1000, month: 7, year: 2026, ...input };
+      const runs = options.existingRuns ?? [];
+      const prisma = {
+        payrollVariableInput: {
+          findFirst: jest.fn().mockResolvedValue(record),
+          update: jest.fn((args: { data: Record<string, unknown> }) => Promise.resolve({ ...record, ...args.data })),
+        },
+        payrollRun: {
+          findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+            Promise.resolve(
+              runs.find(
+                (run) =>
+                  run.tenantId === where.tenantId &&
+                  run.month === where.month &&
+                  run.year === where.year &&
+                  run.status !== where.status.not,
+              ) ?? null,
+            ),
+          ),
+        },
+        auditLog: { create: jest.fn().mockResolvedValue({}) },
+      };
+      return { prisma, record, service: new PayrollService(prisma as any, {} as any, {} as any) };
+    }
+
+    it('approves a DRAFT payroll input', async () => {
+      const { prisma, service } = inputHarness({ status: 'DRAFT' });
+
+      const result = await service.decidePayrollInput('tenant-1', 'user-1', 'input-1', 'APPROVED');
+
+      expect(result.status).toBe('APPROVED');
+      expect(prisma.payrollVariableInput.update).toHaveBeenCalledWith({
+        where: { id: 'input-1' },
+        data: { status: 'APPROVED' },
+      });
+    });
+
+    it('rejects a DRAFT payroll input', async () => {
+      const { service } = inputHarness({ status: 'DRAFT' });
+
+      const result = await service.decidePayrollInput('tenant-1', 'user-1', 'input-1', 'REJECTED');
+
+      expect(result.status).toBe('REJECTED');
+    });
+
+    it('refuses to re-decide an already APPROVED input', async () => {
+      const { prisma, service } = inputHarness({ status: 'APPROVED' });
+
+      await expect(
+        service.decidePayrollInput('tenant-1', 'user-1', 'input-1', 'REJECTED'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.payrollVariableInput.update).not.toHaveBeenCalled();
+    });
+
+    it('allows editing a DRAFT input before approval', async () => {
+      const { prisma, service } = inputHarness({ status: 'DRAFT' });
+
+      const result = await service.updatePayrollInput('tenant-1', 'user-1', 'input-1', { amount: 1500 });
+
+      expect(result.amount).toBe(1500);
+      expect(prisma.payrollVariableInput.update).toHaveBeenCalledWith({
+        where: { id: 'input-1' },
+        data: { amount: 1500 },
+      });
+    });
+
+    it('allows editing an APPROVED input while payroll for its period has not started processing', async () => {
+      const { prisma, service } = inputHarness({ status: 'APPROVED' }, { existingRuns: [] });
+
+      const result = await service.updatePayrollInput('tenant-1', 'user-1', 'input-1', { amount: 1500 });
+
+      expect(result.amount).toBe(1500);
+      expect(prisma.payrollRun.findFirst).toHaveBeenCalledWith({
+        where: { tenantId: 'tenant-1', month: 7, year: 2026, status: { not: 'DRAFT' } },
+      });
+    });
+
+    it('still allows editing an APPROVED input while its period run exists but is still DRAFT', async () => {
+      const { prisma, service } = inputHarness(
+        { status: 'APPROVED' },
+        { existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'DRAFT' }] },
+      );
+
+      const result = await service.updatePayrollInput('tenant-1', 'user-1', 'input-1', { amount: 1500 });
+
+      expect(result.amount).toBe(1500);
+      expect(prisma.payrollVariableInput.update).toHaveBeenCalled();
+    });
+
+    it('locks an APPROVED input once payroll for its period has been processed', async () => {
+      const { prisma, service } = inputHarness(
+        { status: 'APPROVED' },
+        { existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'REVIEW' }] },
+      );
+
+      await expect(
+        service.updatePayrollInput('tenant-1', 'user-1', 'input-1', { amount: 1500 }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.payrollVariableInput.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses to edit a REJECTED input', async () => {
+      const { prisma, service } = inputHarness({ status: 'REJECTED' });
+
+      await expect(
+        service.updatePayrollInput('tenant-1', 'user-1', 'input-1', { amount: 1500 }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.payrollVariableInput.update).not.toHaveBeenCalled();
+    });
+
+    it('only includes APPROVED inputs when payroll is processed', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: [{ tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(prisma.payrollVariableInput.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ status: 'APPROVED' }) }),
+      );
+    });
+  });
+
+  describe('mid-month salary revision proration', () => {
+    const finalizedJuly = [
+      { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+
+    it('splits the month across an effective-dated raise instead of applying the new salary for the whole month', async () => {
+      // Basic-only structure (100% of monthly CTC as BASIC, no other components) so the
+      // gross for each segment is easy to hand-verify: 10 days at 10,000/mo + 21 days at
+      // 15,500/mo (31-day July), each scaled against the full 31-day denominator.
+      const basicOnlyComponents = [{ code: 'BASIC', name: 'Basic', type: 'EARNING', monthly: 0 }];
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        run: { month: 7, year: 2026 },
+        finalizations: finalizedJuly,
+        employeeOverrides: {
+          employeeSalaries: [
+            {
+              ctc: 120000,
+              components: [{ ...basicOnlyComponents[0], monthly: 10000 }],
+              effectiveFrom: new Date(Date.UTC(2026, 5, 1)),
+              effectiveTo: new Date(Date.UTC(2026, 6, 11)),
+            },
+            {
+              ctc: 186000,
+              components: [{ ...basicOnlyComponents[0], monthly: 15500 }],
+              effectiveFrom: new Date(Date.UTC(2026, 6, 11)),
+              effectiveTo: null,
+            },
+          ],
+        },
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      const entry = prisma.payrollRunEmployee.upsert.mock.calls.find(
+        ([args]: [{ create: { employeeId: string } }]) => args.create.employeeId === 'emp-1',
+      )[0].create;
+      const basicComponent = entry.components.find((c: { code: string }) => c.code === 'BASIC');
+
+      // Segment 1: 1-10 Jul (10 days) at 10,000/mo -> 10,000 * 10/31
+      // Segment 2: 11-31 Jul (21 days) at 15,500/mo -> 15,500 * 21/31
+      const expectedGross = Math.round((10000 * (10 / 31) + 15500 * (21 / 31)) * 100) / 100;
+      expect(basicComponent.monthly).toBeCloseTo(expectedGross, 2);
+      expect(entry.grossPay).toBeCloseTo(expectedGross, 2);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+    });
+
+    it('behaves exactly as a single salary record when only one is active in the period', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        run: { month: 7, year: 2026 },
+        finalizations: finalizedJuly,
+        employeeOverrides: {
+          employeeSalaries: [
+            {
+              ctc: 1200000,
+              components: [],
+              effectiveFrom: new Date(Date.UTC(2024, 0, 1)),
+              effectiveTo: null,
+            },
+          ],
+        },
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // Falls back to the calculator (empty components), same as the pre-fix single-record path.
+      expect(prisma.payrollRunEmployee.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ create: expect.objectContaining({ grossPay: 90000 }) }),
+      );
+    });
   });
 
   it('exports payroll GL lines from run component totals', async () => {

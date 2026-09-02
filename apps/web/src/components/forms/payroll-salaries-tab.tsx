@@ -1,10 +1,11 @@
 'use client';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { BadgeIndianRupee, Plus } from 'lucide-react';
+import { BadgeIndianRupee, History, Pencil, Plus, Trash2 } from 'lucide-react';
+import type React from 'react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
-import { formatINR } from '@/lib/utils';
+import { formatDate, formatINR } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -47,6 +48,15 @@ interface SalaryPreview {
   components: Array<{ code: string; name: string; type: string; monthly: number; annual: number }>;
 }
 
+interface SalaryHistoryEntry {
+  id: string;
+  salaryStructureId: string;
+  ctc: number;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+  salaryStructure: { name: string };
+}
+
 export function PayrollSalariesTab() {
   const { data, isLoading } = useQuery({
     queryKey: ['payroll', 'salaries'],
@@ -68,6 +78,7 @@ export function PayrollSalariesTab() {
               <TH>Department</TH>
               <TH>Components</TH>
               <TH className="text-right">Current CTC</TH>
+              <TH></TH>
             </TR>
           </THead>
           <TBody>
@@ -85,6 +96,12 @@ export function PayrollSalariesTab() {
                 <TD>{row.department?.name ?? '—'}</TD>
                 <TD><Badge variant="outline">{row.currentSalary?.components?.length ?? 0} lines</Badge></TD>
                 <TD className="text-right font-medium tabular-nums">{row.currentSalary ? formatINR(row.currentSalary.ctc, true) : '—'}</TD>
+                <TD className="text-right">
+                  <PayrollSalaryHistoryDialog
+                    employeeId={row.id}
+                    employeeName={`${row.firstName} ${row.lastName}`}
+                  />
+                </TD>
               </TR>
             ))}
           </TBody>
@@ -104,6 +121,7 @@ function PayrollAssignSalaryDialog() {
   const [salaryStructureId, setSalaryStructureId] = useState('');
   const [ctc, setCtc] = useState('');
   const [effectiveFrom, setEffectiveFrom] = useState(new Date().toISOString().slice(0, 10));
+  const [effectiveTo, setEffectiveTo] = useState('');
 
   const { data: employees } = useQuery({
     queryKey: ['payroll', 'salaries', 'employees'],
@@ -130,12 +148,14 @@ function PayrollAssignSalaryDialog() {
       salaryStructureId,
       ctc: Number(ctc),
       effectiveFrom,
+      effectiveTo: effectiveTo || null,
     }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['payroll'] });
       toast('Salary assigned', 'success');
       setOpen(false);
       setCtc('');
+      setEffectiveTo('');
     },
     onError: (err: unknown) => toast(payrollApiError(err), 'error'),
   });
@@ -150,7 +170,7 @@ function PayrollAssignSalaryDialog() {
         <DialogContent className="max-h-[88vh] max-w-3xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Assign salary</DialogTitle>
-          <DialogDescription>Assign a CTC template and effective date. Previous active salary closes automatically.</DialogDescription>
+          <DialogDescription>Assign a CTC template and effective date. Previous active salary closes automatically. Leave "Effective to" blank for an open-ended revision.</DialogDescription>
         </DialogHeader>
         <div className="grid grid-cols-2 gap-3">
           <label className="col-span-2 block space-y-1.5 text-xs font-medium text-ink-muted">
@@ -178,6 +198,10 @@ function PayrollAssignSalaryDialog() {
           <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
             Effective from
             <Input type="date" value={effectiveFrom} onChange={(e) => setEffectiveFrom(e.target.value)} />
+          </label>
+          <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+            Effective to (optional)
+            <Input type="date" value={effectiveTo} onChange={(e) => setEffectiveTo(e.target.value)} />
           </label>
         </div>
         {preview && (
@@ -218,6 +242,239 @@ function PayrollAssignSalaryDialog() {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function PayrollSalaryHistoryDialog({ employeeId, employeeName }: { employeeId: string; employeeName: string }) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [open, setOpen] = useState(false);
+  const [editingRevision, setEditingRevision] = useState<SalaryHistoryEntry | null>(null);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['payroll', 'salaries', employeeId, 'history'],
+    queryFn: () => api.get(`/payroll/salaries/${employeeId}`).then((r) => r.data as { history: SalaryHistoryEntry[] }),
+    enabled: open,
+  });
+  const history = data?.history ?? [];
+
+  const deleteRevision = useMutation({
+    mutationFn: (revisionId: string) => api.delete(`/payroll/salaries/${revisionId}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['payroll'] });
+      toast('Salary revision deleted', 'success');
+    },
+    onError: (err: unknown) => toast(payrollApiError(err), 'error'),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setEditingRevision(null);
+      }}
+    >
+      <DialogTrigger asChild>
+        <Button variant="outline" size="sm"><History className="h-4 w-4" /> History</Button>
+      </DialogTrigger>
+      <DialogContent className="max-w-full sm:max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>Salary history</DialogTitle>
+          <DialogDescription>{employeeName} — every salary revision, most recent first.</DialogDescription>
+        </DialogHeader>
+        {isLoading ? (
+          <div className="space-y-2">{[...Array(3)].map((_, i) => <Skeleton key={i} className="h-10" />)}</div>
+        ) : history.length ? (
+          <Table>
+            <THead>
+              <TR>
+                <TH className="whitespace-nowrap">Effective from</TH>
+                <TH className="whitespace-nowrap">Effective to</TH>
+                <TH>Structure</TH>
+                <TH className="whitespace-nowrap text-right">CTC</TH>
+                <TH className="text-right">Actions</TH>
+              </TR>
+            </THead>
+            <TBody>
+              {history.map((revision) => (
+                <TR key={revision.id}>
+                  <TD className="whitespace-nowrap">{formatDate(revision.effectiveFrom)}</TD>
+                  <TD className="whitespace-nowrap">
+                    {revision.effectiveTo ? (
+                      formatDate(revision.effectiveTo)
+                    ) : (
+                      <Badge variant="success">Current / open-ended</Badge>
+                    )}
+                  </TD>
+                  <TD>
+                    <span className="block max-w-[10rem] truncate sm:max-w-[14rem]" title={revision.salaryStructure.name}>
+                      {revision.salaryStructure.name}
+                    </span>
+                  </TD>
+                  <TD className="whitespace-nowrap text-right font-medium tabular-nums">{formatINR(revision.ctc, true)}</TD>
+                  <TD className="text-right">
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        aria-label="Edit salary revision"
+                        title="Edit"
+                        onClick={() => setEditingRevision(revision)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        aria-label="Delete salary revision"
+                        title="Delete"
+                        disabled={deleteRevision.isPending}
+                        onClick={() => {
+                          if (window.confirm('Delete this salary revision? This cannot be undone.')) {
+                            deleteRevision.mutate(revision.id);
+                          }
+                        }}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </TD>
+                </TR>
+              ))}
+            </TBody>
+          </Table>
+        ) : (
+          <EmptyState icon={BadgeIndianRupee} title="No salary history" description="This employee has no salary revisions yet." />
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setOpen(false)}>Close</Button>
+        </DialogFooter>
+      </DialogContent>
+      {editingRevision && (
+        <PayrollEditSalaryDialog
+          key={editingRevision.id}
+          employeeId={employeeId}
+          employeeName={employeeName}
+          revision={editingRevision}
+          open={Boolean(editingRevision)}
+          onOpenChange={(next) => {
+            if (!next) setEditingRevision(null);
+          }}
+        />
+      )}
+    </Dialog>
+  );
+}
+
+/**
+ * Edits an existing salary revision in place. `effectiveFrom` is read-only here: the backend
+ * matches a revision to update by employeeId + effectiveFrom exactly, so changing it would
+ * create a new revision instead of updating this one.
+ */
+function PayrollEditSalaryDialog({
+  employeeId,
+  employeeName,
+  revision,
+  open,
+  onOpenChange,
+}: {
+  employeeId: string;
+  employeeName: string;
+  revision: SalaryHistoryEntry;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [salaryStructureId, setSalaryStructureId] = useState(revision.salaryStructureId);
+  const [ctc, setCtc] = useState(String(revision.ctc));
+  const [effectiveTo, setEffectiveTo] = useState(revision.effectiveTo ? revision.effectiveTo.slice(0, 10) : '');
+
+  const { data: structures } = useQuery({
+    queryKey: ['payroll', 'structures', 'salary-assign'],
+    queryFn: () => api.get('/payroll/structures').then((r) => r.data as StructureOption[]),
+    enabled: open,
+  });
+  const { data: preview } = useQuery({
+    queryKey: ['payroll', 'structures', salaryStructureId, 'preview', ctc],
+    queryFn: () =>
+      api
+        .post(`/payroll/structures/${salaryStructureId}/preview`, { ctc: Number(ctc) })
+        .then((r) => r.data as SalaryPreview),
+    enabled: open && !!salaryStructureId && Number(ctc) > 0,
+  });
+
+  const update = useMutation({
+    mutationFn: () => api.post('/payroll/salaries', {
+      employeeId,
+      salaryStructureId,
+      ctc: Number(ctc),
+      effectiveFrom: revision.effectiveFrom.slice(0, 10),
+      effectiveTo: effectiveTo || null,
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['payroll'] });
+      toast('Salary revision updated', 'success');
+      onOpenChange(false);
+    },
+    onError: (err: unknown) => toast(payrollApiError(err), 'error'),
+  });
+
+  const valid = salaryStructureId && Number(ctc) > 0;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[88vh] max-w-3xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>Edit salary revision</DialogTitle>
+          <DialogDescription>{employeeName} — revision effective {revision.effectiveFrom.slice(0, 10)}. Editable until payroll for this period is locked.</DialogDescription>
+        </DialogHeader>
+        <div className="grid grid-cols-2 gap-3">
+          <Labeled label="Structure">
+            <Select className="w-full" value={salaryStructureId} onChange={(e) => setSalaryStructureId(e.target.value)}>
+              {structures?.map((structure) => (
+                <option key={structure.id} value={structure.id}>{structure.name}</option>
+              ))}
+            </Select>
+          </Labeled>
+          <Labeled label="Annual CTC">
+            <Input type="number" min={1} value={ctc} onChange={(e) => setCtc(e.target.value)} />
+          </Labeled>
+          <Labeled label="Effective from">
+            <Input type="date" value={revision.effectiveFrom.slice(0, 10)} disabled />
+          </Labeled>
+          <Labeled label="Effective to (optional)">
+            <Input type="date" value={effectiveTo} onChange={(e) => setEffectiveTo(e.target.value)} />
+          </Labeled>
+        </div>
+        {preview && (
+          <div className="rounded-lg border border-line p-3">
+            <div className="mb-3 grid gap-2 text-sm sm:grid-cols-4">
+              <PreviewStat label="Monthly CTC" value={preview.monthlyCtc} />
+              <PreviewStat label="Gross" value={preview.monthlyGross} />
+              <PreviewStat label="Deductions" value={preview.monthlyDeductions} />
+              <PreviewStat label="Net" value={preview.monthlyNet} />
+            </div>
+          </div>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button disabled={!valid || update.isPending} onClick={() => update.mutate()}>
+            {update.isPending ? 'Saving...' : 'Save'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+      {label}
+      {children}
+    </label>
   );
 }
 

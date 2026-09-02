@@ -6,7 +6,7 @@ import type React from 'react';
 import { useState } from 'react';
 import { api } from '@/lib/api';
 import { formatINR } from '@/lib/utils';
-import { Badge } from '@/components/ui/badge';
+import { Badge, statusVariant } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import {
@@ -78,6 +78,7 @@ export function PayrollInputsTab() {
               <TH>Period</TH>
               <TH>Status</TH>
               <TH className="text-right">Amount</TH>
+              <TH></TH>
             </TR>
           </THead>
           <TBody>
@@ -92,8 +93,9 @@ export function PayrollInputsTab() {
                   <span className="ml-2 text-ink-muted">{row.label}</span>
                 </TD>
                 <TD>{row.month}/{row.year}</TD>
-                <TD><Badge variant={row.status === 'APPROVED' ? 'success' : 'outline'}>{row.status}</Badge></TD>
+                <TD><Badge variant={statusVariant(row.status)}>{row.status}</Badge></TD>
                 <TD className="text-right font-medium tabular-nums">{formatINR(row.amount)}</TD>
+                <TD><PayrollInputRowActions row={row} /></TD>
               </TR>
             ))}
           </TBody>
@@ -192,6 +194,112 @@ function PayrollNewInputDialog() {
           <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
           <Button disabled={!valid || create.isPending} onClick={() => create.mutate()}>
             {create.isPending ? 'Adding...' : 'Add input'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// Mirrors PayrollService.updatePayrollInput / decidePayrollInput: DRAFT/SUBMITTED/APPROVED
+// inputs can still be edited (until the backend rejects it once payroll is locked), but only
+// DRAFT/SUBMITTED inputs can be approved or rejected - an APPROVED input is already decided.
+const EDITABLE_STATUSES = ['DRAFT', 'SUBMITTED', 'APPROVED'];
+const DECIDABLE_STATUSES = ['DRAFT', 'SUBMITTED'];
+
+function PayrollInputRowActions({ row }: { row: PayrollInputRow }) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [editOpen, setEditOpen] = useState(false);
+
+  const decide = useMutation({
+    mutationFn: (decision: 'approve' | 'reject') => api.patch(`/payroll/inputs/${row.id}/${decision}`),
+    onSuccess: (_data, decision) => {
+      queryClient.invalidateQueries({ queryKey: ['payroll'] });
+      toast(decision === 'approve' ? 'Payroll input approved' : 'Payroll input rejected', 'success');
+    },
+    onError: (err: unknown) => toast(payrollApiError(err), 'error'),
+  });
+
+  const editable = EDITABLE_STATUSES.includes(row.status);
+  const decidable = DECIDABLE_STATUSES.includes(row.status);
+  if (!editable && !decidable) return null;
+
+  return (
+    <div className="flex justify-end gap-2">
+      {editable && (
+        <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>Edit</Button>
+      )}
+      {decidable && (
+        <>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={decide.isPending}
+            onClick={() => decide.mutate('approve')}
+          >
+            Approve
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={decide.isPending}
+            onClick={() => decide.mutate('reject')}
+          >
+            Reject
+          </Button>
+        </>
+      )}
+      {editable && <PayrollEditInputDialog row={row} open={editOpen} onOpenChange={setEditOpen} />}
+    </div>
+  );
+}
+
+function PayrollEditInputDialog({
+  row,
+  open,
+  onOpenChange,
+}: {
+  row: PayrollInputRow;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [label, setLabel] = useState(row.label);
+  const [amount, setAmount] = useState(String(row.amount));
+
+  const update = useMutation({
+    mutationFn: () => api.patch(`/payroll/inputs/${row.id}`, { label, amount: Number(amount) }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['payroll'] });
+      toast('Payroll input updated', 'success');
+      onOpenChange(false);
+    },
+    onError: (err: unknown) => toast(payrollApiError(err), 'error'),
+  });
+
+  const valid = label.trim().length > 0 && Number(amount) > 0;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Edit payroll input</DialogTitle>
+          <DialogDescription>Review and correct this input. Locked once its payroll period is locked.</DialogDescription>
+        </DialogHeader>
+        <div className="grid grid-cols-2 gap-3">
+          <Labeled label="Label">
+            <Input value={label} onChange={(e) => setLabel(e.target.value)} />
+          </Labeled>
+          <Labeled label="Amount">
+            <Input type="number" min={1} value={amount} onChange={(e) => setAmount(e.target.value)} />
+          </Labeled>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button disabled={!valid || update.isPending} onClick={() => update.mutate()}>
+            {update.isPending ? 'Saving...' : 'Save'}
           </Button>
         </DialogFooter>
       </DialogContent>

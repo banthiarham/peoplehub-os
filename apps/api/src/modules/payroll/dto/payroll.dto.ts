@@ -57,6 +57,15 @@ export class AssignSalaryDto {
   @ApiProperty()
   @IsDateString()
   effectiveFrom!: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Omit to leave an existing revision\'s effectiveTo unchanged (or open-ended for a new revision); pass null to clear it (open-ended); pass a date to set it.',
+    nullable: true,
+  })
+  @IsOptional()
+  @IsDateString()
+  effectiveTo?: string | null;
 }
 
 export class SalaryComponentConfigDto {
@@ -284,6 +293,24 @@ export class CreatePayrollInputDto {
   @IsOptional()
   @IsString()
   status?: string;
+}
+
+export class UpdatePayrollInputDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  label?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  amount?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  taxable?: boolean;
 }
 
 export class OverrideWarningsDto {

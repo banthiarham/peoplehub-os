@@ -2256,6 +2256,37 @@ describe('AttendanceService', () => {
       );
     });
 
+    it('creates attendance-generated overtime as pending (DRAFT), not auto-approved', async () => {
+      const { service, prisma } = buildFinalizeHarness({
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: new Date(Date.UTC(2026, 6, 8)),
+            status: 'PRESENT',
+            overtimeMinutes: 120,
+            workingMinutes: 600,
+            shift: {
+              id: 'shift-1',
+              overtimeAfterMinutes: 480,
+              halfDayAfterMinutes: 240,
+              minWorkingMinutes: 480,
+              shiftAllowanceAmount: 0,
+              compOffEligible: false,
+            },
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      const overtimeInputs = prisma.payrollVariableInput.create.mock.calls.filter(
+        ([args]: [{ data: { type: string } }]) => args.data.type === 'OVERTIME',
+      );
+      expect(overtimeInputs).toHaveLength(1);
+      expect(overtimeInputs[0][0].data).toMatchObject({ type: 'OVERTIME', status: 'DRAFT' });
+    });
+
     it('never issues a tenant-wide delete when no employees are in scope', async () => {
       const { service, prisma } = buildFinalizeHarness({ employees: [] });
 
