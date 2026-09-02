@@ -334,7 +334,7 @@ export class PayrollController {
   @Patch('inputs/:id/approve')
   @Roles(...PAYROLL_ROLES)
   @Scopes('payroll:approve')
-  @ApiOperation({ summary: 'Approve a pending payroll input so it is included in payroll processing' })
+  @ApiOperation({ summary: 'Approve a payroll input (including flipping a rejected one) so it is included in payroll processing' })
   approveInput(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.decidePayrollInput(user.tenantId, user.userId, id, 'APPROVED');
   }
@@ -342,7 +342,7 @@ export class PayrollController {
   @Patch('inputs/:id/reject')
   @Roles(...PAYROLL_ROLES)
   @Scopes('payroll:approve')
-  @ApiOperation({ summary: 'Reject a pending payroll input' })
+  @ApiOperation({ summary: 'Reject a payroll input (including flipping a previously approved one)' })
   rejectInput(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.payroll.decidePayrollInput(user.tenantId, user.userId, id, 'REJECTED');
   }

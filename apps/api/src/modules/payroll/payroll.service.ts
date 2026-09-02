@@ -1268,12 +1268,20 @@ export class PayrollService {
     return updated;
   }
 
-  /** Approve/reject a pending input, e.g. attendance-generated overtime, before it can be picked up by payroll processing. */
+  /**
+   * Approve/reject an input, e.g. attendance-generated overtime, before it can be picked up by
+   * payroll processing. Already-decided inputs (APPROVED/REJECTED) may still have their status
+   * flipped - mirrors updatePayrollInput's lock: once payroll for the input's period has moved
+   * past DRAFT, the decision is frozen.
+   */
   async decidePayrollInput(tenantId: string, actorId: string | undefined, id: string, status: 'APPROVED' | 'REJECTED') {
     const input = await this.prisma.payrollVariableInput.findFirst({ where: { id, tenantId } });
     if (!input) throw new NotFoundException('Payroll input not found');
-    if (!['DRAFT', 'SUBMITTED'].includes(input.status)) {
-      throw new BadRequestException(`A payroll input that is ${input.status.toLowerCase()} cannot be ${status.toLowerCase()}`);
+    const processedRun = await this.prisma.payrollRun.findFirst({
+      where: { tenantId, month: input.month, year: input.year, status: { not: 'DRAFT' } },
+    });
+    if (processedRun) {
+      throw new BadRequestException('Payroll for this period has already been processed; this input is locked');
     }
     const updated = await this.prisma.payrollVariableInput.update({ where: { id }, data: { status } });
     await this.audit(tenantId, actorId, `PAYROLL_INPUT_${status}`, 'PayrollVariableInput', id, input, updated);

@@ -1566,8 +1566,35 @@ describe('PayrollService', () => {
       expect(result.status).toBe('REJECTED');
     });
 
-    it('refuses to re-decide an already APPROVED input', async () => {
-      const { prisma, service } = inputHarness({ status: 'APPROVED' });
+    it('allows flipping an already APPROVED input to REJECTED before payroll is processed', async () => {
+      const { prisma, service } = inputHarness({ status: 'APPROVED' }, { existingRuns: [] });
+
+      const result = await service.decidePayrollInput('tenant-1', 'user-1', 'input-1', 'REJECTED');
+
+      expect(result.status).toBe('REJECTED');
+      expect(prisma.payrollVariableInput.update).toHaveBeenCalledWith({
+        where: { id: 'input-1' },
+        data: { status: 'REJECTED' },
+      });
+    });
+
+    it('allows flipping an already REJECTED input back to APPROVED before payroll is processed', async () => {
+      const { prisma, service } = inputHarness({ status: 'REJECTED' }, { existingRuns: [] });
+
+      const result = await service.decidePayrollInput('tenant-1', 'user-1', 'input-1', 'APPROVED');
+
+      expect(result.status).toBe('APPROVED');
+      expect(prisma.payrollVariableInput.update).toHaveBeenCalledWith({
+        where: { id: 'input-1' },
+        data: { status: 'APPROVED' },
+      });
+    });
+
+    it('refuses to re-decide an APPROVED input once payroll for its period has been processed', async () => {
+      const { prisma, service } = inputHarness(
+        { status: 'APPROVED' },
+        { existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'REVIEW' }] },
+      );
 
       await expect(
         service.decidePayrollInput('tenant-1', 'user-1', 'input-1', 'REJECTED'),
