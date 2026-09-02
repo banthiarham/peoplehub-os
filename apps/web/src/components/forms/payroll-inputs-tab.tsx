@@ -202,10 +202,10 @@ function PayrollNewInputDialog() {
 }
 
 // Mirrors PayrollService.updatePayrollInput / decidePayrollInput: DRAFT/SUBMITTED/APPROVED
-// inputs can still be edited (until the backend rejects it once payroll is locked), but only
-// DRAFT/SUBMITTED inputs can be approved or rejected - an APPROVED input is already decided.
+// inputs can still be edited, and any input's Approve/Reject decision can still be changed -
+// the backend rejects both once payroll for that input's period has moved past DRAFT.
 const EDITABLE_STATUSES = ['DRAFT', 'SUBMITTED', 'APPROVED'];
-const DECIDABLE_STATUSES = ['DRAFT', 'SUBMITTED'];
+const DECIDABLE_STATUSES = ['DRAFT', 'SUBMITTED', 'APPROVED', 'REJECTED'];
 
 function PayrollInputRowActions({ row }: { row: PayrollInputRow }) {
   const queryClient = useQueryClient();
@@ -230,25 +230,25 @@ function PayrollInputRowActions({ row }: { row: PayrollInputRow }) {
       {editable && (
         <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>Edit</Button>
       )}
-      {decidable && (
-        <>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={decide.isPending}
-            onClick={() => decide.mutate('approve')}
-          >
-            Approve
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={decide.isPending}
-            onClick={() => decide.mutate('reject')}
-          >
-            Reject
-          </Button>
-        </>
+      {decidable && row.status !== 'APPROVED' && (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={decide.isPending}
+          onClick={() => decide.mutate('approve')}
+        >
+          Approve
+        </Button>
+      )}
+      {decidable && row.status !== 'REJECTED' && (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={decide.isPending}
+          onClick={() => decide.mutate('reject')}
+        >
+          Reject
+        </Button>
       )}
       {editable && <PayrollEditInputDialog row={row} open={editOpen} onOpenChange={setEditOpen} />}
     </div>
