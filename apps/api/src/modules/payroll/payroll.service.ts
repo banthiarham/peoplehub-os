@@ -23,6 +23,7 @@ import {
   PageDto,
   PreviewSalaryStructureDto,
   RespondExpenseClarificationDto,
+  UpdatePayrollInputDto,
   UpsertSalaryStructureDto,
   WaiveLoanDto,
 } from './dto/payroll.dto';
@@ -226,6 +227,12 @@ export class PayrollService {
     return { employee, history };
   }
 
+  /**
+   * A revision at the same employee + effectiveFrom is treated as an edit of that revision
+   * (amount/structure/effectiveTo), matching Keka-style "edit an existing salary revision"
+   * behaviour, rather than silently creating a duplicate row. A different effectiveFrom still
+   * creates a new revision and closes out the previously open-ended one, as before.
+   */
   async assignSalary(tenantId: string, dto: AssignSalaryDto, actorId?: string) {
     const [employee, structure] = await Promise.all([
       this.prisma.employee.findFirst({ where: { id: dto.employeeId, tenantId } }),
@@ -239,22 +246,132 @@ export class PayrollService {
     if (!structure.isActive) throw new BadRequestException('Salary structure is inactive');
 
     const effectiveFrom = new Date(dto.effectiveFrom);
+    const components = this.buildComponentsForStructure(dto.ctc, structure.components) as unknown as Prisma.InputJsonValue;
+
+    const existing = await this.prisma.employeeSalary.findFirst({
+      where: { employeeId: dto.employeeId, effectiveFrom },
+    });
+    if (existing) {
+      await this.assertSalaryPeriodEditable(tenantId, effectiveFrom);
+      const effectiveTo = dto.effectiveTo !== undefined
+        ? (dto.effectiveTo ? new Date(dto.effectiveTo) : null)
+        : existing.effectiveTo;
+      this.assertValidSalaryDateRange(effectiveFrom, effectiveTo);
+      await this.assertNoOverlappingSalaryPeriod(dto.employeeId, effectiveFrom, effectiveTo, { excludeId: existing.id });
+      const updated = await this.prisma.employeeSalary.update({
+        where: { id: existing.id },
+        data: {
+          salaryStructureId: dto.salaryStructureId,
+          ctc: dto.ctc,
+          components,
+          // effectiveTo omitted -> keep the existing revision's effectiveTo unchanged;
+          // explicitly null/blank -> clear it (open-ended); a date -> set it.
+          ...(dto.effectiveTo !== undefined && { effectiveTo }),
+        },
+      });
+      await this.audit(tenantId, actorId, 'EMPLOYEE_SALARY_REVISED', 'EmployeeSalary', updated.id, existing, updated);
+      return updated;
+    }
+
+    const effectiveTo = dto.effectiveTo ? new Date(dto.effectiveTo) : null;
+    this.assertValidSalaryDateRange(effectiveFrom, effectiveTo);
+    // The upcoming updateMany below closes any currently-open revision at effectiveFrom, so a
+    // still-open revision that starts before effectiveFrom won't actually end up overlapping -
+    // exempt it here and let the standard interval check catch every other case (including a
+    // still-open revision that starts *after* effectiveFrom, which the close step can't fix).
+    await this.assertNoOverlappingSalaryPeriod(dto.employeeId, effectiveFrom, effectiveTo, {
+      exemptCurrentlyOpenStartingBefore: effectiveFrom,
+    });
+
     await this.prisma.employeeSalary.updateMany({
       where: { employeeId: dto.employeeId, effectiveTo: null },
       data: { effectiveTo: effectiveFrom },
     });
-    const components = this.buildComponentsForStructure(dto.ctc, structure.components) as unknown as Prisma.InputJsonValue;
     const created = await this.prisma.employeeSalary.create({
       data: {
         employeeId: dto.employeeId,
         salaryStructureId: dto.salaryStructureId,
         ctc: dto.ctc,
         effectiveFrom,
+        effectiveTo,
         components,
       },
     });
     await this.audit(tenantId, actorId, 'EMPLOYEE_SALARY_ASSIGNED', 'EmployeeSalary', created.id, undefined, created);
     return created;
+  }
+
+  /**
+   * Deletes a salary revision - part of the salary-history cleanup workflow, not an automated
+   * repair: it only removes the one record picked, never adjusts adjacent revisions'
+   * effectiveFrom/effectiveTo. Blocked once payroll for that revision's period is locked, same
+   * as editing.
+   */
+  async deleteSalary(tenantId: string, id: string, actorId?: string) {
+    const existing = await this.prisma.employeeSalary.findFirst({
+      where: { id, employee: { tenantId } },
+    });
+    if (!existing) throw new NotFoundException('Salary revision not found');
+    await this.assertSalaryPeriodEditable(tenantId, existing.effectiveFrom);
+    await this.prisma.employeeSalary.delete({ where: { id } });
+    await this.audit(tenantId, actorId, 'EMPLOYEE_SALARY_DELETED', 'EmployeeSalary', id, existing, undefined);
+    return { success: true };
+  }
+
+  private assertValidSalaryDateRange(effectiveFrom: Date, effectiveTo: Date | null) {
+    if (effectiveTo && effectiveFrom > effectiveTo) {
+      throw new BadRequestException('effectiveFrom must be on or before effectiveTo');
+    }
+  }
+
+  /**
+   * Half-open interval overlap check ([effectiveFrom, effectiveTo)), treating a null
+   * effectiveTo as unbounded. `excludeId` skips the revision being edited;
+   * `exemptCurrentlyOpenStartingBefore` skips a still-open revision that the caller is about to
+   * close at that date (see assignSalary's create path) so the everyday "assign the next
+   * revision" flow isn't flagged as an overlap against itself.
+   */
+  private async assertNoOverlappingSalaryPeriod(
+    employeeId: string,
+    effectiveFrom: Date,
+    effectiveTo: Date | null,
+    options: { excludeId?: string; exemptCurrentlyOpenStartingBefore?: Date } = {},
+  ) {
+    const others = await this.prisma.employeeSalary.findMany({
+      where: { employeeId, ...(options.excludeId && { id: { not: options.excludeId } }) },
+      select: { id: true, effectiveFrom: true, effectiveTo: true },
+    });
+    const FAR_FUTURE = new Date(8640000000000000);
+    const newEnd = effectiveTo ?? FAR_FUTURE;
+    const overlapping = others.some((other) => {
+      if (
+        options.exemptCurrentlyOpenStartingBefore &&
+        other.effectiveTo === null &&
+        other.effectiveFrom < options.exemptCurrentlyOpenStartingBefore
+      ) {
+        return false;
+      }
+      const otherEnd = other.effectiveTo ?? FAR_FUTURE;
+      return effectiveFrom < otherEnd && other.effectiveFrom < newEnd;
+    });
+    if (overlapping) {
+      throw new BadRequestException('This effective date range overlaps an existing salary revision for this employee');
+    }
+  }
+
+  /** A salary revision can be edited/deleted until payroll for its effective month has been locked (or published/closed). */
+  private async assertSalaryPeriodEditable(tenantId: string, effectiveFrom: Date) {
+    const lockedRun = await this.prisma.payrollRun.findFirst({
+      where: {
+        tenantId,
+        month: effectiveFrom.getUTCMonth() + 1,
+        year: effectiveFrom.getUTCFullYear(),
+        status: { in: ['LOCKED', 'PUBLISHED', 'CLOSED'] },
+      },
+    });
+    if (lockedRun) {
+      throw new BadRequestException('Payroll for this period is locked; this salary revision can no longer be edited');
+    }
   }
 
   // ── Payroll runs ──────────────────────────────────────────────────────────
@@ -567,11 +684,16 @@ export class PayrollService {
         bankDetails: true,
         legalEntityId: true,
         locationId: true,
+        // All salary records overlapping the payroll month, not just the latest: a mid-month
+        // revision must be split across its effective-date segments rather than applying the
+        // newest rate to the whole month.
         employeeSalaries: {
-          where: { effectiveFrom: { lte: monthEnd } },
-          orderBy: { effectiveFrom: 'desc' },
-          take: 1,
-          select: { ctc: true, components: true },
+          where: {
+            effectiveFrom: { lte: monthEnd },
+            OR: [{ effectiveTo: null }, { effectiveTo: { gt: monthStart } }],
+          },
+          orderBy: { effectiveFrom: 'asc' },
+          select: { ctc: true, components: true, effectiveFrom: true, effectiveTo: true },
         },
         loans: {
           where: { status: 'ACTIVE' },
@@ -666,7 +788,8 @@ export class PayrollService {
     let errorCount = 0;
     let warningCount = 0;
     for (const emp of employees) {
-      const salary = emp.employeeSalaries[0];
+      const salaries = emp.employeeSalaries;
+      const salary = salaries[salaries.length - 1];
       const errors: string[] = [];
       const warnings: string[] = [];
       if (!salary) errors.push('Missing active salary structure or CTC for this payroll month');
@@ -729,11 +852,12 @@ export class PayrollService {
         warningCount += warnings.length;
         continue;
       }
-      const result = this.calculateConfiguredMonth({
-        ctc: salary.ctc,
-        storedComponents: salary.components,
+      const result = this.calculateProratedMonth({
+        salaries,
         payableDays,
         daysInMonth,
+        monthStart,
+        monthEnd,
         monthlyEmiDeduction: emi,
       });
       const manualInputs = inputsByEmployee.get(emp.id) ?? [];
@@ -1109,6 +1233,51 @@ export class PayrollService {
     });
     await this.audit(tenantId, actorId, 'PAYROLL_INPUT_CREATED', 'PayrollVariableInput', created.id, undefined, created);
     return created;
+  }
+
+  /**
+   * DRAFT/SUBMITTED inputs (e.g. attendance-generated overtime) can be corrected before
+   * approval. An APPROVED input (e.g. overtime already reviewed) can still be corrected too,
+   * but only up to the point payroll processing for its period has actually started - once a
+   * run for that month/year has moved past DRAFT, the input is locked to keep it consistent
+   * with what was already computed.
+   */
+  async updatePayrollInput(tenantId: string, actorId: string | undefined, id: string, dto: UpdatePayrollInputDto) {
+    const input = await this.prisma.payrollVariableInput.findFirst({ where: { id, tenantId } });
+    if (!input) throw new NotFoundException('Payroll input not found');
+    if (!['DRAFT', 'SUBMITTED', 'APPROVED'].includes(input.status)) {
+      throw new BadRequestException(`A payroll input that is ${input.status.toLowerCase()} cannot be edited`);
+    }
+    if (input.status === 'APPROVED') {
+      const processedRun = await this.prisma.payrollRun.findFirst({
+        where: { tenantId, month: input.month, year: input.year, status: { not: 'DRAFT' } },
+      });
+      if (processedRun) {
+        throw new BadRequestException('Payroll for this period has already been processed; this input is locked');
+      }
+    }
+    const updated = await this.prisma.payrollVariableInput.update({
+      where: { id },
+      data: {
+        ...(dto.label !== undefined && { label: dto.label }),
+        ...(dto.amount !== undefined && { amount: dto.amount }),
+        ...(dto.taxable !== undefined && { taxable: dto.taxable }),
+      },
+    });
+    await this.audit(tenantId, actorId, 'PAYROLL_INPUT_UPDATED', 'PayrollVariableInput', id, input, updated);
+    return updated;
+  }
+
+  /** Approve/reject a pending input, e.g. attendance-generated overtime, before it can be picked up by payroll processing. */
+  async decidePayrollInput(tenantId: string, actorId: string | undefined, id: string, status: 'APPROVED' | 'REJECTED') {
+    const input = await this.prisma.payrollVariableInput.findFirst({ where: { id, tenantId } });
+    if (!input) throw new NotFoundException('Payroll input not found');
+    if (!['DRAFT', 'SUBMITTED'].includes(input.status)) {
+      throw new BadRequestException(`A payroll input that is ${input.status.toLowerCase()} cannot be ${status.toLowerCase()}`);
+    }
+    const updated = await this.prisma.payrollVariableInput.update({ where: { id }, data: { status } });
+    await this.audit(tenantId, actorId, `PAYROLL_INPUT_${status}`, 'PayrollVariableInput', id, input, updated);
+    return updated;
   }
 
   private async attendanceWarningMap(tenantId: string, monthStart: Date, monthEnd: Date) {
@@ -1589,6 +1758,18 @@ export class PayrollService {
     const stored = this.payrollComponents(input.storedComponents);
     if (!stored.length) return this.calculator.calculateMonth(input);
     const proration = input.daysInMonth > 0 ? input.payableDays / input.daysInMonth : 1;
+    const { earnings, employer, basic, grossPay } = this.configuredEarnings(stored, proration);
+    const deductions = this.configuredDeductions(stored, grossPay, basic, proration, input.monthlyEmiDeduction);
+    const totalDeductions = round2(deductions.reduce((sum, component) => sum + component.monthly, 0));
+    return {
+      grossPay,
+      totalDeductions,
+      netPay: round2(grossPay - totalDeductions),
+      components: [...earnings, ...employer, ...deductions],
+    };
+  }
+
+  private configuredEarnings(stored: Array<{ code?: string; monthly?: number; name?: string; type?: string }>, proration: number) {
     const earnings = stored
       .filter((component) => component.type === 'EARNING')
       .map((component) => ({
@@ -1600,6 +1781,25 @@ export class PayrollService {
       }));
     const grossPay = round2(earnings.reduce((sum, component) => sum + component.monthly, 0));
     const basic = earnings.find((component) => component.code === 'BASIC')?.monthly ?? 0;
+    const employer = stored
+      .filter((component) => component.type === 'EMPLOYER_CONTRIBUTION')
+      .map((component) => ({
+        code: component.code ?? '',
+        name: component.name ?? component.code ?? '',
+        type: 'EMPLOYER_CONTRIBUTION' as const,
+        monthly: round2((component.monthly ?? 0) * proration),
+        annual: round2((component.monthly ?? 0) * 12),
+      }));
+    return { earnings, employer, basic, grossPay };
+  }
+
+  private configuredDeductions(
+    stored: Array<{ code?: string; monthly?: number; name?: string; type?: string }>,
+    grossPay: number,
+    basic: number,
+    proration: number,
+    monthlyEmiDeduction?: number,
+  ) {
     const deductions = stored
       .filter((component) => component.type === 'DEDUCTION' && component.code !== 'TDS')
       .map((component) => {
@@ -1618,24 +1818,82 @@ export class PayrollService {
         };
       })
       .filter((component) => component.monthly > 0);
-    if ((input.monthlyEmiDeduction ?? 0) > 0) {
+    if ((monthlyEmiDeduction ?? 0) > 0) {
       deductions.push({
         code: 'LOAN_EMI',
         name: 'Loan EMI',
         type: 'DEDUCTION',
-        monthly: round2(input.monthlyEmiDeduction ?? 0),
+        monthly: round2(monthlyEmiDeduction ?? 0),
         annual: 0,
       });
     }
-    const employer = stored
-      .filter((component) => component.type === 'EMPLOYER_CONTRIBUTION')
-      .map((component) => ({
-        code: component.code ?? '',
-        name: component.name ?? component.code ?? '',
-        type: 'EMPLOYER_CONTRIBUTION' as const,
-        monthly: round2((component.monthly ?? 0) * proration),
-        annual: round2((component.monthly ?? 0) * 12),
-      }));
+    return deductions;
+  }
+
+  /**
+   * Splits a payroll month across every EmployeeSalary record overlapping it. A mid-month
+   * revision (e.g. a raise effective the 11th) is prorated per effective-date segment instead
+   * of applying the latest salary to the whole month: each segment's earnings/employer
+   * components are computed from its own CTC/structure and its own share of payableDays, then
+   * statutory deductions (PF/ESI/PT/LWF/EMI) are computed once against the combined gross using
+   * the most recent segment's structure, so slab-based deductions aren't double-applied.
+   */
+  private calculateProratedMonth(input: {
+    salaries: Array<{ ctc: number; components: Prisma.JsonValue; effectiveFrom: Date; effectiveTo: Date | null }>;
+    payableDays: number;
+    daysInMonth: number;
+    monthStart: Date;
+    monthEnd: Date;
+    monthlyEmiDeduction?: number;
+  }) {
+    const { salaries, payableDays, daysInMonth, monthStart, monthEnd, monthlyEmiDeduction } = input;
+    if (salaries.length <= 1) {
+      const salary = salaries[0];
+      return this.calculateConfiguredMonth({
+        ctc: salary.ctc,
+        storedComponents: salary.components,
+        payableDays,
+        daysInMonth,
+        monthlyEmiDeduction,
+      });
+    }
+
+    const segments = salaries
+      .map((salary, index) => {
+        const segmentStart = salary.effectiveFrom > monthStart ? salary.effectiveFrom : monthStart;
+        const nextStart = salaries[index + 1]?.effectiveFrom;
+        const cappedEnd = salary.effectiveTo && salary.effectiveTo < monthEnd ? salary.effectiveTo : monthEnd;
+        const segmentEnd = nextStart && nextStart <= cappedEnd ? new Date(nextStart.getTime() - 86_400_000) : cappedEnd;
+        return { salary, days: this.inclusiveDayCount(segmentStart, segmentEnd) };
+      })
+      .filter((segment) => segment.days > 0);
+    const totalSegmentDays = segments.reduce((sum, segment) => sum + segment.days, 0) || daysInMonth;
+
+    let earnings: Array<{ code: string; name: string; type: 'EARNING'; monthly: number; annual: number }> = [];
+    let employer: Array<{ code: string; name: string; type: 'EMPLOYER_CONTRIBUTION'; monthly: number; annual: number }> = [];
+    for (const segment of segments) {
+      const stored = this.payrollComponents(segment.salary.components);
+      const segmentPayableDays = (payableDays * segment.days) / totalSegmentDays;
+      const proration = daysInMonth > 0 ? segmentPayableDays / daysInMonth : 0;
+      const segmentResult = stored.length
+        ? this.configuredEarnings(stored, proration)
+        : this.fallbackEarnings(segment.salary.ctc, proration);
+      earnings = this.mergeComponentLines(earnings, segmentResult.earnings);
+      employer = this.mergeComponentLines(employer, segmentResult.employer);
+    }
+    const grossPay = round2(earnings.reduce((sum, component) => sum + component.monthly, 0));
+    const basic = earnings.find((component) => component.code === 'BASIC')?.monthly ?? 0;
+
+    const latest = salaries[salaries.length - 1];
+    const latestStored = this.payrollComponents(latest.components);
+    const overallProration = daysInMonth > 0 ? payableDays / daysInMonth : 1;
+    const deductions = this.configuredDeductions(
+      latestStored.length ? latestStored : this.fallbackDeductionStubs(),
+      grossPay,
+      basic,
+      overallProration,
+      monthlyEmiDeduction,
+    );
     const totalDeductions = round2(deductions.reduce((sum, component) => sum + component.monthly, 0));
     return {
       grossPay,
@@ -1643,6 +1901,59 @@ export class PayrollService {
       netPay: round2(grossPay - totalDeductions),
       components: [...earnings, ...employer, ...deductions],
     };
+  }
+
+  /** Earnings/employer split for a salary that has no configured component structure, using the same default grid as PayrollCalculatorService. */
+  private fallbackEarnings(ctc: number, proration: number) {
+    const components = this.calculator.buildComponents(ctc);
+    const earnings = components
+      .filter((component) => component.type === 'EARNING')
+      .map((component) => ({
+        code: component.code,
+        name: component.name,
+        type: 'EARNING' as const,
+        monthly: round2(component.monthly * proration),
+        annual: component.annual,
+      }));
+    const employer = components
+      .filter((component) => component.type === 'EMPLOYER_CONTRIBUTION')
+      .map((component) => ({
+        code: component.code,
+        name: component.name,
+        type: 'EMPLOYER_CONTRIBUTION' as const,
+        monthly: round2(component.monthly * proration),
+        annual: component.annual,
+      }));
+    const grossPay = round2(earnings.reduce((sum, component) => sum + component.monthly, 0));
+    const basic = earnings.find((component) => component.code === 'BASIC')?.monthly ?? 0;
+    return { earnings, employer, basic, grossPay };
+  }
+
+  /** Deduction code stubs (PF/ESI/PT/LWF) to drive configuredDeductions when a salary has no configured components. */
+  private fallbackDeductionStubs() {
+    return [
+      { code: 'PF_EMP', name: 'Provident Fund (Employee)', monthly: 0, type: 'DEDUCTION' },
+      { code: 'ESI_EMP', name: 'ESI (Employee)', monthly: 0, type: 'DEDUCTION' },
+      { code: 'PT', name: 'Professional Tax', monthly: 0, type: 'DEDUCTION' },
+      { code: 'LWF', name: 'Labour Welfare Fund', monthly: 0, type: 'DEDUCTION' },
+    ];
+  }
+
+  private mergeComponentLines<T extends { code: string; name: string; type: string; monthly: number; annual: number }>(
+    existing: T[],
+    incoming: T[],
+  ): T[] {
+    const merged = [...existing];
+    for (const component of incoming) {
+      const match = merged.find((item) => item.code === component.code);
+      if (match) {
+        match.monthly = round2(match.monthly + component.monthly);
+        match.annual = round2(match.annual + component.annual);
+      } else {
+        merged.push({ ...component });
+      }
+    }
+    return merged;
   }
 
   private defaultSalaryComponents() {

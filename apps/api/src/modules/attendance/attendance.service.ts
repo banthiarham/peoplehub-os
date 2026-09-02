@@ -2822,7 +2822,7 @@ export class AttendanceService {
             label: `Attendance overtime (${Math.round((totals.overtimeMinutes / 60) * 10) / 10}h)`,
             amount: Math.round((totals.overtimeMinutes / 60) * 250 * 100) / 100,
             taxable: true,
-            status: 'APPROVED',
+            status: 'DRAFT',
             source: 'ATTENDANCE',
             metadata: { finalizationId: finalization.id, overtimeMinutes: totals.overtimeMinutes },
           },

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import { FastifyReply } from 'fastify';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -18,6 +18,7 @@ import {
   PageDto,
   PreviewSalaryStructureDto,
   RespondExpenseClarificationDto,
+  UpdatePayrollInputDto,
   UpsertSalaryStructureDto,
   WaiveLoanDto,
 } from './dto/payroll.dto';
@@ -121,6 +122,14 @@ export class PayrollController {
   @ApiOperation({ summary: 'Assign or revise an employee salary' })
   assignSalary(@CurrentUser() user: AuthUser, @Body() dto: AssignSalaryDto) {
     return this.payroll.assignSalary(user.tenantId, dto, user.userId);
+  }
+
+  @Delete('salaries/:id')
+  @Roles(...PAYROLL_ROLES)
+  @Scopes('payroll:write')
+  @ApiOperation({ summary: 'Delete a salary revision (blocked once payroll for its period is locked)' })
+  deleteSalary(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.payroll.deleteSalary(user.tenantId, id, user.userId);
   }
 
   @Get('runs')
@@ -312,6 +321,30 @@ export class PayrollController {
   @Scopes('payroll:write')
   createInput(@CurrentUser() user: AuthUser, @Body() dto: CreatePayrollInputDto) {
     return this.payroll.createPayrollInput(user.tenantId, user.userId, dto);
+  }
+
+  @Patch('inputs/:id')
+  @Roles(...PAYROLL_ROLES)
+  @Scopes('payroll:write')
+  @ApiOperation({ summary: 'Edit a pending payroll input (DRAFT/SUBMITTED) before it is approved' })
+  updateInput(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdatePayrollInputDto) {
+    return this.payroll.updatePayrollInput(user.tenantId, user.userId, id, dto);
+  }
+
+  @Patch('inputs/:id/approve')
+  @Roles(...PAYROLL_ROLES)
+  @Scopes('payroll:approve')
+  @ApiOperation({ summary: 'Approve a pending payroll input so it is included in payroll processing' })
+  approveInput(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.payroll.decidePayrollInput(user.tenantId, user.userId, id, 'APPROVED');
+  }
+
+  @Patch('inputs/:id/reject')
+  @Roles(...PAYROLL_ROLES)
+  @Scopes('payroll:approve')
+  @ApiOperation({ summary: 'Reject a pending payroll input' })
+  rejectInput(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.payroll.decidePayrollInput(user.tenantId, user.userId, id, 'REJECTED');
   }
 
   // The result set narrows to the caller: `PayrollService.listExpenses` returns only the
