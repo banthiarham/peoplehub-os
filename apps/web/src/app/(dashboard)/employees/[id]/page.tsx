@@ -88,6 +88,32 @@ const terminateInitial: TerminationFormState = {
   confirmName: '',
 };
 
+const bankFormInitial = {
+  accountHolderName: '',
+  accountNumber: '',
+  ifsc: '',
+};
+
+function hasBankDetailsValue(bankDetails: unknown) {
+  return (
+    !!bankDetails &&
+    typeof bankDetails === 'object' &&
+    Object.values(bankDetails as Record<string, unknown>).some(
+      (value) => value !== null && value !== undefined && value !== '',
+    )
+  );
+}
+
+function bankField(bankDetails: unknown, keys: string[]) {
+  if (!bankDetails || typeof bankDetails !== 'object') return '';
+  const record = bankDetails as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== null && value !== undefined && value !== '') return String(value);
+  }
+  return '';
+}
+
 interface DocumentRow {
   id: string;
   type: string;
@@ -124,6 +150,9 @@ export default function EmployeeProfilePage() {
   const [editForm, setEditForm] = useState(editInitial);
   const [terminateOpen, setTerminateOpen] = useState(false);
   const [terminateForm, setTerminateForm] = useState<TerminationFormState>(terminateInitial);
+  const [bankOpen, setBankOpen] = useState(false);
+  const [bankForm, setBankForm] = useState(bankFormInitial);
+  const canSeePendingChanges = allows(viewerFromSession(session), 'approveProfileChanges');
   // Held apart from `editForm`, whose values are all strings and get filtered
   // by `value !== ''` when the patch payload is built.
   const [authorizedLocationIds, setAuthorizedLocationIds] = useState<string[]>([]);
@@ -131,6 +160,16 @@ export default function EmployeeProfilePage() {
     queryKey: ['employees', id],
     queryFn: () => api.get(`/employees/${id}`).then((r) => r.data),
   });
+  // Server-backed, so the badge survives a reload rather than only lasting for the
+  // submitting session — the caller may not be the one who ends up approving it.
+  const { data: pendingChanges } = useQuery<Array<{ employeeId: string; fieldName: string }>>({
+    queryKey: ['employees', 'profile-changes', 'pending'],
+    queryFn: () => api.get('/employees/profile-changes/pending').then((r) => r.data),
+    enabled: canSeePendingChanges,
+  });
+  const bankPendingApproval = !!pendingChanges?.some(
+    (change) => change.employeeId === id && change.fieldName === 'bankDetails',
+  );
   const { data: options } = useQuery<EmployeeOptions>({
     queryKey: ['employees', 'options'],
     queryFn: () => api.get('/employees/meta/options').then((r) => r.data),
@@ -177,6 +216,31 @@ export default function EmployeeProfilePage() {
       queryClient.invalidateQueries({ queryKey: ['employees'] });
     },
     onError: () => toast('Could not update employee details', 'error'),
+  });
+  const updateBankDetails = useMutation({
+    mutationFn: () =>
+      api
+        .patch(`/employees/${id}`, {
+          bankDetails: {
+            accountHolderName: bankForm.accountHolderName.trim(),
+            accountNumber: bankForm.accountNumber.trim(),
+            ifsc: bankForm.ifsc.trim().toUpperCase(),
+          },
+        })
+        .then((r) => r.data as { pendingSensitiveChanges?: number }),
+    onSuccess: (data) => {
+      setBankOpen(false);
+      queryClient.invalidateQueries({ queryKey: ['employees', id] });
+      queryClient.invalidateQueries({ queryKey: ['employees', 'profile-changes', 'pending'] });
+      // Bank details are a sensitive field: a non-super-admin's change is queued for
+      // approval rather than applied, so the record won't show it until approved.
+      if ((data?.pendingSensitiveChanges ?? 0) > 0) {
+        toast('Bank details submitted — an admin must approve the change before it takes effect');
+      } else {
+        toast(hasBankDetails ? 'Bank details updated' : 'Bank details added');
+      }
+    },
+    onError: () => toast('Could not save bank details', 'error'),
   });
   const terminateEmployee = useMutation({
     mutationFn: () =>
@@ -261,6 +325,15 @@ export default function EmployeeProfilePage() {
   const terminateReady = canSubmitTermination(terminateForm, e, {
     pending: terminateEmployee.isPending,
   });
+  const hasBankDetails = hasBankDetailsValue(e.bankDetails);
+  const openBankDialog = () => {
+    setBankForm({
+      accountHolderName: bankField(e.bankDetails, ['accountHolderName', 'holderName', 'name']),
+      accountNumber: bankField(e.bankDetails, ['accountNumber', 'account', 'bankAccountNumber']),
+      ifsc: bankField(e.bankDetails, ['ifsc', 'bankIfsc']),
+    });
+    setBankOpen(true);
+  };
 
   return (
     <div className="space-y-4">
@@ -474,6 +547,55 @@ export default function EmployeeProfilePage() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={bankOpen} onOpenChange={setBankOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{hasBankDetails ? 'Edit bank details' : 'Add bank details'}</DialogTitle>
+            <DialogDescription>Used for salary payouts on this employee's payroll record.</DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              updateBankDetails.mutate();
+            }}
+            className="space-y-3"
+          >
+            <Input
+              value={bankForm.accountHolderName}
+              onChange={(event) => setBankForm((f) => ({ ...f, accountHolderName: event.target.value }))}
+              placeholder="Account holder name"
+              required
+            />
+            <Input
+              value={bankForm.accountNumber}
+              onChange={(event) => setBankForm((f) => ({ ...f, accountNumber: event.target.value }))}
+              placeholder="Account number"
+              required
+            />
+            <Input
+              value={bankForm.ifsc}
+              onChange={(event) => setBankForm((f) => ({ ...f, ifsc: event.target.value.toUpperCase() }))}
+              placeholder="IFSC"
+              required
+            />
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setBankOpen(false)}>Cancel</Button>
+              <Button
+                type="submit"
+                disabled={
+                  updateBankDetails.isPending ||
+                  !bankForm.accountHolderName.trim() ||
+                  !bankForm.accountNumber.trim() ||
+                  !bankForm.ifsc.trim()
+                }
+              >
+                {updateBankDetails.isPending ? 'Saving...' : 'Save bank details'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
           <Card>
@@ -519,7 +641,16 @@ export default function EmployeeProfilePage() {
               <Field label="UAN" value={e.uan ?? '—'} />
               <Field label="ESIC" value={e.esicNumber ?? '—'} />
               <Field label="Tax regime" value={e.taxRegime} />
-              <Field label="Bank details" value={summarizeObject(e.bankDetails)} />
+              <div>
+                <p className="text-xs text-ink-muted">Bank details</p>
+                <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                  <p className="font-medium">{summarizeObject(e.bankDetails)}</p>
+                  {bankPendingApproval && <Badge variant="warning">Pending approval</Badge>}
+                  <Button size="sm" variant="ghost" className="h-6 px-1.5 text-xs" onClick={openBankDialog}>
+                    {hasBankDetails ? 'Edit' : 'Add'}
+                  </Button>
+                </div>
+              </div>
             </CardContent>
           </Card>
 

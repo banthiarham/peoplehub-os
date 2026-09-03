@@ -92,22 +92,21 @@ describe('EmployeesService', () => {
     });
   });
 
-  it('lets tenant owners update legal entity directly while preserving approval for other sensitive fields', async () => {
+  it('lets tenant owners apply every sensitive field directly, same as super admins', async () => {
     const existing = {
       id: 'emp-1',
       tenantId: 'tenant-1',
       legalEntityId: 'entity-1',
       pan: 'OLDPAN1234',
+      bankDetails: null,
       status: 'ACTIVE',
     };
     const prisma = {
       employee: {
-        findFirst: jest
+        findFirst: jest.fn().mockResolvedValueOnce(existing),
+        update: jest
           .fn()
-          .mockResolvedValueOnce(existing)
-          .mockResolvedValueOnce({ id: 'requester-employee' })
-          .mockResolvedValueOnce({ id: 'approver-employee' }),
-        update: jest.fn().mockResolvedValue({ ...existing, legalEntityId: 'entity-2' }),
+          .mockResolvedValue({ ...existing, legalEntityId: 'entity-2', pan: 'NEWPAN1234', bankDetails: { ifsc: 'HDFC0001234' } }),
       },
       employeeProfileChange: { createMany: jest.fn() },
       approvalRequest: { create: jest.fn() },
@@ -118,19 +117,78 @@ describe('EmployeesService', () => {
     const result = await service.update(
       { ...user, roles: ['Tenant Owner'] },
       'emp-1',
-      { legalEntityId: 'entity-2', pan: 'NEWPAN1234' },
+      { legalEntityId: 'entity-2', pan: 'NEWPAN1234', bankDetails: { ifsc: 'HDFC0001234' } },
     );
 
-    expect(result.pendingSensitiveChanges).toBe(1);
+    expect(result.pendingSensitiveChanges).toBe(0);
     expect(prisma.employee.update).toHaveBeenCalledWith({
       where: { id: 'emp-1' },
-      data: { legalEntityId: 'entity-2' },
+      data: { legalEntityId: 'entity-2', pan: 'NEWPAN1234', bankDetails: { ifsc: 'HDFC0001234' } },
     });
-    expect(prisma.approvalRequest.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ requestData: { fields: ['pan'] } }),
-    });
+    expect(prisma.approvalRequest.create).not.toHaveBeenCalled();
     expect(prisma.employeeProfileChange.createMany).toHaveBeenCalledWith({
-      data: [expect.objectContaining({ fieldName: 'pan', approvedAt: null })],
+      data: [
+        expect.objectContaining({ fieldName: 'legalEntityId', approvedAt: expect.any(Date) }),
+        expect.objectContaining({ fieldName: 'pan', approvedAt: expect.any(Date) }),
+        expect.objectContaining({ fieldName: 'bankDetails', approvedAt: expect.any(Date) }),
+      ],
+    });
+  });
+
+  describe('rejectProfileChange', () => {
+    function harness(change: Record<string, unknown>) {
+      const employeeProfileChange = {
+        findFirst: jest.fn().mockResolvedValue(change),
+        update: jest.fn().mockResolvedValue({ ...change, rejectedById: 'user-2', rejectedAt: new Date() }),
+      };
+      const auditLog = { create: jest.fn() };
+      const tx = { employeeProfileChange, auditLog };
+      const prisma = {
+        employeeProfileChange,
+        auditLog,
+        $transaction: jest.fn((cb: (t: typeof tx) => unknown) => cb(tx)),
+      };
+      const service = new EmployeesService(prisma as any, {} as any, {} as any);
+      return { service, prisma };
+    }
+
+    it('marks a pending change rejected without touching the employee record', async () => {
+      const { service, prisma } = harness({
+        id: 'change-1',
+        employeeId: 'emp-1',
+        fieldName: 'bankDetails',
+        oldValue: null,
+        newValue: '{"ifsc":"HDFC0001234"}',
+        changedById: 'user-1',
+        reason: null,
+      });
+
+      await service.rejectProfileChange({ ...user, userId: 'user-2' }, 'change-1', 'Account holder name looks wrong');
+
+      expect(prisma.employeeProfileChange.update).toHaveBeenCalledWith({
+        where: { id: 'change-1' },
+        data: expect.objectContaining({
+          rejectedById: 'user-2',
+          rejectedAt: expect.any(Date),
+          reason: 'Account holder name looks wrong',
+        }),
+      });
+      expect(prisma.auditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ action: 'employee.profile_change.rejected' }) }),
+      );
+    });
+
+    it('blocks the maker from rejecting their own change', async () => {
+      const { service } = harness({
+        id: 'change-1',
+        employeeId: 'emp-1',
+        fieldName: 'pan',
+        changedById: 'user-1',
+      });
+
+      await expect(service.rejectProfileChange(user, 'change-1')).rejects.toThrow(
+        'Maker cannot reject their own change',
+      );
     });
   });
 

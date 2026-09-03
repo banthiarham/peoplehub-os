@@ -68,6 +68,7 @@ const EMPLOYEE_TEMPLATE_COLUMNS = [
   'aadhaar',
   'uan',
   'esicNumber',
+  'bankAccountHolderName',
   'bankAccountNumber',
   'bankIfsc',
   'salaryStructure',
@@ -252,6 +253,7 @@ export class SetupService {
             aadhaar: '',
             uan: '100200300400',
             esicNumber: '',
+            bankAccountHolderName: 'Aarav Sharma',
             bankAccountNumber: '123456789012',
             bankIfsc: 'HDFC0001234',
             salaryStructure: 'India Standard CTC',
@@ -805,8 +807,9 @@ export class SetupService {
   }
 
   private bankDetails(row: SetupEmployeeImportRowDto) {
-    if (!row.bankAccountNumber && !row.bankIfsc) return undefined;
+    if (!row.bankAccountHolderName && !row.bankAccountNumber && !row.bankIfsc) return undefined;
     return {
+      accountHolderName: row.bankAccountHolderName?.trim(),
       accountNumber: row.bankAccountNumber?.trim(),
       ifsc: row.bankIfsc?.trim().toUpperCase(),
     };
