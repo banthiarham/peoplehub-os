@@ -13,6 +13,7 @@ import {
   CreateDocumentDto,
   CreateEmployeeDto,
   CreateLifecycleEventDto,
+  RejectProfileChangeDto,
   TerminateEmployeeDto,
   UpdateEmployeeDto,
 } from './dto/create-employee.dto';
@@ -52,17 +53,28 @@ export class EmployeesController {
   }
 
   @Get('profile-changes/pending')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'HR Admin', 'Tenant Owner')
   @Scopes('employees:approve')
   pendingProfileChanges(@CurrentUser() user: AuthUser) {
     return this.employees.pendingProfileChanges(user);
   }
 
   @Patch('profile-changes/:id/approve')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'HR Admin', 'Tenant Owner')
   @Scopes('employees:approve')
   approveProfileChange(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.employees.approveProfileChange(user, id);
+  }
+
+  @Patch('profile-changes/:id/reject')
+  @Roles('Super Admin', 'HR Admin', 'Tenant Owner')
+  @Scopes('employees:approve')
+  rejectProfileChange(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: RejectProfileChangeDto,
+  ) {
+    return this.employees.rejectProfileChange(user, id, dto.reason);
   }
 
   @Get(':id')
@@ -107,7 +119,7 @@ export class EmployeesController {
   }
 
   @Patch(':id')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'HR Admin', 'Tenant Owner')
   @Scopes('employees:write')
   @ApiOperation({ summary: 'Update employee (audited)' })
   update(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateEmployeeDto) {

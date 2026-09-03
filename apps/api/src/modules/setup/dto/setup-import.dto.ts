@@ -103,6 +103,12 @@ export class SetupEmployeeImportRowDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(160)
+  bankAccountHolderName?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
   @Matches(/^\d{6,34}$/, { message: 'bankAccountNumber must contain 6 to 34 digits' })
   bankAccountNumber?: string;
 

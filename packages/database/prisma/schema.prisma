@@ -755,6 +755,8 @@ model EmployeeProfileChange {
   reason       String?
   approvedById String?
   approvedAt   DateTime?
+  rejectedById String?
+  rejectedAt   DateTime?
   createdAt    DateTime  @default(now())
 
   employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)

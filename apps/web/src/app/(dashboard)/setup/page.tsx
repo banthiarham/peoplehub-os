@@ -186,6 +186,7 @@ type EmployeeRow = {
   employmentType: string;
   pan: string;
   uan: string;
+  bankAccountHolderName: string;
   bankAccountNumber: string;
   bankIfsc: string;
   salaryStructure: string;
@@ -214,6 +215,7 @@ const emptyEmployeeRow: EmployeeRow = {
   employmentType: 'FULL_TIME',
   pan: '',
   uan: '',
+  bankAccountHolderName: '',
   bankAccountNumber: '',
   bankIfsc: '',
   salaryStructure: '',
@@ -266,6 +268,7 @@ const sampleEmployeeRows: EmployeeRow[] = [
     employmentType: 'FULL_TIME',
     pan: 'ABCDE1234F',
     uan: '100200300400',
+    bankAccountHolderName: 'Aarav Sharma',
     bankAccountNumber: '123456789012',
     bankIfsc: 'HDFC0001234',
     salaryStructure: 'India Standard CTC',
@@ -307,6 +310,7 @@ const fallbackEmployeeTemplate: TemplateResponse = {
     'employmentType',
     'pan',
     'uan',
+    'bankAccountHolderName',
     'bankAccountNumber',
     'bankIfsc',
     'salaryStructure',
@@ -1337,6 +1341,7 @@ function EmployeeRows({
                 <Input placeholder="PAN" value={row.pan} onChange={(e) => update(index, { pan: e.target.value.toUpperCase() })} />
                 <Input placeholder="UAN" value={row.uan} onChange={(e) => update(index, { uan: e.target.value })} />
               </div>
+              <Input placeholder="Account holder name" value={row.bankAccountHolderName} onChange={(e) => update(index, { bankAccountHolderName: e.target.value })} />
               <div className="grid grid-cols-2 gap-2">
                 <Input placeholder="Bank account" value={row.bankAccountNumber} onChange={(e) => update(index, { bankAccountNumber: e.target.value })} />
                 <Input placeholder="IFSC" value={row.bankIfsc} onChange={(e) => update(index, { bankIfsc: e.target.value.toUpperCase() })} />

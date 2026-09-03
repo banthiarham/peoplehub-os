@@ -461,9 +461,11 @@ export class PayrollService {
     const csv = toCsv(
       run.entries.map((entry) => {
         const bank = this.asRecord(entry.employee.bankDetails);
+        const employeeName = `${entry.employee.firstName} ${entry.employee.lastName}`;
         return {
           employeeCode: entry.employee.employeeCode,
-          employeeName: `${entry.employee.firstName} ${entry.employee.lastName}`,
+          employeeName,
+          accountHolderName: bank.accountHolderName ?? bank.holderName ?? bank.beneficiaryName ?? employeeName,
           accountNumber: bank.accountNumber ?? bank.account ?? '',
           ifsc: bank.ifsc ?? bank.ifscCode ?? '',
           bankName: bank.bankName ?? '',
