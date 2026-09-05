@@ -148,6 +148,22 @@ enum PayrollRunType {
   FULL_AND_FINAL
 }
 
+enum SalaryBasis {
+  CALENDAR_DAYS
+  FIXED_DAYS
+  WORKING_DAYS
+}
+
+enum CompOffUnusedTreatment {
+  PAY
+  UNPAID
+}
+
+enum CompOffUsagePeriod {
+  MONTHLY
+  ANNUAL
+}
+
 enum ApprovalStatus {
   PENDING
   APPROVED
@@ -319,6 +335,7 @@ model Tenant {
   leaveTypes                LeaveType[]
   leavePolicies             LeavePolicy[]
   salaryStructures          SalaryStructure[]
+  payrollPolicies           PayrollPolicy[]
   payrollRuns               PayrollRun[]
   workflows                 Workflow[]
   notifications             Notification[]
@@ -404,6 +421,7 @@ model Location {
   attendanceRules           AttendanceRule[]
   attendanceCaptureSettings AttendanceCaptureSetting[]
   leavePolicies             LeavePolicy[]
+  payrollPolicies           PayrollPolicy[]
   shiftAssignments          ShiftAssignment[]
   authorizedEmployees       EmployeeLocation[]
   punchEvents               AttendancePunchEvent[]
@@ -1322,6 +1340,30 @@ model CompOffGrant {
 }
 
 // ─── Module 6: Payroll ───────────────────────────────────────────────────────
+
+model PayrollPolicy {
+  id                         String                  @id @default(cuid())
+  tenantId                   String
+  locationId                 String?
+  salaryBasis                SalaryBasis             @default(CALENDAR_DAYS)
+  fixedDays                  Int?
+  overtimePaymentEnabled     Boolean                 @default(false)
+  compOffEnabled             Boolean                 @default(false)
+  compOffUnusedTreatment     CompOffUnusedTreatment  @default(UNPAID)
+  compOffUsagePeriod         CompOffUsagePeriod      @default(MONTHLY)
+  compOffCarryForwardEnabled Boolean                 @default(false)
+  isDefault                  Boolean                 @default(false)
+  createdAt                  DateTime                @default(now())
+  updatedAt                  DateTime                @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  location Location? @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, locationId])
+  @@index([tenantId])
+  @@index([locationId])
+  @@map("payroll_policies")
+}
 
 model SalaryStructure {
   id          String   @id @default(cuid())
