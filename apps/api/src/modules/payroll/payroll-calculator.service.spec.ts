@@ -40,7 +40,7 @@ describe('PayrollCalculatorService', () => {
 
   describe('calculateMonth', () => {
     it('computes gross, statutory deductions and net for a full month', () => {
-      const result = calc.calculateMonth({ ctc: 1200000, payableDays: 30, daysInMonth: 30 });
+      const result = calc.calculateMonth({ ctc: 1200000, payableDays: 30, denominatorDays: 30 });
       expect(result.grossPay).toBeGreaterThan(0);
       expect(result.netPay).toBeCloseTo(result.grossPay - result.totalDeductions, 1);
 
@@ -54,15 +54,15 @@ describe('PayrollCalculatorService', () => {
     });
 
     it('applies ESI for gross <= ₹21,000', () => {
-      const result = calc.calculateMonth({ ctc: 240000, payableDays: 30, daysInMonth: 30 });
+      const result = calc.calculateMonth({ ctc: 240000, payableDays: 30, denominatorDays: 30 });
       const esi = result.components.find((c) => c.code === 'ESI_EMP');
       expect(esi).toBeDefined();
       expect(esi!.monthly).toBeCloseTo(result.grossPay * 0.0075, 1);
     });
 
     it('prorates earnings by payable days (loss of pay)', () => {
-      const full = calc.calculateMonth({ ctc: 1200000, payableDays: 30, daysInMonth: 30 });
-      const half = calc.calculateMonth({ ctc: 1200000, payableDays: 15, daysInMonth: 30 });
+      const full = calc.calculateMonth({ ctc: 1200000, payableDays: 30, denominatorDays: 30 });
+      const half = calc.calculateMonth({ ctc: 1200000, payableDays: 15, denominatorDays: 30 });
       expect(half.grossPay).toBeCloseTo(full.grossPay / 2, 0);
     });
 
@@ -70,7 +70,7 @@ describe('PayrollCalculatorService', () => {
       const result = calc.calculateMonth({
         ctc: 1200000,
         payableDays: 30,
-        daysInMonth: 30,
+        denominatorDays: 30,
         monthlyEmiDeduction: 10000,
       });
       expect(result.components.find((c) => c.code === 'LOAN_EMI')?.monthly).toBe(10000);

@@ -28,6 +28,7 @@ import {
   WaiveLoanDto,
 } from './dto/payroll.dto';
 import { PayrollCalculatorService } from './payroll-calculator.service';
+import { SalaryDenominatorService } from './salary-denominator.service';
 
 /**
  * Employee statuses that may file a claim. Same set leave self-service accepts, so a
@@ -102,6 +103,7 @@ export class PayrollService {
     private readonly prisma: PrismaService,
     private readonly calculator: PayrollCalculatorService,
     private readonly tdsEngine: TdsEngineService,
+    private readonly denominators: SalaryDenominatorService,
   ) {}
 
   // ── Structures ────────────────────────────────────────────────────────────
@@ -656,9 +658,9 @@ export class PayrollService {
       throw new BadRequestException(`Run is ${run.status}; only DRAFT runs can be processed`);
     }
 
-    const daysInMonth = new Date(run.year, run.month, 0).getDate();
     const monthStart = new Date(Date.UTC(run.year, run.month - 1, 1));
     const monthEnd = new Date(Date.UTC(run.year, run.month, 0));
+    const calendarDays = monthEnd.getUTCDate();
 
     await this.prisma.payrollRun.update({ where: { id }, data: { status: 'PROCESSING' } });
     const employees = await this.prisma.employee.findMany({
@@ -701,6 +703,16 @@ export class PayrollService {
         },
       },
     });
+
+    // Salary denominator per employee, from the PayrollPolicy that applies at their location.
+    // Resolved before any entry is written so a misconfigured FIXED_DAYS policy fails the run
+    // outright instead of paying part of it on a denominator the policy did not ask for.
+    const denominators = await this.denominators.resolveForMonth(
+      tenantId,
+      run.month,
+      run.year,
+      employees.map((employee) => ({ id: employee.id, locationId: employee.locationId })),
+    );
 
     const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
     const attendanceLopByEmployee = await this.attendanceLossDayMap(tenantId, monthStart, monthEnd);
@@ -815,14 +827,24 @@ export class PayrollService {
 
       const attendanceLop = attendanceLopByEmployee.get(emp.id) ?? 0;
       if (attendanceLop > 0) warnings.push(`${attendanceLop} attendance LOP day(s) from finalized absences/half-days`);
-      const lopDays = Math.min((lwpByEmployee.get(emp.id) ?? 0) + attendanceLop, daysInMonth);
-      const payableDays = daysInMonth - lopDays;
+      // The configured denominator drives monthly salary -> daily salary -> LOP alike: LOP is
+      // capped at it so a full month of absence zeroes pay and never turns it negative. An
+      // unusable denominator still reports the LOP it found, capped at the calendar month.
+      const denominator = denominators.get(emp.id);
+      if (denominator?.error) errors.push(denominator.error);
+      const denominatorDays = denominator?.days ?? calendarDays;
+      const lopCap = denominator?.error ? calendarDays : denominatorDays;
+      const lopDays = Math.min((lwpByEmployee.get(emp.id) ?? 0) + attendanceLop, lopCap);
+      // Clamped rather than merely capped: an unusable denominator is 0 while its LOP is still
+      // reported against the calendar month, and payable days must never go negative even
+      // though that path writes a zeroed entry anyway.
+      const payableDays = Math.max(0, denominatorDays - lopDays);
       const dueLoans = emp.loans.map((loan) => ({
         ...loan,
         due: this.loanDueForMonth(loan, run.month, run.year),
       })).filter((loan) => loan.due > 0);
       const emi = dueLoans.reduce((s, l) => s + l.due, 0);
-      if (!salary) {
+      if (!salary || denominator?.error) {
         await this.prisma.payrollRunEmployee.upsert({
           where: { payrollRunId_employeeId: { payrollRunId: run.id, employeeId: emp.id } },
           create: {
@@ -855,7 +877,7 @@ export class PayrollService {
       const result = this.calculateProratedMonth({
         salaries,
         payableDays,
-        daysInMonth,
+        denominatorDays,
         monthStart,
         monthEnd,
         monthlyEmiDeduction: emi,
@@ -1760,12 +1782,12 @@ export class PayrollService {
     ctc: number;
     storedComponents: Prisma.JsonValue;
     payableDays: number;
-    daysInMonth: number;
+    denominatorDays: number;
     monthlyEmiDeduction?: number;
   }) {
     const stored = this.payrollComponents(input.storedComponents);
     if (!stored.length) return this.calculator.calculateMonth(input);
-    const proration = input.daysInMonth > 0 ? input.payableDays / input.daysInMonth : 1;
+    const proration = input.denominatorDays > 0 ? input.payableDays / input.denominatorDays : 1;
     const { earnings, employer, basic, grossPay } = this.configuredEarnings(stored, proration);
     const deductions = this.configuredDeductions(stored, grossPay, basic, proration, input.monthlyEmiDeduction);
     const totalDeductions = round2(deductions.reduce((sum, component) => sum + component.monthly, 0));
@@ -1849,19 +1871,19 @@ export class PayrollService {
   private calculateProratedMonth(input: {
     salaries: Array<{ ctc: number; components: Prisma.JsonValue; effectiveFrom: Date; effectiveTo: Date | null }>;
     payableDays: number;
-    daysInMonth: number;
+    denominatorDays: number;
     monthStart: Date;
     monthEnd: Date;
     monthlyEmiDeduction?: number;
   }) {
-    const { salaries, payableDays, daysInMonth, monthStart, monthEnd, monthlyEmiDeduction } = input;
+    const { salaries, payableDays, denominatorDays, monthStart, monthEnd, monthlyEmiDeduction } = input;
     if (salaries.length <= 1) {
       const salary = salaries[0];
       return this.calculateConfiguredMonth({
         ctc: salary.ctc,
         storedComponents: salary.components,
         payableDays,
-        daysInMonth,
+        denominatorDays,
         monthlyEmiDeduction,
       });
     }
@@ -1875,14 +1897,16 @@ export class PayrollService {
         return { salary, days: this.inclusiveDayCount(segmentStart, segmentEnd) };
       })
       .filter((segment) => segment.days > 0);
-    const totalSegmentDays = segments.reduce((sum, segment) => sum + segment.days, 0) || daysInMonth;
+    // Calendar span of each revision segment, used only to split payableDays between them.
+    // The denominator that turns those payable days into a proration stays the configured one.
+    const totalSegmentDays = segments.reduce((sum, segment) => sum + segment.days, 0) || denominatorDays;
 
     let earnings: Array<{ code: string; name: string; type: 'EARNING'; monthly: number; annual: number }> = [];
     let employer: Array<{ code: string; name: string; type: 'EMPLOYER_CONTRIBUTION'; monthly: number; annual: number }> = [];
     for (const segment of segments) {
       const stored = this.payrollComponents(segment.salary.components);
       const segmentPayableDays = (payableDays * segment.days) / totalSegmentDays;
-      const proration = daysInMonth > 0 ? segmentPayableDays / daysInMonth : 0;
+      const proration = denominatorDays > 0 ? segmentPayableDays / denominatorDays : 0;
       const segmentResult = stored.length
         ? this.configuredEarnings(stored, proration)
         : this.fallbackEarnings(segment.salary.ctc, proration);
@@ -1894,7 +1918,7 @@ export class PayrollService {
 
     const latest = salaries[salaries.length - 1];
     const latestStored = this.payrollComponents(latest.components);
-    const overallProration = daysInMonth > 0 ? payableDays / daysInMonth : 1;
+    const overallProration = denominatorDays > 0 ? payableDays / denominatorDays : 1;
     const deductions = this.configuredDeductions(
       latestStored.length ? latestStored : this.fallbackDeductionStubs(),
       grossPay,

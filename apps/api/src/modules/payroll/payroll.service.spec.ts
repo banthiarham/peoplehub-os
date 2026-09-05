@@ -5,6 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PayrollService } from './payroll.service';
+import { PayrollPolicyService } from './payroll-policy.service';
+import { SalaryDenominatorService } from './salary-denominator.service';
 import { AuthUser } from '../../common/types/auth-user';
 
 type FinalizationFixture = {
@@ -14,6 +16,15 @@ type FinalizationFixture = {
   locationId: string | null;
   status: string;
 };
+
+/**
+ * Denominator double for the specs that never reach `processRun`. An empty map leaves every
+ * employee on the calendar-days fallback, which is what those specs assumed before the
+ * denominator became configurable.
+ */
+function stubDenominators() {
+  return { resolveForMonth: jest.fn().mockResolvedValue(new Map()) };
+}
 
 /**
  * Minimal prisma double for `processRun`. The attendance finalization lookup
@@ -26,6 +37,13 @@ function buildProcessRunHarness(options: {
   leaveRequests?: Array<Record<string, unknown>>;
   employeeOverrides?: Record<string, unknown>;
   attendanceRecords?: Array<{ employeeId: string; status: string; isFinalized: boolean }>;
+  /** Resolved by the real PayrollPolicyService; null (the default) means CALENDAR_DAYS. */
+  payrollPolicies?: Array<Record<string, unknown>>;
+  holidays?: Date[];
+  /** Weekly offs of the shift every employee resolves to; undefined means "no shift". */
+  weeklyOffDays?: number[];
+  /** One entry per employee in the run, merged over the default fixture. */
+  extraEmployees?: Array<Record<string, unknown>>;
 } = {}) {
   const run = {
     id: 'run-1',
@@ -45,10 +63,10 @@ function buildProcessRunHarness(options: {
       update: jest.fn().mockResolvedValue(run),
     },
     employee: {
-      findMany: jest.fn().mockResolvedValue([
-        {
+      findMany: jest.fn().mockResolvedValue(
+        (options.extraEmployees ?? [{}]).map((overrides, index) => ({
           id: 'emp-1',
-          employeeCode: 'PH001',
+          employeeCode: `PH00${index + 1}`,
           firstName: 'Asha',
           lastName: 'Shah',
           status: 'ACTIVE',
@@ -65,8 +83,9 @@ function buildProcessRunHarness(options: {
           employeeSalaries: [{ ctc: 1200000, components: [] }],
           loans: [],
           ...options.employeeOverrides,
-        },
-      ]),
+          ...overrides,
+        })),
+      ),
       groupBy: jest.fn().mockResolvedValue([]),
     },
     attendanceRecord: {
@@ -117,6 +136,20 @@ function buildProcessRunHarness(options: {
       findMany: jest.fn().mockResolvedValue([]),
       upsert: jest.fn().mockResolvedValue({}),
     },
+    // Matched against the real `where` so location-scoped policies resolve by precedence
+    // instead of every lookup returning the same row.
+    payrollPolicy: {
+      findFirst: jest.fn(({ where }: { where: Record<string, unknown> }) =>
+        Promise.resolve(
+          (options.payrollPolicies ?? []).find((policy) =>
+            Object.entries(where).every(([key, value]) => policy[key] === value),
+          ) ?? null,
+        ),
+      ),
+    },
+    holiday: {
+      findMany: jest.fn().mockResolvedValue((options.holidays ?? []).map((date) => ({ date }))),
+    },
   };
   const calculator = {
     calculateMonth: jest.fn().mockReturnValue({
@@ -134,7 +167,21 @@ function buildProcessRunHarness(options: {
       { code: 'SA', type: 'EARNING', monthly: 50000 },
     ]),
   };
-  const service = new PayrollService(prisma as any, calculator as any, {} as any);
+  // The real policy + denominator services, so `processRun` exercises actual policy
+  // resolution and day counting rather than a stubbed number.
+  const shifts = {
+    resolverForRange: jest.fn().mockResolvedValue(() => ({
+      shift: options.weeklyOffDays ? { weeklyOffDays: options.weeklyOffDays } : null,
+      assignedLocationId: null,
+      assignment: null,
+    })),
+  };
+  const denominators = new SalaryDenominatorService(
+    prisma as any,
+    new PayrollPolicyService(prisma as any),
+    shifts as any,
+  );
+  const service = new PayrollService(prisma as any, calculator as any, {} as any, denominators as any);
   const entryFor = (employeeId: string) => {
     const call = prisma.payrollRunEmployee.upsert.mock.calls.find(
       ([args]: [{ create: { employeeId: string } }]) => args.create.employeeId === employeeId,
@@ -210,12 +257,12 @@ function salaryHarness(
     },
     auditLog: { create: jest.fn().mockResolvedValue({}) },
   };
-  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any) };
+  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any) };
 }
 
 describe('PayrollService', () => {
   it('rejects salary structures without a BASIC earning component', async () => {
-    const service = new PayrollService({} as any, {} as any, {} as any);
+    const service = new PayrollService({} as any, {} as any, {} as any, stubDenominators() as any);
 
     await expect(
       service.createStructure('tenant-1', 'user-1', {
@@ -247,7 +294,7 @@ describe('PayrollService', () => {
         }),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
 
     await expect(service.previewStructure('tenant-1', 'structure-1', { ctc: 1200000 })).resolves.toEqual(
       expect.objectContaining({
@@ -787,7 +834,7 @@ describe('PayrollService', () => {
         findMany: jest.fn().mockResolvedValue([{ errors: ['Missing active salary structure or CTC'] }]),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
 
     await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(
       BadRequestException,
@@ -808,7 +855,7 @@ describe('PayrollService', () => {
         findMany: jest.fn().mockResolvedValue([{ errors: [] }]),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
 
     await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).resolves.toEqual({
       id: 'run-1',
@@ -829,7 +876,7 @@ describe('PayrollService', () => {
         findMany: jest.fn().mockResolvedValue([{ errors: [], warnings: ['PAN missing'] }]),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
 
     await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(
       BadRequestException,
@@ -857,7 +904,7 @@ describe('PayrollService', () => {
         upsert: jest.fn().mockResolvedValue({}),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
 
     await expect(service.lockRun('tenant-1', 'run-1', 'user-1')).resolves.toEqual({
       id: 'run-1',
@@ -973,7 +1020,7 @@ describe('PayrollService', () => {
         slabsApplied: [],
       }),
     };
-    const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any);
+    const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any);
 
     await expect(service.processRun('tenant-1', 'run-1')).resolves.toEqual({
       processed: 1,
@@ -1054,7 +1101,7 @@ describe('PayrollService', () => {
           ]),
         },
       };
-      const service = new PayrollService(prisma as any, {} as any, {} as any);
+      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
 
       await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(
         BadRequestException,
@@ -1392,7 +1439,7 @@ describe('PayrollService', () => {
         payrollRun: { update: jest.fn().mockResolvedValue({}) },
         expenseClaim: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
       };
-      const service = new PayrollService(prisma as any, {} as any, {} as any);
+      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
       return { prisma, service, entries };
     }
 
@@ -1543,7 +1590,7 @@ describe('PayrollService', () => {
         },
         auditLog: { create: jest.fn().mockResolvedValue({}) },
       };
-      return { prisma, record, service: new PayrollService(prisma as any, {} as any, {} as any) };
+      return { prisma, record, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any) };
     }
 
     it('approves a DRAFT payroll input', async () => {
@@ -1671,6 +1718,252 @@ describe('PayrollService', () => {
     });
   });
 
+  /**
+   * The configured salary basis reaching the numbers payroll actually stores. July 2026 has 31
+   * calendar days and, starting on a Wednesday, 23 Mon-Fri working days.
+   */
+  describe('configurable salary denominator', () => {
+    const finalizedJuly = [
+      { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+    const policy = (overrides: Record<string, unknown>) => [
+      {
+        id: 'tenant-default',
+        tenantId: 'tenant-1',
+        locationId: null,
+        salaryBasis: 'CALENDAR_DAYS',
+        fixedDays: null,
+        ...overrides,
+      },
+    ];
+    const threeUnpaidDays = [
+      {
+        employeeId: 'emp-1',
+        days: 3,
+        fromDate: new Date(Date.UTC(2026, 6, 10)),
+        toDate: new Date(Date.UTC(2026, 6, 12)),
+      },
+    ];
+
+    it('keeps calendar-days behaviour when no policy is configured', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        leaveRequests: threeUnpaidDays,
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(3);
+      expect(entryFor('emp-1').payableDays).toBe(28);
+    });
+
+    it('pays a FIXED_DAYS month out of the configured 26 days', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(26);
+    });
+
+    it('deducts LOP from the FIXED_DAYS denominator, not the calendar month', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        leaveRequests: threeUnpaidDays,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(3);
+      expect(entryFor('emp-1').payableDays).toBe(23);
+    });
+
+    it('caps LOP at the configured denominator so pay floors at zero', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+        leaveRequests: [
+          {
+            employeeId: 'emp-1',
+            days: 40,
+            fromDate: new Date(Date.UTC(2026, 6, 1)),
+            toDate: new Date(Date.UTC(2026, 6, 31)),
+          },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(26);
+      expect(entryFor('emp-1').payableDays).toBe(0);
+    });
+
+    it('keeps a half day worth 0.5 LOP under a FIXED_DAYS policy', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0.5);
+      expect(entryFor('emp-1').payableDays).toBe(25.5);
+    });
+
+    it('pays a WORKING_DAYS month out of the scheduled days only', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'WORKING_DAYS' }),
+        weeklyOffDays: [0, 6],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').payableDays).toBe(23);
+    });
+
+    it('drops a holiday out of the WORKING_DAYS denominator', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'WORKING_DAYS' }),
+        weeklyOffDays: [0, 6],
+        holidays: [new Date(Date.UTC(2026, 6, 15))],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').payableDays).toBe(22);
+    });
+
+    it('fails the run when a FIXED_DAYS policy has no usable fixedDays', async () => {
+      const { service } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: null }),
+      });
+
+      await expect(service.processRun('tenant-1', 'run-1')).rejects.toThrow(BadRequestException);
+    });
+
+    it('resolves a denominator per employee, not one for the whole run', async () => {
+      // Same run, three locations: loc-fixed overrides to FIXED_DAYS 26, loc-working to
+      // WORKING_DAYS, and the third falls back to the tenant CALENDAR_DAYS default.
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        weeklyOffDays: [0, 6],
+        payrollPolicies: [
+          ...policy({ salaryBasis: 'CALENDAR_DAYS' }),
+          {
+            id: 'loc-fixed-policy',
+            tenantId: 'tenant-1',
+            locationId: 'loc-fixed',
+            salaryBasis: 'FIXED_DAYS',
+            fixedDays: 26,
+          },
+          {
+            id: 'loc-working-policy',
+            tenantId: 'tenant-1',
+            locationId: 'loc-working',
+            salaryBasis: 'WORKING_DAYS',
+            fixedDays: null,
+          },
+        ],
+        extraEmployees: [
+          { id: 'emp-calendar', employeeCode: 'PH-CAL', locationId: 'loc-other' },
+          { id: 'emp-fixed', employeeCode: 'PH-FIX', locationId: 'loc-fixed' },
+          { id: 'emp-working', employeeCode: 'PH-WRK', locationId: 'loc-working' },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-calendar').payableDays).toBe(31);
+      expect(entryFor('emp-fixed').payableDays).toBe(26);
+      expect(entryFor('emp-working').payableDays).toBe(23);
+    });
+
+    it('keeps each employee LOP against their own denominator in a mixed run', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          ...policy({ salaryBasis: 'CALENDAR_DAYS' }),
+          {
+            id: 'loc-fixed-policy',
+            tenantId: 'tenant-1',
+            locationId: 'loc-fixed',
+            salaryBasis: 'FIXED_DAYS',
+            fixedDays: 26,
+          },
+        ],
+        extraEmployees: [
+          { id: 'emp-calendar', employeeCode: 'PH-CAL', locationId: 'loc-other' },
+          { id: 'emp-fixed', employeeCode: 'PH-FIX', locationId: 'loc-fixed' },
+        ],
+        attendanceRecords: [
+          { employeeId: 'emp-calendar', status: 'HALF_DAY', isFinalized: true },
+          { employeeId: 'emp-fixed', status: 'HALF_DAY', isFinalized: true },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-calendar').lopDays).toBe(0.5);
+      expect(entryFor('emp-calendar').payableDays).toBe(30.5);
+      expect(entryFor('emp-fixed').lopDays).toBe(0.5);
+      expect(entryFor('emp-fixed').payableDays).toBe(25.5);
+    });
+
+    it('pays the rest of the run when one employee has no schedulable day', async () => {
+      // The tenant default stays CALENDAR_DAYS, which never consults shifts, so only the
+      // employee under the location WORKING_DAYS policy hits the all-week-off shift.
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        weeklyOffDays: [0, 1, 2, 3, 4, 5, 6],
+        payrollPolicies: [
+          ...policy({ salaryBasis: 'CALENDAR_DAYS' }),
+          {
+            id: 'loc-working-policy',
+            tenantId: 'tenant-1',
+            locationId: 'loc-working',
+            salaryBasis: 'WORKING_DAYS',
+            fixedDays: null,
+          },
+        ],
+        extraEmployees: [
+          { id: 'emp-ok', employeeCode: 'PH-OK', locationId: null },
+          { id: 'emp-broken', employeeCode: 'PH-BAD', locationId: 'loc-working' },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-broken').errors).toContainEqual(
+        expect.stringMatching(/no scheduled working day/i),
+      );
+      expect(entryFor('emp-broken').payableDays).toBe(0);
+      // The healthy employee is paid normally rather than the whole run failing.
+      expect(entryFor('emp-ok').payableDays).toBe(31);
+      expect(entryFor('emp-ok').errors).toEqual([]);
+    });
+
+    it('records an error instead of paying when WORKING_DAYS schedules nothing', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'WORKING_DAYS' }),
+        weeklyOffDays: [0, 1, 2, 3, 4, 5, 6],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').errors).toContainEqual(expect.stringMatching(/no scheduled working day/i));
+      expect(entryFor('emp-1').payableDays).toBe(0);
+    });
+  });
+
   describe('mid-month salary revision proration', () => {
     const finalizedJuly = [
       { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
@@ -1743,7 +2036,7 @@ describe('PayrollService', () => {
   });
 
   it('exports payroll GL lines from run component totals', async () => {
-    const service = new PayrollService({} as any, {} as any, {} as any);
+    const service = new PayrollService({} as any, {} as any, {} as any, stubDenominators() as any);
     jest.spyOn(service, 'getRun').mockResolvedValue({
       id: 'run-1',
       month: 7,
@@ -1854,7 +2147,7 @@ function expenseHarness(options: {
     },
     auditLog: { create: jest.fn().mockResolvedValue({}) },
   };
-  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any) };
+  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any) };
 }
 
 describe('expense claims', () => {

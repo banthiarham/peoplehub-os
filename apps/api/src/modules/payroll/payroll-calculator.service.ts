@@ -11,7 +11,13 @@ export interface ComponentLine {
 export interface MonthlyPayrollInput {
   ctc: number; // annual
   payableDays: number;
-  daysInMonth: number;
+  /**
+   * Days the monthly salary is divided by, from the tenant's `PayrollPolicy.salaryBasis`.
+   * Equals the calendar days of the month under the default CALENDAR_DAYS basis, but is a
+   * fixed count (FIXED_DAYS) or the employee's scheduled working days (WORKING_DAYS)
+   * otherwise - so it is deliberately not named after the calendar.
+   */
+  denominatorDays: number;
   monthlyEmiDeduction?: number;
 }
 
@@ -70,7 +76,7 @@ export class PayrollCalculatorService {
   }
 
   calculateMonth(input: MonthlyPayrollInput): MonthlyPayrollResult {
-    const proration = input.daysInMonth > 0 ? input.payableDays / input.daysInMonth : 1;
+    const proration = input.denominatorDays > 0 ? input.payableDays / input.denominatorDays : 1;
     const full = this.buildComponents(input.ctc);
     const earnings = full
       .filter((c) => c.type === 'EARNING')

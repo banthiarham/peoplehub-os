@@ -4,7 +4,7 @@ import { PrismaService } from '../../common/database/prisma.service';
 import { UpsertPayrollPolicyDto } from './dto/payroll-policy.dto';
 
 /** Upper bound for `fixedDays`: a payable-day count is a day count within one month. */
-const MAX_FIXED_DAYS = 31;
+export const MAX_FIXED_DAYS = 31;
 
 /**
  * In-code fallback applied when a tenant has configured no payroll policy at all.
