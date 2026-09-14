@@ -4439,15 +4439,27 @@ describe('AttendanceService', () => {
 });
 
 describe('manual comp-off grants', () => {
+  /**
+   * `updateMany`/`findFirstOrThrow` back `decideCompOff`'s atomic transition; `shiftAssignment`/
+   * `shift` back the weekly-off check `USED` now runs. A five-day week (Sat/Sun off) is the
+   * default so a plain weekday `usedOnDate` needs no per-test shift fixture.
+   */
   function compOffHarness(overrides: Record<string, any> = {}) {
+    let grantRow: Record<string, unknown> | null = null;
     const prisma = {
       employee: { findFirst: jest.fn().mockResolvedValue({ id: 'emp-1' }) },
       attendanceRecord: { findUnique: jest.fn().mockResolvedValue(null) },
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue(null),
+        findFirstOrThrow: jest.fn(() => Promise.resolve(grantRow)),
         create: jest.fn((args: any) => Promise.resolve({ id: 'grant-1', ...args.data })),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn((args: any) => {
+          grantRow = { id: args.where.id, ...args.data };
+          return Promise.resolve({ count: 1 });
+        }),
       },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       ...overrides,
     };
     return { prisma, service: newAttendanceService(prisma) };
@@ -4506,31 +4518,235 @@ describe('manual comp-off grants', () => {
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED', employeeId: 'emp-1', employee: { managerId: 'mgr-1' } }),
         create: jest.fn(),
-        update: jest.fn(),
+        updateMany: jest.fn(),
       },
     });
 
     await expect(
       service.decideCompOff(hrAdminUser, 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('already used');
-    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
   });
 
-  it('marks an available grant used', async () => {
+  it('marks an available grant used for a valid scheduled working date', async () => {
+    // 2026-08-17 is a Monday, in the same calendar month as the 2026-08-15 earned date.
     const { prisma, service } = compOffHarness({
       compOffGrant: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-1', employee: { managerId: 'mgr-1' } }),
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: new Date(Date.UTC(2026, 10, 13)),
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
         create: jest.fn(),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'USED',
+          usedOnDate: new Date(Date.UTC(2026, 7, 17)),
+        }),
       },
     });
 
-    await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never });
-
-    expect(prisma.compOffGrant.update).toHaveBeenCalledWith({
-      where: { id: 'grant-1' },
-      data: { status: 'USED' },
+    const result = await service.decideCompOff(hrAdminUser, 'grant-1', {
+      status: 'USED' as never,
+      usedOnDate: '2026-08-17',
     });
+
+    expect(prisma.compOffGrant.updateMany).toHaveBeenCalledWith({
+      where: { id: 'grant-1', status: 'AVAILABLE' },
+      data: { status: 'USED', usedOnDate: new Date(Date.UTC(2026, 7, 17)) },
+    });
+    expect(result).toMatchObject({ status: 'USED', usedOnDate: new Date(Date.UTC(2026, 7, 17)) });
+  });
+
+  it('rejects marking a grant used without a usedOnDate', async () => {
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never }),
+    ).rejects.toThrow('usedOnDate is required');
+  });
+
+  it('rejects a weekly-off date as the usage date', async () => {
+    // 2026-08-15 is a Saturday - a weekly off on the default [0, 6] shift.
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 1)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-15' }),
+    ).rejects.toThrow('weekly off');
+  });
+
+  it('rejects a holiday as the usage date', async () => {
+    const { service } = compOffHarness({
+      holiday: { findMany: jest.fn().mockResolvedValue([{ date: new Date(Date.UTC(2026, 7, 17)) }]) },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 1)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
+    ).rejects.toThrow('holiday');
+  });
+
+  it('rejects usage in a later calendar month under a MONTHLY policy', async () => {
+    const { service } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'MONTHLY', compOffCarryForwardEnabled: false,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)), // August
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      // 2026-09-14 is a Monday, but a different calendar month than the August earned date.
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-09-14' }),
+    ).rejects.toThrow('same calendar month');
+  });
+
+  it('rejects usage in a later calendar year under an ANNUAL policy', async () => {
+    const { service } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: false,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 11, 15)), // December 2026
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      // Monday, but 2027 - a different calendar year than the December 2026 earned date.
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-04' }),
+    ).rejects.toThrow('same calendar year');
+  });
+
+  it('allows crossing the ANNUAL boundary when carry-forward is enabled and the grant has not expired', async () => {
+    const { service, prisma } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: true,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 11, 15)), // December 2026
+          expiresAt: new Date(Date.UTC(2027, 2, 15)), // still valid into 2027
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
+      },
+    });
+
+    await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-04' });
+
+    expect(prisma.compOffGrant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'USED' }) }),
+    );
+  });
+
+  it('still enforces the expiry ceiling when carry-forward is enabled', async () => {
+    const { service } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: true,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 11, 15)), // December 2026
+          expiresAt: new Date(Date.UTC(2027, 0, 1)), // expires Jan 1, 2027
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-04' }),
+    ).rejects.toThrow('expired');
+  });
+
+  it('does not create a duplicate use when the same grant is decided twice', async () => {
+    // The second call observes the grant already USED via the where-guarded updateMany
+    // returning zero rows affected - the concurrent-decision path, not a fresh lookup race.
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
+    ).rejects.toThrow('already decided');
   });
 });
 
@@ -4539,8 +4755,13 @@ describe('decideCompOff authorization', () => {
     const prisma = {
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue(null),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn((args: { where: { id: string } }) =>
+          Promise.resolve({ id: args.where.id, status: 'USED' }),
+        ),
       },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       ...overrides,
     };
     return { prisma, service: newAttendanceService(prisma) };
@@ -4559,14 +4780,14 @@ describe('decideCompOff authorization', () => {
         findFirst: jest.fn().mockResolvedValue({
           id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-mgr', employee: { managerId: 'emp-grandmgr' },
         }),
-        update: jest.fn(),
+        updateMany: jest.fn(),
       },
     });
 
     await expect(
       service.decideCompOff(manager(), 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('You cannot approve your own request.');
-    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
   });
 
   it('denies a Manager deciding a comp-off outside their team', async () => {
@@ -4575,29 +4796,36 @@ describe('decideCompOff authorization', () => {
         findFirst: jest.fn().mockResolvedValue({
           id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-target', employee: { managerId: 'someone-else' },
         }),
-        update: jest.fn(),
+        updateMany: jest.fn(),
       },
     });
 
     await expect(
       service.decideCompOff(manager(), 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('You can only approve requests from employees who report to you.');
-    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
   });
 
   it('lets a Manager decide a direct report comp-off', async () => {
     const { prisma, service } = compOffHarness({
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue({
-          id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-target', employee: { managerId: 'emp-mgr' },
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-target',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: null,
+          employee: { managerId: 'emp-mgr', locationId: null },
         }),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
       },
     });
 
-    await service.decideCompOff(manager(), 'grant-1', { status: 'USED' as never });
+    // 2026-08-17 is a Monday in the same calendar month as the grant's earned date.
+    await service.decideCompOff(manager(), 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' });
 
-    expect(prisma.compOffGrant.update).toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
   });
 });
 

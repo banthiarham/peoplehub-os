@@ -16,6 +16,7 @@ import {
   Max,
   MaxLength,
   Min,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
 import {
@@ -863,6 +864,15 @@ export class DecideCompOffDto {
   @ApiProperty({ enum: [CompOffStatus.USED, CompOffStatus.CANCELLED, CompOffStatus.EXPIRED] })
   @IsEnum(CompOffStatus)
   status!: CompOffStatus;
+
+  @ApiPropertyOptional({
+    description:
+      'The scheduled working date this comp-off is used for. Required when status is USED; ' +
+      'rejected for any other status.',
+  })
+  @ValidateIf((dto: DecideCompOffDto) => dto.status === CompOffStatus.USED)
+  @IsDateString()
+  usedOnDate?: string;
 
   @ApiPropertyOptional()
   @IsOptional()

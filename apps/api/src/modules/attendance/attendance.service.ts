@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -9,6 +10,7 @@ import {
   AttendanceCaptureMode,
   AttendanceStatus,
   CompOffStatus,
+  CompOffUsagePeriod,
   Prisma,
   PunchDirection,
   ShiftSwapStatus,
@@ -2981,21 +2983,120 @@ export class AttendanceService {
     });
   }
 
-  /** Marks a grant used, cancelled or expired. Only an available grant can move. */
+  /**
+   * Marks a grant used, cancelled or expired. Only an available grant can move.
+   *
+   * `USED` additionally requires `usedOnDate` — the specific scheduled working day the
+   * comp-off is being spent against — validated by {@link validateCompOffUsage}: it must
+   * fall in the same usage period as `earnedDate` (or, with carry-forward on, no later than
+   * the grant's own `expiresAt`), and it must be a day the employee was actually scheduled
+   * to work, not a weekly off or holiday. An available balance alone never grants usage;
+   * the work date must be named.
+   *
+   * The transition is applied with `updateMany` gated on `status: AVAILABLE`, so a grant
+   * decided twice concurrently only ever moves once — the loser gets a 409, not a silently
+   * duplicated use — the same optimistic-concurrency pattern `respondToClarification` uses
+   * for expense claims.
+   */
   async decideCompOff(user: AuthUser, id: string, dto: DecideCompOffDto) {
     const grant = await this.prisma.compOffGrant.findFirst({
       where: { id, tenantId: user.tenantId },
-      include: { employee: { select: { managerId: true } } },
+      include: { employee: { select: { managerId: true, locationId: true } } },
     });
     if (!grant) throw new NotFoundException('Comp-off not found');
     if (grant.status !== CompOffStatus.AVAILABLE) {
       throw new BadRequestException(`This comp-off is already ${grant.status.toLowerCase()}`);
     }
     assertCanDecideApproval(user, grant.employeeId, grant.employee.managerId);
-    return this.prisma.compOffGrant.update({
-      where: { id },
-      data: { status: dto.status, ...(dto.notes && { notes: dto.notes }) },
+
+    const usedOnDate =
+      dto.status === CompOffStatus.USED
+        ? await this.validateCompOffUsage(user.tenantId, grant, dto.usedOnDate)
+        : undefined;
+
+    const { count } = await this.prisma.compOffGrant.updateMany({
+      where: { id, status: CompOffStatus.AVAILABLE },
+      data: {
+        status: dto.status,
+        ...(usedOnDate && { usedOnDate }),
+        ...(dto.notes && { notes: dto.notes }),
+      },
     });
+    if (count === 0) {
+      throw new ConflictException('This comp-off was already decided. Reload it to see where it stands.');
+    }
+    return this.prisma.compOffGrant.findFirstOrThrow({ where: { id } });
+  }
+
+  /**
+   * Validates a comp-off usage request and returns the day it resolves to.
+   *
+   * Usage-period rule (from `PayrollPolicy.compOffUsagePeriod`, resolved for the employee's
+   * location): `usedOnDate` must fall in the same calendar month (`MONTHLY`) or calendar year
+   * (`ANNUAL`) as `earnedDate`. `compOffCarryForwardEnabled` governs only whether crossing
+   * that period boundary is allowed at all — it does not relax anything else. When it does
+   * allow crossing, the grant's own `expiresAt` (already set at grant time, independent of
+   * this policy) remains the outer limit: carry-forward lets the grant survive into the next
+   * period, not indefinitely.
+   */
+  private async validateCompOffUsage(
+    tenantId: string,
+    grant: {
+      employeeId: string;
+      earnedDate: Date;
+      expiresAt: Date | null;
+      employee: { locationId: string | null };
+    },
+    usedOnDateInput?: string,
+  ): Promise<Date> {
+    if (!usedOnDateInput) {
+      throw new BadRequestException('usedOnDate is required to mark a comp-off used');
+    }
+    const usedOnDate = requireAttendanceDate(usedOnDateInput, 'usedOnDate');
+
+    const policy = await this.payrollPolicies.resolve(tenantId, grant.employee.locationId);
+    const samePeriod = this.compOffUsagePeriodMatches(
+      policy.compOffUsagePeriod,
+      grant.earnedDate,
+      usedOnDate,
+    );
+    if (!samePeriod) {
+      if (!policy.compOffCarryForwardEnabled) {
+        const unit = policy.compOffUsagePeriod === CompOffUsagePeriod.ANNUAL ? 'calendar year' : 'calendar month';
+        throw new BadRequestException(`This comp-off must be used within the same ${unit} it was earned in`);
+      }
+      // Carry-forward lets usage cross into a later period, but never past the grant's own
+      // expiry — the same ceiling that already governs every grant regardless of this policy.
+      if (grant.expiresAt && usedOnDate > grant.expiresAt) {
+        throw new BadRequestException('This comp-off has expired and can no longer be used');
+      }
+    }
+
+    const { isWeeklyOff } = await this.weeklyOffAt(tenantId, grant.employeeId, usedOnDate);
+    if (isWeeklyOff) {
+      throw new BadRequestException('A comp-off cannot be used on a weekly off');
+    }
+    const dayKey = usedOnDate.toISOString().slice(0, 10);
+    const isHoliday = (await this.holidayDateSet(tenantId, usedOnDate, usedOnDate)).has(dayKey);
+    if (isHoliday) {
+      throw new BadRequestException('A comp-off cannot be used on a holiday');
+    }
+
+    return usedOnDate;
+  }
+
+  /**
+   * Whether `usedOnDate` falls in the same usage period as `earnedDate`: the same calendar
+   * month for `MONTHLY`, the same calendar year for `ANNUAL`.
+   */
+  private compOffUsagePeriodMatches(
+    period: CompOffUsagePeriod,
+    earnedDate: Date,
+    usedOnDate: Date,
+  ): boolean {
+    if (earnedDate.getUTCFullYear() !== usedOnDate.getUTCFullYear()) return false;
+    if (period === CompOffUsagePeriod.ANNUAL) return true;
+    return earnedDate.getUTCMonth() === usedOnDate.getUTCMonth();
   }
 
   async listShiftSwaps(user: AuthUser) {

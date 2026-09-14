@@ -1325,6 +1325,9 @@ model CompOffGrant {
   earnedDate               DateTime      @db.Date
   days                     Float         @default(1)
   expiresAt                DateTime?
+  /// The scheduled working date this grant was used against. Set together with
+  /// `status: USED`; null for every other status.
+  usedOnDate               DateTime?     @db.Date
   status                   CompOffStatus @default(AVAILABLE)
   notes                    String?
   createdAt                DateTime      @default(now())
