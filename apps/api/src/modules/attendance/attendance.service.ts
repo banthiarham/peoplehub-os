@@ -23,6 +23,7 @@ import {
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
 import { NON_WORKING_ATTENDANCE_STATUSES } from '../../common/utils/employment-status';
+import { PayrollPolicyService } from '../payroll/payroll-policy.service';
 import { AttendanceQrService } from './attendance-qr.service';
 import { DeviceBindingService } from './device-binding.service';
 import { haversineMeters } from './geo-distance';
@@ -186,6 +187,7 @@ export class AttendanceService {
     private readonly shifts: ShiftResolutionService,
     private readonly devices: DeviceBindingService,
     private readonly qr: AttendanceQrService,
+    private readonly payrollPolicies: PayrollPolicyService,
   ) {}
 
   private requireEmployee(user: AuthUser): string {
@@ -2779,6 +2781,8 @@ export class AttendanceService {
         },
       });
     }
+    const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
+    const compOffPolicyCache = new Map<string, boolean>();
     const byEmployee = new Map<string, { overtimeMinutes: number; allowance: number }>();
     for (const record of records) {
       const current = byEmployee.get(record.employeeId) ?? { overtimeMinutes: 0, allowance: 0 };
@@ -2786,28 +2790,11 @@ export class AttendanceService {
       if (record.shift?.shiftAllowanceAmount && ['PRESENT', 'LATE', 'HALF_DAY'].includes(record.status)) {
         current.allowance += record.shift.shiftAllowanceAmount;
       }
-      if (
-        record.shift?.compOffEligible &&
-        ['WEEKEND', 'HOLIDAY'].includes(record.status) &&
-        (record.workingMinutes ?? 0) >= Math.min(record.shift.halfDayAfterMinutes, record.shift.minWorkingMinutes)
-      ) {
-        await this.prisma.compOffGrant.upsert({
-          where: { id: `${record.id}` },
-          create: {
-            tenantId,
-            employeeId: record.employeeId,
-            sourceAttendanceRecordId: record.id,
-            earnedDate: record.date,
-            days: 1,
-            expiresAt: new Date(record.date.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
-            notes: 'Generated from finalized weekend/holiday work',
-          },
-          update: {},
-        }).catch(async () => {
-          const existingGrant = await this.prisma.compOffGrant.findFirst({ where: { sourceAttendanceRecordId: record.id } });
-          return existingGrant;
-        });
-      }
+      await this.grantAutomaticCompOff(tenantId, record, {
+        holidaySet,
+        locationByEmployee,
+        compOffPolicyCache,
+      });
       byEmployee.set(record.employeeId, current);
     }
     for (const [employeeId, totals] of byEmployee.entries()) {
@@ -2865,10 +2852,88 @@ export class AttendanceService {
   }
 
   /**
-   * Manually credits a comp-off. HR needs this because the automatic grant only
-   * fires at month finalization, and only for days the system itself classified
-   * as weekly-off or holiday work — an ad-hoc credit (an on-call Sunday, a day
-   * worked before the tenant's holiday calendar was loaded) has no other route.
+   * Automatically credits a comp-off for one finalized attendance record, if the tenant's
+   * payroll policy, the employee's shift and the day itself all qualify.
+   *
+   * The day's calendar classification — weekly off or holiday — is computed here directly
+   * from the shift and the holiday calendar, independently of `record.status`. A day the
+   * employee actually punched is classified `PRESENT`/`LATE`/`HALF_DAY` by worked-minutes
+   * alone (see `classifyAttendanceStatus`) and never becomes `WEEKEND`/`HOLIDAY` — those
+   * statuses are written only for days with no punches at all — so gating on the final
+   * status would never grant anything for a day that was actually worked.
+   *
+   * Idempotent by construction: a comp-off already linked to this attendance record (via
+   * `sourceAttendanceRecordId`) is left alone, so re-finalizing the same month never grants
+   * twice. `AttendanceRecord` is unique per `(employeeId, date)` and finalization only
+   * updates existing records rather than recreating them, so a record's id is a stable key
+   * across repeated finalizations of the same day.
+   */
+  private async grantAutomaticCompOff(
+    tenantId: string,
+    record: Prisma.AttendanceRecordGetPayload<{ include: { shift: true } }>,
+    context: {
+      holidaySet: Set<string>;
+      locationByEmployee: Map<string, string | null>;
+      compOffPolicyCache: Map<string, boolean>;
+    },
+  ): Promise<void> {
+    const shift = record.shift;
+    if (!shift?.compOffEligible) return;
+
+    const dayKey = record.date.toISOString().slice(0, 10);
+    const dayOfWeek = record.date.getUTCDay();
+    const isWeeklyOff = shift.weeklyOffDays.includes(dayOfWeek);
+    const isHoliday = context.holidaySet.has(dayKey);
+    if (!isWeeklyOff && !isHoliday) return;
+
+    const qualifyingMinutes = Math.min(shift.halfDayAfterMinutes, shift.minWorkingMinutes);
+    if ((record.workingMinutes ?? 0) < qualifyingMinutes) return;
+
+    const locationId = context.locationByEmployee.get(record.employeeId) ?? null;
+    const locationKey = locationId ?? '';
+    let compOffEnabled = context.compOffPolicyCache.get(locationKey);
+    if (compOffEnabled === undefined) {
+      const policy = await this.payrollPolicies.resolve(tenantId, locationId);
+      compOffEnabled = policy.compOffEnabled;
+      context.compOffPolicyCache.set(locationKey, compOffEnabled);
+    }
+    if (!compOffEnabled) return;
+
+    // Matched by attendance record first — the stable idempotency key across re-finalizations
+    // of this exact day — and, as a fallback, by the same (employeeId, earnedDate, AVAILABLE|
+    // USED) guard `createCompOff` uses. The fallback exists for a grant credited manually
+    // before this attendance record existed (so it carries no `sourceAttendanceRecordId`),
+    // which would otherwise not be found by the first check alone.
+    const alreadyGranted = await this.prisma.compOffGrant.findFirst({
+      where: {
+        tenantId,
+        employeeId: record.employeeId,
+        OR: [
+          { sourceAttendanceRecordId: record.id },
+          { earnedDate: record.date, status: { in: [CompOffStatus.AVAILABLE, CompOffStatus.USED] } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (alreadyGranted) return;
+
+    await this.prisma.compOffGrant.create({
+      data: {
+        tenantId,
+        employeeId: record.employeeId,
+        sourceAttendanceRecordId: record.id,
+        earnedDate: record.date,
+        days: 1,
+        expiresAt: new Date(record.date.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+        notes: isHoliday ? 'Generated from finalized holiday work' : 'Generated from finalized weekly-off work',
+      },
+    });
+  }
+
+  /**
+   * Manually credits a comp-off. HR needs this for a credit outside the automatic path —
+   * an ad-hoc grant (an on-call day, a day worked before the tenant's holiday calendar was
+   * loaded, a correction) — or for a tenant with `PayrollPolicy.compOffEnabled` off.
    *
    * The earned day is linked to its attendance record when one exists, so the
    * grant and the day it was earned on stay traceable to each other, and a
