@@ -715,7 +715,10 @@ export class PayrollService {
     );
 
     const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
-    const attendanceLopByEmployee = await this.attendanceLossDayMap(tenantId, monthStart, monthEnd);
+    // Attendance-absence and LWP LOP, broken down per date rather than summed per employee,
+    // so a used Comp-Off's `usedOnDate` can offset the exact day it names (see processing
+    // loop below) instead of being netted against the employee's total.
+    const lopContributions = await this.lopContributionsByDate(tenantId, monthStart, monthEnd);
     const attendanceFinalized =
       run.runType === 'MONTHLY' ? await this.hasMonthlyAttendanceFinalization(run) : true;
     const taxYear = await this.activeTaxYear(tenantId, monthStart, monthEnd);
@@ -729,72 +732,70 @@ export class PayrollService {
         )
       : null;
 
-    // Unpaid leave days (LWP) reduce payable days
-    const lwpRequests = await this.prisma.leaveRequest.findMany({
-      where: {
-        tenantId,
-        status: 'APPROVED',
-        leaveType: { isPaid: false },
-        fromDate: { lte: monthEnd },
-        toDate: { gte: monthStart },
-      },
-      select: { employeeId: true, days: true, fromDate: true, toDate: true },
-    });
-    const lwpByEmployee = new Map<string, number>();
-    for (const r of lwpRequests) {
-      const daysInPeriod = this.leaveDaysInPeriod(r, monthStart, monthEnd);
-      if (daysInPeriod <= 0) continue;
-      lwpByEmployee.set(r.employeeId, (lwpByEmployee.get(r.employeeId) ?? 0) + daysInPeriod);
-    }
     const employeeIds = employees.map((employee) => employee.id);
-    const [variableInputs, payrollExpenses, pendingLeave, pendingExpenses, duplicateCodes] = await Promise.all([
-      this.prisma.payrollVariableInput.findMany({
-        where: {
-          tenantId,
-          employeeId: { in: employeeIds },
-          status: 'APPROVED',
-          OR: [
-            { payrollRunId: run.id },
-            { payrollRunId: null, month: run.month, year: run.year },
-          ],
-        },
-      }),
-      this.prisma.expenseClaim.findMany({
-        where: {
-          tenantId,
-          employeeId: { in: employeeIds },
-          status: 'APPROVED',
-          reimbursementMethod: 'PAYROLL',
-        },
-      }),
-      this.prisma.leaveRequest.groupBy({
-        by: ['employeeId'],
-        where: {
-          tenantId,
-          employeeId: { in: employeeIds },
-          status: 'PENDING',
-          fromDate: { lte: monthEnd },
-          toDate: { gte: monthStart },
-        },
-        _count: true,
-      }),
-      this.prisma.expenseClaim.groupBy({
-        by: ['employeeId'],
-        where: { tenantId, employeeId: { in: employeeIds }, status: { in: ['SUBMITTED', 'CLARIFICATION_REQUESTED'] } },
-        _count: true,
-      }),
-      this.prisma.employee.groupBy({
-        by: ['employeeCode'],
-        where: { tenantId },
-        _count: true,
-        having: { employeeCode: { _count: { gt: 1 } } },
-      }),
-    ]);
+    const [variableInputs, payrollExpenses, pendingLeave, pendingExpenses, duplicateCodes, usedCompOffGrants] =
+      await Promise.all([
+        this.prisma.payrollVariableInput.findMany({
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'APPROVED',
+            OR: [
+              { payrollRunId: run.id },
+              { payrollRunId: null, month: run.month, year: run.year },
+            ],
+          },
+        }),
+        this.prisma.expenseClaim.findMany({
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'APPROVED',
+            reimbursementMethod: 'PAYROLL',
+          },
+        }),
+        this.prisma.leaveRequest.groupBy({
+          by: ['employeeId'],
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'PENDING',
+            fromDate: { lte: monthEnd },
+            toDate: { gte: monthStart },
+          },
+          _count: true,
+        }),
+        this.prisma.expenseClaim.groupBy({
+          by: ['employeeId'],
+          where: { tenantId, employeeId: { in: employeeIds }, status: { in: ['SUBMITTED', 'CLARIFICATION_REQUESTED'] } },
+          _count: true,
+        }),
+        this.prisma.employee.groupBy({
+          by: ['employeeCode'],
+          where: { tenantId },
+          _count: true,
+          having: { employeeCode: { _count: { gt: 1 } } },
+        }),
+        // Only USED grants whose usedOnDate falls inside this payroll month can offset
+        // anything here; AVAILABLE/EXPIRED/CANCELLED grants are never read for payroll, and
+        // a grant used outside this month cannot reach a date this run has no record of.
+        // Nothing here writes to CompOffGrant - payroll only ever reads it.
+        this.prisma.compOffGrant.findMany({
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'USED',
+            usedOnDate: { gte: monthStart, lte: monthEnd },
+          },
+          select: { employeeId: true, usedOnDate: true },
+        }),
+      ]);
     const inputsByEmployee = this.groupByEmployee(variableInputs);
     const expensesByEmployee = this.groupByEmployee(payrollExpenses);
     const pendingLeaveByEmployee = new Map(pendingLeave.map((row) => [row.employeeId, row._count]));
     const pendingExpenseByEmployee = new Map(pendingExpenses.map((row) => [row.employeeId, row._count]));
     const duplicateCodeSet = new Set(duplicateCodes.map((row) => row.employeeCode));
+    const usedCompOffDatesByEmployee = this.groupByEmployee(usedCompOffGrants);
 
     let processed = 0;
     let errorCount = 0;
@@ -825,8 +826,22 @@ export class PayrollService {
       const unfinalized = attendanceWarnings.get(emp.id);
       if (unfinalized) warnings.push(`${unfinalized} attendance record(s) are not finalized`);
 
-      const attendanceLop = attendanceLopByEmployee.get(emp.id) ?? 0;
+      const attendanceLop = lopContributions.attendanceTotalByEmployee.get(emp.id) ?? 0;
       if (attendanceLop > 0) warnings.push(`${attendanceLop} attendance LOP day(s) from finalized absences/half-days`);
+      // Comp-Off offset is applied per date before the employee's days are totalled: a used
+      // grant removes only the LOP its own usedOnDate actually contributed - 1 for an
+      // absence, 0.5 for a half day, nothing if that date had none - and never the leftover
+      // from one date onto another. See applyCompOffOffsets.
+      const usedOnDates = (usedCompOffDatesByEmployee.get(emp.id) ?? [])
+        .map((grant) => grant.usedOnDate)
+        .filter((date): date is Date => date !== null);
+      const { lopDays: rawLopDays, offsetDays: compOffOffsetDays } = this.applyCompOffOffsets(
+        lopContributions.byDate.get(emp.id) ?? new Map<string, number>(),
+        usedOnDates,
+      );
+      if (compOffOffsetDays > 0) {
+        warnings.push(`${compOffOffsetDays} day(s) of LOP offset by used comp-off`);
+      }
       // The configured denominator drives monthly salary -> daily salary -> LOP alike: LOP is
       // capped at it so a full month of absence zeroes pay and never turns it negative. An
       // unusable denominator still reports the LOP it found, capped at the calendar month.
@@ -834,10 +849,11 @@ export class PayrollService {
       if (denominator?.error) errors.push(denominator.error);
       const denominatorDays = denominator?.days ?? calendarDays;
       const lopCap = denominator?.error ? calendarDays : denominatorDays;
-      const lopDays = Math.min((lwpByEmployee.get(emp.id) ?? 0) + attendanceLop, lopCap);
+      const lopDays = Math.min(rawLopDays, lopCap);
       // Clamped rather than merely capped: an unusable denominator is 0 while its LOP is still
       // reported against the calendar month, and payable days must never go negative even
-      // though that path writes a zeroed entry anyway.
+      // though that path writes a zeroed entry anyway. Comp-Off can only ever reduce lopDays,
+      // so payableDays can never exceed denominatorDays because of it.
       const payableDays = Math.max(0, denominatorDays - lopDays);
       const dueLoans = emp.loans.map((loan) => ({
         ...loan,
@@ -1351,44 +1367,113 @@ export class PayrollService {
     return Boolean(finalization);
   }
 
-  private async attendanceLossDayMap(tenantId: string, monthStart: Date, monthEnd: Date) {
-    const records = await this.prisma.attendanceRecord.findMany({
-      where: {
-        tenantId,
-        date: { gte: monthStart, lte: monthEnd },
-        isFinalized: true,
-        status: { in: ['ABSENT', 'HALF_DAY'] },
-      },
-      select: { employeeId: true, status: true },
-    });
-    const result = new Map<string, number>();
-    for (const record of records) {
-      result.set(record.employeeId, (result.get(record.employeeId) ?? 0) + (record.status === 'HALF_DAY' ? 0.5 : 1));
+  /**
+   * Per-employee, per-date LOP contribution for the payroll month, before any Comp-Off
+   * offset is applied - the day-level detail a Comp-Off `usedOnDate` is matched against
+   * (see {@link applyCompOffOffsets}), keyed by the ISO day the contribution falls on.
+   *
+   * Attendance and LWP are independent sources that can both land on the same date; their
+   * contributions are summed there rather than one replacing the other, matching how the
+   * pre-existing aggregate (`attendanceLop + lwp`) totalled them.
+   *
+   * A leave request's `days` total is spread evenly across its own calendar span - the same
+   * assumption the original `leaveDaysInPeriod` used to prorate a request across a month
+   * boundary - just decomposed to one day at a time here so a specific date can be matched
+   * and offset without touching any other day of a multi-day request.
+   */
+  private async lopContributionsByDate(
+    tenantId: string,
+    monthStart: Date,
+    monthEnd: Date,
+  ): Promise<{ byDate: Map<string, Map<string, number>>; attendanceTotalByEmployee: Map<string, number> }> {
+    const [attendanceRecords, lwpRequests] = await Promise.all([
+      this.prisma.attendanceRecord.findMany({
+        where: {
+          tenantId,
+          date: { gte: monthStart, lte: monthEnd },
+          isFinalized: true,
+          status: { in: ['ABSENT', 'HALF_DAY'] },
+        },
+        select: { employeeId: true, date: true, status: true },
+      }),
+      this.prisma.leaveRequest.findMany({
+        where: {
+          tenantId,
+          status: 'APPROVED',
+          leaveType: { isPaid: false },
+          fromDate: { lte: monthEnd },
+          toDate: { gte: monthStart },
+        },
+        select: { employeeId: true, days: true, fromDate: true, toDate: true },
+      }),
+    ]);
+
+    const result = new Map<string, Map<string, number>>();
+    const add = (employeeId: string, dayKey: string, amount: number) => {
+      if (amount <= 0) return;
+      const byDate = result.get(employeeId) ?? new Map<string, number>();
+      byDate.set(dayKey, (byDate.get(dayKey) ?? 0) + amount);
+      result.set(employeeId, byDate);
+    };
+
+    // Tracked separately from `result` only so callers can report "N attendance LOP day(s)"
+    // as they did before this method existed - it plays no part in the offset itself.
+    const attendanceTotalByEmployee = new Map<string, number>();
+    for (const record of attendanceRecords) {
+      const amount = record.status === 'HALF_DAY' ? 0.5 : 1;
+      add(record.employeeId, this.dayKey(record.date), amount);
+      attendanceTotalByEmployee.set(
+        record.employeeId,
+        (attendanceTotalByEmployee.get(record.employeeId) ?? 0) + amount,
+      );
     }
-    return result;
+
+    for (const leave of lwpRequests) {
+      const clippedFrom = leave.fromDate < monthStart ? monthStart : leave.fromDate;
+      const clippedTo = leave.toDate > monthEnd ? monthEnd : leave.toDate;
+      if (clippedTo < clippedFrom) continue;
+      const totalSpanDays = this.inclusiveDayCount(leave.fromDate, leave.toDate);
+      if (totalSpanDays <= 0) continue;
+      const dailyRate = leave.days / totalSpanDays;
+      for (let d = new Date(clippedFrom); d <= clippedTo; d.setUTCDate(d.getUTCDate() + 1)) {
+        add(leave.employeeId, this.dayKey(d), dailyRate);
+      }
+    }
+
+    return { byDate: result, attendanceTotalByEmployee };
   }
 
   /**
-   * The portion of an approved leave request that falls inside the payroll
-   * period. A request contained in the period keeps its stored `days` verbatim,
-   * so single-month and half-day requests are unchanged. A request straddling a
-   * month boundary is split across its calendar span, which keeps the sum of the
-   * monthly portions equal to the request total and stops the same leave days
-   * from being deducted again in the adjacent month.
+   * Removes, from one employee's per-date LOP map, the contribution of every date named by
+   * a USED Comp-Off's `usedOnDate`. Each date is offset by exactly what it contributed - 1
+   * for a full absence, 0.5 for a half day, nothing for a date with no LOP - never the
+   * grant's own `days`, and never applied to any other date.
+   *
+   * A date already brought to zero (by an earlier grant, or one that had no LOP to begin
+   * with) is left alone, so two grants that happen to share a `usedOnDate` cannot
+   * double-offset the same day, and the total can never go negative.
    */
-  private leaveDaysInPeriod(
-    leave: { fromDate: Date; toDate: Date; days: number },
-    periodStart: Date,
-    periodEnd: Date,
-  ): number {
-    const clippedFrom = leave.fromDate < periodStart ? periodStart : leave.fromDate;
-    const clippedTo = leave.toDate > periodEnd ? periodEnd : leave.toDate;
-    if (clippedTo < clippedFrom) return 0;
-    const totalSpanDays = this.inclusiveDayCount(leave.fromDate, leave.toDate);
-    if (totalSpanDays <= 0) return 0;
-    const inPeriodSpanDays = this.inclusiveDayCount(clippedFrom, clippedTo);
-    if (inPeriodSpanDays >= totalSpanDays) return leave.days;
-    return round2((leave.days * inPeriodSpanDays) / totalSpanDays);
+  private applyCompOffOffsets(
+    byDate: Map<string, number>,
+    usedOnDates: Date[],
+  ): { lopDays: number; offsetDays: number } {
+    const working = new Map(byDate);
+    let offsetDays = 0;
+    for (const usedOnDate of usedOnDates) {
+      const key = this.dayKey(usedOnDate);
+      const contribution = working.get(key) ?? 0;
+      if (contribution > 0) {
+        working.set(key, 0);
+        offsetDays += contribution;
+      }
+    }
+    let lopDays = 0;
+    for (const contribution of working.values()) lopDays += contribution;
+    return { lopDays: round2(lopDays), offsetDays: round2(offsetDays) };
+  }
+
+  private dayKey(date: Date): string {
+    return date.toISOString().slice(0, 10);
   }
 
   private inclusiveDayCount(from: Date, to: Date): number {

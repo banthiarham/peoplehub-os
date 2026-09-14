@@ -36,7 +36,7 @@ function buildProcessRunHarness(options: {
   finalizations?: FinalizationFixture[];
   leaveRequests?: Array<Record<string, unknown>>;
   employeeOverrides?: Record<string, unknown>;
-  attendanceRecords?: Array<{ employeeId: string; status: string; isFinalized: boolean }>;
+  attendanceRecords?: Array<{ employeeId: string; status: string; isFinalized: boolean; date?: Date }>;
   /** Resolved by the real PayrollPolicyService; null (the default) means CALENDAR_DAYS. */
   payrollPolicies?: Array<Record<string, unknown>>;
   holidays?: Date[];
@@ -44,6 +44,8 @@ function buildProcessRunHarness(options: {
   weeklyOffDays?: number[];
   /** One entry per employee in the run, merged over the default fixture. */
   extraEmployees?: Array<Record<string, unknown>>;
+  /** USED Comp-Off grants; matched against the real `where` (tenant/employee/status/date range). */
+  usedCompOffGrants?: Array<{ employeeId: string; usedOnDate: Date; status?: string; tenantId?: string }>;
 } = {}) {
   const run = {
     id: 'run-1',
@@ -91,14 +93,21 @@ function buildProcessRunHarness(options: {
     attendanceRecord: {
       groupBy: jest.fn().mockResolvedValue([]),
       // Honours the LOP projection filters so leave-reconciled days are excluded
-      // by the query under test rather than by the fixture.
+      // by the query under test rather than by the fixture. A record without an explicit
+      // `date` defaults to the 10th of the run month, so fixtures written before Comp-Off
+      // offsetting needed day-level detail keep working unchanged.
       findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
         Promise.resolve(
-          (options.attendanceRecords ?? []).filter(
-            (record) =>
-              record.isFinalized === where.isFinalized &&
-              (where.status?.in ?? []).includes(record.status),
-          ),
+          (options.attendanceRecords ?? [])
+            .filter(
+              (record) =>
+                record.isFinalized === where.isFinalized &&
+                (where.status?.in ?? []).includes(record.status),
+            )
+            .map((record) => ({
+              ...record,
+              date: record.date ?? new Date(Date.UTC(run.year as number, (run.month as number) - 1, 10)),
+            })),
         ),
       ),
     },
@@ -149,6 +158,20 @@ function buildProcessRunHarness(options: {
     },
     holiday: {
       findMany: jest.fn().mockResolvedValue((options.holidays ?? []).map((date) => ({ date }))),
+    },
+    // Matched against the real `where` so tenant scoping, the employeeId allowlist and the
+    // status/usedOnDate filters are genuinely exercised rather than assumed.
+    compOffGrant: {
+      findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
+        Promise.resolve(
+          (options.usedCompOffGrants ?? [])
+            .filter((grant) => (grant.tenantId ?? 'tenant-1') === where.tenantId)
+            .filter((grant) => (where.employeeId?.in ?? []).includes(grant.employeeId))
+            .filter((grant) => (grant.status ?? 'USED') === where.status)
+            .filter((grant) => grant.usedOnDate >= where.usedOnDate.gte && grant.usedOnDate <= where.usedOnDate.lte)
+            .map((grant) => ({ employeeId: grant.employeeId, usedOnDate: grant.usedOnDate })),
+        ),
+      ),
     },
   };
   const calculator = {
@@ -950,6 +973,7 @@ describe('PayrollService', () => {
       attendanceFinalization: { findFirst: jest.fn().mockResolvedValue({ id: 'finalization-1' }) },
       leaveRequest: { findMany: jest.fn().mockResolvedValue([]), groupBy: jest.fn().mockResolvedValue([]) },
       payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
+      compOffGrant: { findMany: jest.fn().mockResolvedValue([]) },
       expenseClaim: {
         findMany: jest.fn().mockResolvedValue([]),
         groupBy: jest.fn().mockResolvedValue([]),
@@ -1429,6 +1453,289 @@ describe('PayrollService', () => {
       await service.processRun('tenant-1', 'run-1');
 
       expect(entryFor('emp-1').lopDays).toBe(1);
+    });
+  });
+
+  describe('used Comp-Off offsets payroll LOP', () => {
+    const finalizedJuly = [
+      { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+    // July 2026 is the harness's default run month/year.
+    const absenceDate = new Date(Date.UTC(2026, 6, 10));
+    const otherDate = new Date(Date.UTC(2026, 6, 20));
+
+    it('removes exactly 1 LOP day for a used Comp-Off matching a full-day absence', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+    });
+
+    it('removes exactly 1 LOP day for a used Comp-Off matching an LWP day', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        leaveRequests: [{ employeeId: 'emp-1', days: 1, fromDate: absenceDate, toDate: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+    });
+
+    it('removes exactly 0.5 LOP day for a used Comp-Off matching a half day', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+    });
+
+    it('has no effect when the used date has no LOP contribution', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+    });
+
+    it('cannot offset an absence on a different date than usedOnDate', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: otherDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(30);
+    });
+
+    it('offsets multiple used dates independently, each against its own day only', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [
+          { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate },
+          { employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: otherDate },
+        ],
+        usedCompOffGrants: [
+          { employeeId: 'emp-1', usedOnDate: absenceDate },
+          { employeeId: 'emp-1', usedOnDate: otherDate },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+    });
+
+    it('does not offset anything for an AVAILABLE grant', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate, status: 'AVAILABLE' }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(30);
+    });
+
+    it.each(['EXPIRED', 'CANCELLED'])('does not offset anything for a %s grant', async (status) => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate, status }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(30);
+    });
+
+    it('keeps multiple employees isolated: one is offset, the other is not', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        extraEmployees: [
+          { id: 'emp-offset', employeeCode: 'PH-OFF' },
+          { id: 'emp-plain', employeeCode: 'PH-PLN' },
+        ],
+        attendanceRecords: [
+          { employeeId: 'emp-offset', status: 'ABSENT', isFinalized: true, date: absenceDate },
+          { employeeId: 'emp-plain', status: 'ABSENT', isFinalized: true, date: absenceDate },
+        ],
+        usedCompOffGrants: [{ employeeId: 'emp-offset', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-offset').lopDays).toBe(0);
+      expect(entryFor('emp-offset').payableDays).toBe(31);
+      expect(entryFor('emp-plain').lopDays).toBe(1);
+      expect(entryFor('emp-plain').payableDays).toBe(30);
+    });
+
+    it('a used Comp-Off for one employee cannot offset another employee\'s matching-date absence', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        extraEmployees: [
+          { id: 'emp-a', employeeCode: 'PH-A' },
+          { id: 'emp-b', employeeCode: 'PH-B' },
+        ],
+        attendanceRecords: [{ employeeId: 'emp-b', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        // Comp-off belongs to emp-a, not emp-b, even though the date matches.
+        usedCompOffGrants: [{ employeeId: 'emp-a', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-b').lopDays).toBe(1);
+    });
+
+    it('offsets correctly under a FIXED_DAYS policy without changing the denominator', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, salaryBasis: 'FIXED_DAYS', fixedDays: 26 },
+        ],
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(26);
+    });
+
+    it('offsets correctly under a WORKING_DAYS policy without changing the denominator', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [{ id: 'p1', tenantId: 'tenant-1', locationId: null, salaryBasis: 'WORKING_DAYS' }],
+        weeklyOffDays: [0, 6],
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // July 2026 has 23 Mon-Fri working days on a [0,6] weekly off.
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(23);
+    });
+
+    it('offsets a date once even when two used grants share the same usedOnDate', async () => {
+      // Two grants both name the one absence date. The first zeroes its 1-day contribution;
+      // the second finds nothing left there, so the offset is reported once, not twice.
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [
+          { employeeId: 'emp-1', usedOnDate: absenceDate },
+          { employeeId: 'emp-1', usedOnDate: absenceDate },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+      expect(entryFor('emp-1').warnings).toContainEqual('1 day(s) of LOP offset by used comp-off');
+    });
+
+    it('cannot push payableDays past the resolved denominator even with excess offsets', async () => {
+      // A used grant on a date that never had any LOP: the offset is a no-op rather than a
+      // credit, so payableDays still stops exactly at the denominator instead of exceeding it.
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+      expect(entryFor('emp-1').payableDays).toBeLessThanOrEqual(31);
+    });
+
+    it('resolves CALENDAR_DAYS correctly with a used Comp-Off offset applied', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [{ id: 'p1', tenantId: 'tenant-1', locationId: null, salaryBasis: 'CALENDAR_DAYS' }],
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31); // July 2026 calendar days
+    });
+
+    it('combines attendance and LWP sources per date, offsetting only the named date', async () => {
+      // A half-day attendance record on one date and a full LWP day on another: the two
+      // sources land on different days, and the Comp-Off only touches the half-day's date.
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate }],
+        leaveRequests: [{ employeeId: 'emp-1', days: 1, fromDate: otherDate, toDate: otherDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // 0.5 (half day, offset to 0) + 1 (LWP, untouched) = 1 remaining.
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(30);
+    });
+
+    it('produces identical LOP/payable results on a rerun of the same payroll month', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+      const first = { lopDays: entryFor('emp-1').lopDays, payableDays: entryFor('emp-1').payableDays };
+
+      await service.processRun('tenant-1', 'run-1');
+      const second = { lopDays: entryFor('emp-1').lopDays, payableDays: entryFor('emp-1').payableDays };
+
+      expect(second).toEqual(first);
+      expect(second).toEqual({ lopDays: 0, payableDays: 31 });
+    });
+
+    it('leaves payroll behaviour unchanged for a run with no Comp-Off usage at all', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(30);
     });
   });
 
