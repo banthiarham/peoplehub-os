@@ -56,6 +56,8 @@ function buildProcessRunHarness(options: {
     status?: string;
     tenantId?: string;
   }>;
+  /** Pre-existing manual/attendance-sourced variable inputs (e.g. OVERTIME, BONUS), seeded into the same store `COMP_OFF_PAYOUT` writes land in. */
+  variableInputs?: Array<Record<string, unknown>>;
 } = {}) {
   const run = {
     id: 'run-1',
@@ -72,8 +74,9 @@ function buildProcessRunHarness(options: {
   // Backs the payrollVariableInput mock below with real create/delete/read semantics (rather
   // than a static empty array) so a Comp-Off payout this run creates is genuinely visible to
   // the same query that later folds variable inputs into gross/net pay - the same integration
-  // a real database gives for free.
-  let compOffPayoutStore: Array<Record<string, unknown>> = [];
+  // a real database gives for free. Also seeded with any pre-existing manual/attendance
+  // inputs (e.g. OVERTIME) a test supplies.
+  let variableInputStore: Array<Record<string, unknown>> = [...(options.variableInputs ?? [])];
   const prisma = {
     payrollRun: {
       findFirst: jest.fn().mockResolvedValue(run),
@@ -152,7 +155,7 @@ function buildProcessRunHarness(options: {
     payrollVariableInput: {
       findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
         Promise.resolve(
-          compOffPayoutStore.filter(
+          variableInputStore.filter(
             (input) =>
               input.tenantId === where.tenantId &&
               (where.employeeId?.in ?? []).includes(input.employeeId) &&
@@ -166,8 +169,8 @@ function buildProcessRunHarness(options: {
         ),
       ),
       deleteMany: jest.fn(({ where }: { where: Record<string, any> }) => {
-        const before = compOffPayoutStore.length;
-        compOffPayoutStore = compOffPayoutStore.filter(
+        const before = variableInputStore.length;
+        variableInputStore = variableInputStore.filter(
           (input) =>
             !(
               input.tenantId === where.tenantId &&
@@ -176,10 +179,10 @@ function buildProcessRunHarness(options: {
               input.source === where.source
             ),
         );
-        return Promise.resolve({ count: before - compOffPayoutStore.length });
+        return Promise.resolve({ count: before - variableInputStore.length });
       }),
       createMany: jest.fn(({ data }: { data: Array<Record<string, unknown>> }) => {
-        compOffPayoutStore.push(...data);
+        variableInputStore.push(...data);
         return Promise.resolve({ count: data.length });
       }),
     },
@@ -1115,7 +1118,8 @@ describe('PayrollService', () => {
         slabsApplied: [],
       }),
     };
-    const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any, {} as any);
+    const payrollPolicies = { resolve: jest.fn().mockResolvedValue({ overtimePaymentEnabled: true }) };
+    const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any, payrollPolicies as any);
 
     await expect(service.processRun('tenant-1', 'run-1')).resolves.toEqual({
       processed: 1,
@@ -2217,6 +2221,153 @@ describe('PayrollService', () => {
       expect(entryFor('emp-1').lopDays).toBe(0);
       expect(entryFor('emp-1').payableDays).toBe(31);
       expect(payoutCreates(prisma)).toHaveLength(1);
+    });
+  });
+
+  describe('overtime payment configuration', () => {
+    const finalizedJuly = [
+      { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+
+    function approvedOvertimeInput(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'ot-1',
+        tenantId: 'tenant-1',
+        employeeId: 'emp-1',
+        payrollRunId: null,
+        month: 7,
+        year: 2026,
+        type: 'OVERTIME',
+        label: 'Attendance overtime (5h)',
+        amount: 1250, // 5h x Rs.250/hr - the existing rate, unchanged by this policy
+        taxable: true,
+        status: 'APPROVED',
+        source: 'ATTENDANCE',
+        metadata: {},
+        ...overrides,
+      };
+    }
+
+    it('pays APPROVED overtime when overtimePaymentEnabled is true', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, overtimePaymentEnabled: true },
+        ],
+        variableInputs: [approvedOvertimeInput()],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(90000 + 1250, 2);
+      expect(entryFor('emp-1').components).toContainEqual(expect.objectContaining({ code: 'INPUT_OVERTIME', monthly: 1250 }));
+    });
+
+    it('does not pay APPROVED overtime when overtimePaymentEnabled is false', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, overtimePaymentEnabled: false },
+        ],
+        variableInputs: [approvedOvertimeInput()],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(90000, 2);
+      expect(entryFor('emp-1').components.some((c) => c.code === 'INPUT_OVERTIME')).toBe(false);
+    });
+
+    it('leaves the PayrollVariableInput itself untouched when disabled - not deleted, not mutated', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, overtimePaymentEnabled: false },
+        ],
+        variableInputs: [approvedOvertimeInput()],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(prisma.payrollVariableInput.deleteMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ type: 'OVERTIME' }) }),
+      );
+      const stillThere = await prisma.payrollVariableInput.findMany({
+        where: { tenantId: 'tenant-1', employeeId: { in: ['emp-1'] }, status: 'APPROVED', OR: [{ payrollRunId: null, month: 7, year: 2026 }] },
+      });
+      expect(stillThere).toEqual([expect.objectContaining({ id: 'ot-1', status: 'APPROVED' })]);
+    });
+
+    it('leaves DRAFT overtime unpaid, same as before this policy existed', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, overtimePaymentEnabled: true },
+        ],
+        variableInputs: [approvedOvertimeInput({ id: 'ot-draft', status: 'DRAFT' })],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(90000, 2);
+    });
+
+    it('applies the policy per employee - mixed employees at different locations resolve independently', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        extraEmployees: [
+          { id: 'emp-1', locationId: 'loc-enabled' },
+          { id: 'emp-2', locationId: 'loc-disabled' },
+        ],
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, overtimePaymentEnabled: false },
+          { id: 'p-enabled', tenantId: 'tenant-1', locationId: 'loc-enabled', overtimePaymentEnabled: true },
+          { id: 'p-disabled', tenantId: 'tenant-1', locationId: 'loc-disabled', overtimePaymentEnabled: false },
+        ],
+        variableInputs: [
+          approvedOvertimeInput({ id: 'ot-emp1', employeeId: 'emp-1' }),
+          approvedOvertimeInput({ id: 'ot-emp2', employeeId: 'emp-2' }),
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(90000 + 1250, 2);
+      expect(entryFor('emp-2').grossPay).toBeCloseTo(90000, 2);
+    });
+
+    it('leaves a non-OVERTIME earning input unaffected by the policy either way', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          { id: 'p1', tenantId: 'tenant-1', locationId: null, overtimePaymentEnabled: false },
+        ],
+        variableInputs: [
+          approvedOvertimeInput(),
+          {
+            id: 'bonus-1',
+            tenantId: 'tenant-1',
+            employeeId: 'emp-1',
+            payrollRunId: null,
+            month: 7,
+            year: 2026,
+            type: 'BONUS',
+            label: 'Diwali bonus',
+            amount: 5000,
+            taxable: true,
+            status: 'APPROVED',
+            source: 'MANUAL',
+            metadata: {},
+          },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // OT excluded (policy disabled), BONUS unaffected either way.
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(90000 + 5000, 2);
+      expect(entryFor('emp-1').components).toContainEqual(expect.objectContaining({ code: 'INPUT_BONUS', monthly: 5000 }));
+      expect(entryFor('emp-1').components.some((c) => c.code === 'INPUT_OVERTIME')).toBe(false);
     });
   });
 

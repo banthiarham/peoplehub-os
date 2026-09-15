@@ -731,6 +731,10 @@ export class PayrollService {
     // recreates its own inputs for this run every time, so a rerun never doubles a payout.
     await this.applyUnusedCompOffPayouts(tenantId, run, employees, denominators, monthStart, monthEnd);
 
+    // Whether an already-APPROVED OVERTIME input actually pays out, per the PayrollPolicy at
+    // each employee's own location - resolved once per location, not per employee.
+    const overtimePaidByEmployee = await this.resolveOvertimePaidByEmployee(tenantId, employees);
+
     const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
     // Attendance-absence and LWP LOP, broken down per date rather than summed per employee,
     // so a used Comp-Off's `usedOnDate` can offset the exact day it names (see processing
@@ -915,7 +919,13 @@ export class PayrollService {
         monthEnd,
         monthlyEmiDeduction: emi,
       });
-      const manualInputs = inputsByEmployee.get(emp.id) ?? [];
+      // An APPROVED OVERTIME input still exists and is still APPROVED either way - it is
+      // filtered out of this run's own earning calculation only, never deleted or mutated,
+      // so re-enabling the policy later picks it back up unchanged. DRAFT OVERTIME was never
+      // in inputsByEmployee to begin with (that query is already APPROVED-only).
+      const manualInputs = (inputsByEmployee.get(emp.id) ?? []).filter(
+        (input) => input.type !== 'OVERTIME' || overtimePaidByEmployee.get(emp.id) !== false,
+      );
       const expenseInputs = (expensesByEmployee.get(emp.id) ?? []).map((expense) => ({
         id: expense.id,
         type: 'REIMBURSEMENT',
@@ -1341,6 +1351,31 @@ export class PayrollService {
     const updated = await this.prisma.payrollVariableInput.update({ where: { id }, data: { status } });
     await this.audit(tenantId, actorId, `PAYROLL_INPUT_${status}`, 'PayrollVariableInput', id, input, updated);
     return updated;
+  }
+
+  /**
+   * Whether an APPROVED `OVERTIME` variable input actually pays out for each employee, per
+   * `PayrollPolicy.overtimePaymentEnabled` resolved at their own location - two employees in
+   * the same run can legitimately resolve different policies, same as the salary denominator
+   * and unused-Comp-Off payout already do. Resolved once per location, not per employee.
+   */
+  private async resolveOvertimePaidByEmployee(
+    tenantId: string,
+    employees: Array<{ id: string; locationId: string | null }>,
+  ): Promise<Map<string, boolean>> {
+    const policyCache = new Map<string, boolean>();
+    const result = new Map<string, boolean>();
+    for (const employee of employees) {
+      const locationKey = employee.locationId ?? '';
+      let overtimePaymentEnabled = policyCache.get(locationKey);
+      if (overtimePaymentEnabled === undefined) {
+        const policy = await this.payrollPolicies.resolve(tenantId, employee.locationId);
+        overtimePaymentEnabled = policy.overtimePaymentEnabled;
+        policyCache.set(locationKey, overtimePaymentEnabled);
+      }
+      result.set(employee.id, overtimePaymentEnabled);
+    }
+    return result;
   }
 
   private async attendanceWarningMap(tenantId: string, monthStart: Date, monthEnd: Date) {
