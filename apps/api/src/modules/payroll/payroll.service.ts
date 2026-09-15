@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AgeCategory, Prisma } from '@prisma/client';
+import { AgeCategory, CompOffUsagePeriod, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
@@ -28,7 +28,8 @@ import {
   WaiveLoanDto,
 } from './dto/payroll.dto';
 import { PayrollCalculatorService } from './payroll-calculator.service';
-import { SalaryDenominatorService } from './salary-denominator.service';
+import { PayrollPolicyService } from './payroll-policy.service';
+import { ResolvedDenominator, SalaryDenominatorService } from './salary-denominator.service';
 
 /**
  * Employee statuses that may file a claim. Same set leave self-service accepts, so a
@@ -91,7 +92,16 @@ const EXPENSE_POLICY_LIMITS: Record<string, number> = {
   MEDICAL: 15000,
 };
 
-const EARNING_INPUTS = new Set(['BONUS', 'ARREAR', 'INCENTIVE', 'OVERTIME', 'REIMBURSEMENT', 'LEAVE_ENCASHMENT', 'FULL_AND_FINAL']);
+const EARNING_INPUTS = new Set([
+  'BONUS',
+  'ARREAR',
+  'INCENTIVE',
+  'OVERTIME',
+  'REIMBURSEMENT',
+  'LEAVE_ENCASHMENT',
+  'FULL_AND_FINAL',
+  'COMP_OFF_PAYOUT',
+]);
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -104,6 +114,7 @@ export class PayrollService {
     private readonly calculator: PayrollCalculatorService,
     private readonly tdsEngine: TdsEngineService,
     private readonly denominators: SalaryDenominatorService,
+    private readonly payrollPolicies: PayrollPolicyService,
   ) {}
 
   // ── Structures ────────────────────────────────────────────────────────────
@@ -713,6 +724,12 @@ export class PayrollService {
       run.year,
       employees.map((employee) => ({ id: employee.id, locationId: employee.locationId })),
     );
+
+    // Unused AVAILABLE Comp-Off is resolved into a PAY earning (or left UNPAID) before the
+    // variable-input batch below is read, so a payout this call creates is picked up by that
+    // same read - the existing earning-input pipeline, not a parallel one. Deletes and
+    // recreates its own inputs for this run every time, so a rerun never doubles a payout.
+    await this.applyUnusedCompOffPayouts(tenantId, run, employees, denominators, monthStart, monthEnd);
 
     const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
     // Attendance-absence and LWP LOP, broken down per date rather than summed per employee,
@@ -1478,6 +1495,156 @@ export class PayrollService {
 
   private inclusiveDayCount(from: Date, to: Date): number {
     return Math.floor((to.getTime() - from.getTime()) / 86_400_000) + 1;
+  }
+
+  /**
+   * Resolves unused AVAILABLE Comp-Off for this run's employees into `PayrollPolicy.
+   * compOffUnusedTreatment`: `PAY` becomes a `COMP_OFF_PAYOUT` variable input through the
+   * existing earning-input pipeline (see `inputComponents`/`EARNING_INPUTS`); `UNPAID`
+   * creates nothing. `AVAILABLE` grants are never read by LOP or read here for any purpose
+   * other than this payout - they cannot offset absence (only a `USED` grant's `usedOnDate`
+   * can, see `applyCompOffOffsets`) and `CompOffGrant` itself is never written.
+   *
+   * A grant becomes eligible for the run whose month contains the date its usage period
+   * actually closes (see {@link compOffClosureDate}): the end of its earned month/year for
+   * `MONTHLY`/`ANNUAL`, or, when `compOffCarryForwardEnabled` lets it survive that boundary,
+   * the later of that period end and its own `expiresAt` (unchanged from Phase 4, never
+   * invented here). Tying eligibility to that one closing month, rather than "any AVAILABLE
+   * grant whose period has already ended", is what keeps a rerun of a later month from paying
+   * the same grant again without needing to mutate its status. A grant already past its own
+   * `expiresAt` at processing time is excluded outright, independent of that closure date.
+   *
+   * Idempotent the same way attendance finalization keeps its own OVERTIME/SHIFT_ALLOWANCE
+   * inputs in sync: every `COMP_OFF_PAYOUT` input already recorded against this run is deleted
+   * and, only where still eligible, recreated - inside one transaction - rather than probed
+   * with a findFirst before deciding whether to create.
+   */
+  private async applyUnusedCompOffPayouts(
+    tenantId: string,
+    run: { id: string; month: number; year: number },
+    employees: Array<{
+      id: string;
+      locationId: string | null;
+      employeeSalaries: Array<{ ctc: number; components: Prisma.JsonValue }>;
+    }>,
+    denominators: Map<string, ResolvedDenominator>,
+    monthStart: Date,
+    monthEnd: Date,
+  ): Promise<void> {
+    const employeeIds = employees.map((employee) => employee.id);
+    const deleteStale = this.prisma.payrollVariableInput.deleteMany({
+      where: { tenantId, payrollRunId: run.id, type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
+    });
+    if (!employeeIds.length) {
+      await this.prisma.$transaction([deleteStale]);
+      return;
+    }
+
+    const grants = await this.prisma.compOffGrant.findMany({
+      where: { tenantId, employeeId: { in: employeeIds }, status: 'AVAILABLE' },
+      select: { id: true, employeeId: true, earnedDate: true, expiresAt: true, days: true },
+    });
+
+    const processingNow = new Date();
+    const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
+    const policyCache = new Map<string, Awaited<ReturnType<PayrollPolicyService['resolve']>>>();
+    const resolvePolicy = async (employeeId: string) => {
+      const locationKey = locationByEmployee.get(employeeId) ?? '';
+      let policy = policyCache.get(locationKey);
+      if (!policy) {
+        policy = await this.payrollPolicies.resolve(tenantId, locationByEmployee.get(employeeId) ?? null);
+        policyCache.set(locationKey, policy);
+      }
+      return policy;
+    };
+
+    const eligibleByEmployee = new Map<string, { days: number; grantIds: string[] }>();
+    for (const grant of grants) {
+      if (grant.expiresAt && grant.expiresAt < processingNow) continue;
+      const policy = await resolvePolicy(grant.employeeId);
+      const closureDate = this.compOffClosureDate(policy, grant);
+      if (closureDate < monthStart || closureDate > monthEnd) continue;
+      const entry = eligibleByEmployee.get(grant.employeeId) ?? { days: 0, grantIds: [] };
+      entry.days = round2(entry.days + grant.days);
+      entry.grantIds.push(grant.id);
+      eligibleByEmployee.set(grant.employeeId, entry);
+    }
+
+    const salaryByEmployee = new Map(
+      employees.map((employee) => [employee.id, employee.employeeSalaries[employee.employeeSalaries.length - 1]]),
+    );
+    const creates: Prisma.PayrollVariableInputCreateManyInput[] = [];
+    for (const [employeeId, eligible] of eligibleByEmployee) {
+      if (eligible.days <= 0) continue;
+      const policy = await resolvePolicy(employeeId);
+      if (policy.compOffUnusedTreatment !== 'PAY') continue;
+      const salary = salaryByEmployee.get(employeeId);
+      const denominator = denominators.get(employeeId);
+      if (!salary || !denominator || denominator.error || denominator.days <= 0) continue;
+
+      // Same denominator-driven daily rate LOP already uses (see `calculateConfiguredMonth`'s
+      // `proration = payableDays / denominatorDays`), just evaluated at a full month
+      // (proration 1) so the rate reflects the configured salary undiluted by this month's
+      // own attendance - no separate Comp-Off rate formula.
+      const fullMonth = this.calculateConfiguredMonth({
+        ctc: salary.ctc,
+        storedComponents: salary.components,
+        payableDays: denominator.days,
+        denominatorDays: denominator.days,
+      });
+      const dailyRate = fullMonth.grossPay / denominator.days;
+      const amount = round2(dailyRate * eligible.days);
+      if (amount <= 0) continue;
+
+      creates.push({
+        tenantId,
+        employeeId,
+        payrollRunId: run.id,
+        month: run.month,
+        year: run.year,
+        type: 'COMP_OFF_PAYOUT',
+        label: `Unused comp-off payout (${eligible.days} day${eligible.days === 1 ? '' : 's'})`,
+        amount,
+        taxable: true,
+        status: 'APPROVED',
+        source: 'COMP_OFF',
+        metadata: { grantIds: eligible.grantIds, days: eligible.days, dailyRate: round2(dailyRate) },
+      });
+    }
+
+    const ops: Prisma.PrismaPromise<Prisma.BatchPayload>[] = [deleteStale];
+    if (creates.length) ops.push(this.prisma.payrollVariableInput.createMany({ data: creates }));
+    await this.prisma.$transaction(ops);
+  }
+
+  /**
+   * The date a Comp-Off grant's usage window closes.
+   *
+   * `validateCompOffUsage` only ever checks `expiresAt` when a usage crosses into a *later*
+   * period than `earnedDate` - within the same period, a grant stays usable through the
+   * period's own end regardless of `expiresAt` (e.g. the default 90-day auto-expiry ending
+   * before an `ANNUAL` period does). So the actual close of a grant's usage window is never
+   * earlier than its period end: without carry-forward it's exactly the period end; with
+   * carry-forward it's the later of the period end and `expiresAt` - the same ceiling
+   * `validateCompOffUsage` applies once carry-forward lets usage cross that boundary - never
+   * earlier, and never past an `expiresAt` it doesn't have.
+   */
+  private compOffClosureDate(
+    policy: { compOffUsagePeriod: CompOffUsagePeriod; compOffCarryForwardEnabled: boolean },
+    grant: { earnedDate: Date; expiresAt: Date | null },
+  ): Date {
+    const periodEnd = this.compOffPeriodEnd(policy.compOffUsagePeriod, grant.earnedDate);
+    if (!policy.compOffCarryForwardEnabled) return periodEnd;
+    if (!grant.expiresAt || grant.expiresAt <= periodEnd) return periodEnd;
+    return grant.expiresAt;
+  }
+
+  /** Last day of the calendar month (`MONTHLY`) or calendar year (`ANNUAL`) `earnedDate` falls in. */
+  private compOffPeriodEnd(period: CompOffUsagePeriod, earnedDate: Date): Date {
+    if (period === CompOffUsagePeriod.ANNUAL) {
+      return new Date(Date.UTC(earnedDate.getUTCFullYear(), 11, 31));
+    }
+    return new Date(Date.UTC(earnedDate.getUTCFullYear(), earnedDate.getUTCMonth() + 1, 0));
   }
 
   private async activeTaxYear(tenantId: string, monthStart: Date, monthEnd: Date) {

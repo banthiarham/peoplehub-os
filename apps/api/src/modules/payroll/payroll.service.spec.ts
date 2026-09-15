@@ -46,6 +46,16 @@ function buildProcessRunHarness(options: {
   extraEmployees?: Array<Record<string, unknown>>;
   /** USED Comp-Off grants; matched against the real `where` (tenant/employee/status/date range). */
   usedCompOffGrants?: Array<{ employeeId: string; usedOnDate: Date; status?: string; tenantId?: string }>;
+  /** AVAILABLE Comp-Off grants; matched against the real `where` (tenant/employee/status only). */
+  availableCompOffGrants?: Array<{
+    id?: string;
+    employeeId: string;
+    earnedDate: Date;
+    expiresAt?: Date | null;
+    days?: number;
+    status?: string;
+    tenantId?: string;
+  }>;
 } = {}) {
   const run = {
     id: 'run-1',
@@ -59,6 +69,11 @@ function buildProcessRunHarness(options: {
     ...options.run,
   };
   const finalizations = options.finalizations ?? [];
+  // Backs the payrollVariableInput mock below with real create/delete/read semantics (rather
+  // than a static empty array) so a Comp-Off payout this run creates is genuinely visible to
+  // the same query that later folds variable inputs into gross/net pay - the same integration
+  // a real database gives for free.
+  let compOffPayoutStore: Array<Record<string, unknown>> = [];
   const prisma = {
     payrollRun: {
       findFirst: jest.fn().mockResolvedValue(run),
@@ -134,7 +149,40 @@ function buildProcessRunHarness(options: {
       findMany: jest.fn().mockResolvedValue(options.leaveRequests ?? []),
       groupBy: jest.fn().mockResolvedValue([]),
     },
-    payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
+    payrollVariableInput: {
+      findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
+        Promise.resolve(
+          compOffPayoutStore.filter(
+            (input) =>
+              input.tenantId === where.tenantId &&
+              (where.employeeId?.in ?? []).includes(input.employeeId) &&
+              input.status === where.status &&
+              (where.OR ?? []).some(
+                (clause: { payrollRunId: string | null; month?: number; year?: number }) =>
+                  clause.payrollRunId === input.payrollRunId &&
+                  (clause.month === undefined || (clause.month === input.month && clause.year === input.year)),
+              ),
+          ),
+        ),
+      ),
+      deleteMany: jest.fn(({ where }: { where: Record<string, any> }) => {
+        const before = compOffPayoutStore.length;
+        compOffPayoutStore = compOffPayoutStore.filter(
+          (input) =>
+            !(
+              input.tenantId === where.tenantId &&
+              input.payrollRunId === where.payrollRunId &&
+              input.type === where.type &&
+              input.source === where.source
+            ),
+        );
+        return Promise.resolve({ count: before - compOffPayoutStore.length });
+      }),
+      createMany: jest.fn(({ data }: { data: Array<Record<string, unknown>> }) => {
+        compOffPayoutStore.push(...data);
+        return Promise.resolve({ count: data.length });
+      }),
+    },
     expenseClaim: {
       findMany: jest.fn().mockResolvedValue([]),
       groupBy: jest.fn().mockResolvedValue([]),
@@ -160,19 +208,37 @@ function buildProcessRunHarness(options: {
       findMany: jest.fn().mockResolvedValue((options.holidays ?? []).map((date) => ({ date }))),
     },
     // Matched against the real `where` so tenant scoping, the employeeId allowlist and the
-    // status/usedOnDate filters are genuinely exercised rather than assumed.
+    // status/usedOnDate filters are genuinely exercised rather than assumed. Branches on the
+    // requested status: USED grants (Phase 5 LOP offset) carry a usedOnDate range filter,
+    // AVAILABLE grants (Phase 6 unused payout) do not.
     compOffGrant: {
-      findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
-        Promise.resolve(
+      findMany: jest.fn(({ where }: { where: Record<string, any> }) => {
+        if (where.status === 'AVAILABLE') {
+          return Promise.resolve(
+            (options.availableCompOffGrants ?? [])
+              .filter((grant) => (grant.tenantId ?? 'tenant-1') === where.tenantId)
+              .filter((grant) => (where.employeeId?.in ?? []).includes(grant.employeeId))
+              .filter((grant) => (grant.status ?? 'AVAILABLE') === where.status)
+              .map((grant, index) => ({
+                id: grant.id ?? `grant-${index}`,
+                employeeId: grant.employeeId,
+                earnedDate: grant.earnedDate,
+                expiresAt: grant.expiresAt ?? null,
+                days: grant.days ?? 1,
+              })),
+          );
+        }
+        return Promise.resolve(
           (options.usedCompOffGrants ?? [])
             .filter((grant) => (grant.tenantId ?? 'tenant-1') === where.tenantId)
             .filter((grant) => (where.employeeId?.in ?? []).includes(grant.employeeId))
             .filter((grant) => (grant.status ?? 'USED') === where.status)
             .filter((grant) => grant.usedOnDate >= where.usedOnDate.gte && grant.usedOnDate <= where.usedOnDate.lte)
             .map((grant) => ({ employeeId: grant.employeeId, usedOnDate: grant.usedOnDate })),
-        ),
-      ),
+        );
+      }),
     },
+    $transaction: jest.fn((ops: Array<Promise<unknown>>) => Promise.all(ops)),
   };
   const calculator = {
     calculateMonth: jest.fn().mockReturnValue({
@@ -199,12 +265,9 @@ function buildProcessRunHarness(options: {
       assignment: null,
     })),
   };
-  const denominators = new SalaryDenominatorService(
-    prisma as any,
-    new PayrollPolicyService(prisma as any),
-    shifts as any,
-  );
-  const service = new PayrollService(prisma as any, calculator as any, {} as any, denominators as any);
+  const payrollPolicyService = new PayrollPolicyService(prisma as any);
+  const denominators = new SalaryDenominatorService(prisma as any, payrollPolicyService, shifts as any);
+  const service = new PayrollService(prisma as any, calculator as any, {} as any, denominators as any, payrollPolicyService);
   const entryFor = (employeeId: string) => {
     const call = prisma.payrollRunEmployee.upsert.mock.calls.find(
       ([args]: [{ create: { employeeId: string } }]) => args.create.employeeId === employeeId,
@@ -215,6 +278,9 @@ function buildProcessRunHarness(options: {
       warnings: string[];
       lopDays: number;
       payableDays: number;
+      grossPay: number;
+      netPay: number;
+      components: Array<{ code: string; type: string; monthly: number }>;
     };
   };
   return { prisma, service, calculator, entryFor };
@@ -280,12 +346,12 @@ function salaryHarness(
     },
     auditLog: { create: jest.fn().mockResolvedValue({}) },
   };
-  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any) };
+  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any) };
 }
 
 describe('PayrollService', () => {
   it('rejects salary structures without a BASIC earning component', async () => {
-    const service = new PayrollService({} as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService({} as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
     await expect(
       service.createStructure('tenant-1', 'user-1', {
@@ -317,7 +383,7 @@ describe('PayrollService', () => {
         }),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
     await expect(service.previewStructure('tenant-1', 'structure-1', { ctc: 1200000 })).resolves.toEqual(
       expect.objectContaining({
@@ -857,7 +923,7 @@ describe('PayrollService', () => {
         findMany: jest.fn().mockResolvedValue([{ errors: ['Missing active salary structure or CTC'] }]),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
     await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(
       BadRequestException,
@@ -878,7 +944,7 @@ describe('PayrollService', () => {
         findMany: jest.fn().mockResolvedValue([{ errors: [] }]),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
     await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).resolves.toEqual({
       id: 'run-1',
@@ -899,7 +965,7 @@ describe('PayrollService', () => {
         findMany: jest.fn().mockResolvedValue([{ errors: [], warnings: ['PAN missing'] }]),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
     await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(
       BadRequestException,
@@ -927,7 +993,7 @@ describe('PayrollService', () => {
         upsert: jest.fn().mockResolvedValue({}),
       },
     };
-    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
     await expect(service.lockRun('tenant-1', 'run-1', 'user-1')).resolves.toEqual({
       id: 'run-1',
@@ -972,8 +1038,13 @@ describe('PayrollService', () => {
       attendanceRecord: { groupBy: jest.fn().mockResolvedValue([]), findMany: jest.fn().mockResolvedValue([]) },
       attendanceFinalization: { findFirst: jest.fn().mockResolvedValue({ id: 'finalization-1' }) },
       leaveRequest: { findMany: jest.fn().mockResolvedValue([]), groupBy: jest.fn().mockResolvedValue([]) },
-      payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
+      payrollVariableInput: {
+        findMany: jest.fn().mockResolvedValue([]),
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+        createMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
       compOffGrant: { findMany: jest.fn().mockResolvedValue([]) },
+      $transaction: jest.fn((ops: Array<Promise<unknown>>) => Promise.all(ops)),
       expenseClaim: {
         findMany: jest.fn().mockResolvedValue([]),
         groupBy: jest.fn().mockResolvedValue([]),
@@ -1044,7 +1115,7 @@ describe('PayrollService', () => {
         slabsApplied: [],
       }),
     };
-    const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any);
+    const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any, {} as any);
 
     await expect(service.processRun('tenant-1', 'run-1')).resolves.toEqual({
       processed: 1,
@@ -1125,7 +1196,7 @@ describe('PayrollService', () => {
           ]),
         },
       };
-      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
       await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(
         BadRequestException,
@@ -1739,6 +1810,416 @@ describe('PayrollService', () => {
     });
   });
 
+  describe('unused Comp-Off is paid or left unpaid at payroll', () => {
+    const finalizedJuly = [
+      { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+    const finalizedDecember = [
+      { tenantId: 'tenant-1', month: 12, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+    // July 2026 is the harness's default run month/year.
+    const absenceDate = new Date(Date.UTC(2026, 6, 10));
+    const farFutureExpiry = new Date(Date.UTC(2030, 0, 1));
+
+    /** A single BASIC earning of `monthly`, so grossPay is exactly `monthly` at full proration - no PF/ESI/PT noise. */
+    function basicSalary(monthly: number) {
+      return { employeeSalaries: [{ ctc: monthly * 12, components: [{ code: 'BASIC', name: 'Basic', type: 'EARNING', monthly } ] }] };
+    }
+
+    /** Every field explicit - `PayrollPolicyService.resolve` returns the fixture row as-is, so an omitted field resolves to `undefined`, not a default. */
+    function policy(overrides: Record<string, unknown> = {}) {
+      return [
+        {
+          id: 'p1',
+          tenantId: 'tenant-1',
+          locationId: null,
+          salaryBasis: 'CALENDAR_DAYS',
+          fixedDays: null,
+          compOffUnusedTreatment: 'PAY',
+          compOffUsagePeriod: 'MONTHLY',
+          compOffCarryForwardEnabled: false,
+          ...overrides,
+        },
+      ];
+    }
+
+    function payoutCreates(prisma: ReturnType<typeof buildProcessRunHarness>['prisma']) {
+      return (prisma.payrollVariableInput.createMany as jest.Mock).mock.calls.flatMap(
+        ([args]: [{ data: Array<Record<string, unknown>> }]) => args.data,
+      );
+    }
+
+    it('1. pays the daily rate for one unused Comp-Off day', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      const creates = payoutCreates(prisma);
+      expect(creates).toHaveLength(1);
+      expect(creates[0]).toMatchObject({ employeeId: 'emp-1', type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF', amount: 838.71, taxable: true, status: 'APPROVED' });
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
+      expect(entryFor('emp-1').components).toContainEqual(expect.objectContaining({ code: 'INPUT_COMP_OFF_PAYOUT', monthly: 838.71 }));
+    });
+
+    it('2. pays the correct total for multiple unused days', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 3)), expiresAt: farFutureExpiry, days: 1 },
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 12)), expiresAt: farFutureExpiry, days: 2 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      const creates = payoutCreates(prisma);
+      expect(creates).toHaveLength(1);
+      expect(creates[0]).toMatchObject({ amount: 2516.13 });
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26000 + 2516.13, 2);
+    });
+
+    it('3. UNPAID creates no earning and no deduction', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ compOffUnusedTreatment: 'UNPAID' }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      expect(entryFor('emp-1').components.some((c) => c.code === 'INPUT_COMP_OFF_PAYOUT')).toBe(false);
+    });
+
+    it('4. a USED grant is not paid as unused', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1, status: 'USED' },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+    });
+
+    it('5. an EXPIRED grant is not paid', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1, status: 'EXPIRED' },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+    });
+
+    it('6. a CANCELLED grant is not paid', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1, status: 'CANCELLED' },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+    });
+
+    it('7. an AVAILABLE Comp-Off does not reduce LOP', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ compOffUnusedTreatment: 'UNPAID' }),
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // Only a USED grant's usedOnDate (Phase 5) can offset LOP; an AVAILABLE balance never does.
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(30);
+    });
+
+    it('8. pays correctly under CALENDAR_DAYS', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'CALENDAR_DAYS' }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // 26000 / 31 calendar days in July.
+      expect(payoutCreates(prisma)[0]).toMatchObject({ amount: 838.71 });
+    });
+
+    it('9. pays exactly the salary/26 example under FIXED_DAYS = 26', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)[0]).toMatchObject({ amount: 1000 });
+    });
+
+    it('10. pays correctly under WORKING_DAYS', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'WORKING_DAYS' }),
+        weeklyOffDays: [0, 6],
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // 26000 / 23 Mon-Fri working days in July 2026 under a [0,6] weekly off.
+      expect(payoutCreates(prisma)[0]).toMatchObject({ amount: 1130.43 });
+    });
+
+    it('11. the payout daily rate matches the LOP denominator, not that month\'s own payable days', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+        employeeOverrides: basicSalary(26000),
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(1);
+      expect(entryFor('emp-1').payableDays).toBe(25);
+      // Full 26000/26 rate, unaffected by this same month's own LOP.
+      expect(payoutCreates(prisma)[0]).toMatchObject({ amount: 1000 });
+    });
+
+    it('12. a grant whose MONTHLY period already closed in an earlier month is not paid again', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        // Earned in June; its MONTHLY period closed at the end of June, a month this run
+        // (July) doesn't own - it should have been resolved by June's own run, not July's.
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 5, 15)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+    });
+
+    it('13. an ANNUAL grant is paid in the run whose month contains the year end', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        run: { month: 12, year: 2026 },
+        finalizations: finalizedDecember,
+        payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 0, 10)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(1);
+    });
+
+    it('13b. an ANNUAL grant is not paid in a run for a month before the year end', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 0, 10)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+    });
+
+    it('14. carry-forward defers a closed-period grant to the run containing its own expiresAt', async () => {
+      // Dated safely past "today" (unlike expiresAt in test 15, which must be dated safely
+      // before it) so this stays valid for years regardless of when the suite actually runs.
+      const grantExpiresInAugust = new Date(Date.UTC(2035, 7, 15));
+      const base = {
+        payrollPolicies: policy({ compOffCarryForwardEnabled: true }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2035, 5, 15)), expiresAt: grantExpiresInAugust, days: 1 },
+        ],
+      };
+
+      const july = buildProcessRunHarness({ run: { month: 7, year: 2035 }, finalizations: [{ tenantId: 'tenant-1', month: 7, year: 2035, locationId: null, status: 'FINALIZED' }], ...base });
+      await july.service.processRun('tenant-1', 'run-1');
+      expect(payoutCreates(july.prisma)).toHaveLength(0);
+
+      const august = buildProcessRunHarness({ run: { month: 8, year: 2035 }, finalizations: [{ tenantId: 'tenant-1', month: 8, year: 2035, locationId: null, status: 'FINALIZED' }], ...base });
+      await august.service.processRun('tenant-1', 'run-1');
+      expect(payoutCreates(august.prisma)).toHaveLength(1);
+    });
+
+    it('14b. carry-forward with a shorter expiresAt than the period end still closes at the period end, not earlier', async () => {
+      // validateCompOffUsage never checks expiresAt for a usage inside the same period, so a
+      // grant stays genuinely usable through its period end even if expiresAt (e.g. the
+      // default 90-day auto-expiry under an ANNUAL policy) falls before it. Paying it out at
+      // that earlier expiresAt would be premature - the ANNUAL period itself hasn't closed yet.
+      const base = {
+        payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: true }),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          {
+            employeeId: 'emp-1',
+            earnedDate: new Date(Date.UTC(2035, 1, 10)), // Feb 2035
+            expiresAt: new Date(Date.UTC(2035, 4, 10)), // ~90 days later, well before the ANNUAL period end
+            days: 1,
+          },
+        ],
+      };
+
+      const may = buildProcessRunHarness({ run: { month: 5, year: 2035 }, finalizations: [{ tenantId: 'tenant-1', month: 5, year: 2035, locationId: null, status: 'FINALIZED' }], ...base });
+      await may.service.processRun('tenant-1', 'run-1');
+      expect(payoutCreates(may.prisma)).toHaveLength(0);
+
+      const december = buildProcessRunHarness({ run: { month: 12, year: 2035 }, finalizations: [{ tenantId: 'tenant-1', month: 12, year: 2035, locationId: null, status: 'FINALIZED' }], ...base });
+      await december.service.processRun('tenant-1', 'run-1');
+      expect(payoutCreates(december.prisma)).toHaveLength(1);
+    });
+
+    it('15. expiresAt already passed at processing time excludes the grant even if its period closed this month', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        // Period end (end of July) falls in this run, but expiresAt is already behind "today".
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: new Date(Date.UTC(2026, 7, 1)), days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+    });
+
+    it('16. multiple employees remain isolated', async () => {
+      const { service, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        extraEmployees: [{ id: 'emp-1' }, { id: 'emp-2' }],
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      const creates = payoutCreates(prisma);
+      expect(creates).toHaveLength(1);
+      expect(creates[0]).toMatchObject({ employeeId: 'emp-1' });
+    });
+
+    it('17. a payroll rerun does not duplicate the payout', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+      const first = entryFor('emp-1').grossPay;
+      await service.processRun('tenant-1', 'run-1');
+      const second = entryFor('emp-1').grossPay;
+
+      // Gross pay is identical on the rerun (not doubled), and each processRun call deletes
+      // this run's own prior COMP_OFF_PAYOUT inputs before recreating them, so the input this
+      // rerun leaves behind is exactly one row, not an accumulating second one.
+      expect(second).toBe(first);
+      expect(prisma.payrollVariableInput.deleteMany).toHaveBeenCalledTimes(2);
+      const lastCreateCall = (prisma.payrollVariableInput.createMany as jest.Mock).mock.calls.at(-1);
+      expect(lastCreateCall[0].data).toHaveLength(1);
+    });
+
+    it('18. payroll with no unused Comp-Off is unchanged', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(payoutCreates(prisma)).toHaveLength(0);
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+    });
+
+    it('19. Phase 5 used Comp-Off LOP offsetting is unaffected by an unrelated unused balance', async () => {
+      const { service, entryFor, prisma } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+        usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate }],
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 20)), expiresAt: farFutureExpiry, days: 1 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').lopDays).toBe(0);
+      expect(entryFor('emp-1').payableDays).toBe(31);
+      expect(payoutCreates(prisma)).toHaveLength(1);
+    });
+  });
+
   describe('payslip publication', () => {
     function publishHarness(entries: Array<Record<string, unknown>>) {
       const prisma = {
@@ -1746,7 +2227,7 @@ describe('PayrollService', () => {
         payrollRun: { update: jest.fn().mockResolvedValue({}) },
         expenseClaim: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
       };
-      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any);
+      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
       return { prisma, service, entries };
     }
 
@@ -1897,7 +2378,7 @@ describe('PayrollService', () => {
         },
         auditLog: { create: jest.fn().mockResolvedValue({}) },
       };
-      return { prisma, record, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any) };
+      return { prisma, record, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any) };
     }
 
     it('approves a DRAFT payroll input', async () => {
@@ -2343,7 +2824,7 @@ describe('PayrollService', () => {
   });
 
   it('exports payroll GL lines from run component totals', async () => {
-    const service = new PayrollService({} as any, {} as any, {} as any, stubDenominators() as any);
+    const service = new PayrollService({} as any, {} as any, {} as any, stubDenominators() as any, {} as any);
     jest.spyOn(service, 'getRun').mockResolvedValue({
       id: 'run-1',
       month: 7,
@@ -2454,7 +2935,7 @@ function expenseHarness(options: {
     },
     auditLog: { create: jest.fn().mockResolvedValue({}) },
   };
-  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any) };
+  return { prisma, service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any) };
 }
 
 describe('expense claims', () => {
