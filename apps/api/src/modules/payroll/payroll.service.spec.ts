@@ -2369,6 +2369,121 @@ describe('PayrollService', () => {
       expect(entryFor('emp-1').components).toContainEqual(expect.objectContaining({ code: 'INPUT_BONUS', monthly: 5000 }));
       expect(entryFor('emp-1').components.some((c) => c.code === 'INPUT_OVERTIME')).toBe(false);
     });
+
+    it('excludes suppressed APPROVED overtime from the annual taxable-salary/TDS projection', async () => {
+      // Mirrors the "uses versioned TDS..." harness above (its own full prisma double, since
+      // buildProcessRunHarness always resolves taxYear to null and never engages the TDS
+      // path at all) - the only change is an APPROVED OVERTIME input plus a disabled policy.
+      const prisma = {
+        payrollRun: {
+          findFirst: jest.fn().mockResolvedValue({ id: 'run-1', tenantId: 'tenant-1', status: 'DRAFT', month: 7, year: 2025, runType: 'MONTHLY' }),
+          update: jest.fn().mockResolvedValue({ id: 'run-1', status: 'REVIEW' }),
+        },
+        employee: {
+          findMany: jest.fn().mockResolvedValue([
+            {
+              id: 'emp-1',
+              employeeCode: 'PH001',
+              firstName: 'Asha',
+              lastName: 'Shah',
+              dateOfBirth: new Date('1990-01-01'),
+              pan: 'ABCDE1234F',
+              taxRegime: 'NEW',
+              uan: '100200300400',
+              bankDetails: { account: '123' },
+              status: 'ACTIVE',
+              joiningDate: new Date('2024-01-01'),
+              exitDate: null,
+              noticePeriodDays: 30,
+              legalEntityId: 'le-1',
+              locationId: 'loc-1',
+              employeeSalaries: [{ ctc: 1800000 }],
+              loans: [],
+            },
+          ]),
+          groupBy: jest.fn().mockResolvedValue([]),
+        },
+        attendanceRecord: { groupBy: jest.fn().mockResolvedValue([]), findMany: jest.fn().mockResolvedValue([]) },
+        attendanceFinalization: { findFirst: jest.fn().mockResolvedValue({ id: 'finalization-1' }) },
+        leaveRequest: { findMany: jest.fn().mockResolvedValue([]), groupBy: jest.fn().mockResolvedValue([]) },
+        payrollVariableInput: {
+          findMany: jest.fn().mockResolvedValue([approvedOvertimeInput({ month: 7, year: 2025, payrollRunId: null })]),
+          deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+          createMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        compOffGrant: { findMany: jest.fn().mockResolvedValue([]) },
+        $transaction: jest.fn((ops: Array<Promise<unknown>>) => Promise.all(ops)),
+        expenseClaim: {
+          findMany: jest.fn().mockResolvedValue([]),
+          groupBy: jest.fn().mockResolvedValue([]),
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
+        taxYear: {
+          findFirst: jest.fn().mockResolvedValue({ id: 'tax-year-1', effectiveTo: new Date('2026-03-31') }),
+        },
+        employeeTaxDeclaration: { findMany: jest.fn().mockResolvedValue([]) },
+        employeePreviousEmployerIncome: { findMany: jest.fn().mockResolvedValue([]) },
+        employeeMonthlyTds: { groupBy: jest.fn().mockResolvedValue([]), upsert: jest.fn().mockResolvedValue({}) },
+        payrollRunEmployee: { findMany: jest.fn().mockResolvedValue([]), upsert: jest.fn().mockResolvedValue({}) },
+        employeeTaxProfile: {
+          findUnique: jest.fn().mockResolvedValue(null),
+          create: jest.fn().mockResolvedValue({ id: 'profile-1', regime: 'NEW', ageCategory: 'BELOW_60' }),
+        },
+        taxComputationSnapshot: {
+          deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+          create: jest.fn().mockResolvedValue({ id: 'snapshot-1' }),
+        },
+      };
+      const calculator = {
+        calculateMonth: jest.fn().mockReturnValue({
+          grossPay: 145000,
+          totalDeductions: 1800,
+          netPay: 143200,
+          components: [
+            { code: 'BASIC', name: 'Basic', type: 'EARNING', monthly: 60000, annual: 720000 },
+            { code: 'SA', name: 'Special Allowance', type: 'EARNING', monthly: 85000, annual: 1020000 },
+            { code: 'PF_EMP', name: 'Provident Fund (Employee)', type: 'DEDUCTION', monthly: 1800, annual: 21600 },
+            { code: 'TDS', name: 'TDS', type: 'DEDUCTION', monthly: 999, annual: 11988 },
+          ],
+        }),
+        buildComponents: jest.fn().mockReturnValue([
+          { code: 'BASIC', type: 'EARNING', monthly: 60000 },
+          { code: 'SA', type: 'EARNING', monthly: 85000 },
+        ]),
+      };
+      const tdsEngine = {
+        calculate: jest.fn().mockResolvedValue({
+          grossTaxableIncome: 1740000,
+          exemptIncome: 0,
+          deductibleAmount: 75000,
+          netTaxableIncome: 1665000,
+          taxBeforeRebate: 72000,
+          rebate: 0,
+          surcharge: 0,
+          cess: 2880,
+          totalAnnualTax: 74880,
+          tdsAlreadyDeducted: 0,
+          remainingTax: 74880,
+          monthlyTds: 8320,
+          effectiveTaxRate: 0.043,
+          breakdownSteps: [{ step: 'MONTHLY_TDS', description: 'Monthly TDS', amount: 8320 }],
+          slabsApplied: [],
+        }),
+      };
+      const payrollPolicies = { resolve: jest.fn().mockResolvedValue({ overtimePaymentEnabled: false }) };
+      const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any, payrollPolicies as any);
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // Same 1740000 as the "uses versioned TDS..." baseline with no OT input at all - the
+      // 1250 the OT input would otherwise have added never reaches the projection.
+      expect(tdsEngine.calculate).toHaveBeenCalledWith(expect.objectContaining({ annualFixedSalary: 1740000 }));
+      expect(prisma.payrollRunEmployee.upsert).toHaveBeenCalledWith(expect.objectContaining({
+        create: expect.objectContaining({
+          components: expect.not.arrayContaining([expect.objectContaining({ code: 'INPUT_OVERTIME' })]),
+        }),
+      }));
+    });
   });
 
   describe('payslip publication', () => {

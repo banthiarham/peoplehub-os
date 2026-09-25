@@ -18,6 +18,7 @@ import { PayrollExpensesTab } from '@/components/forms/payroll-expenses-tab';
 import { PayrollInputsTab } from '@/components/forms/payroll-inputs-tab';
 import { PayrollLoansTab } from '@/components/forms/payroll-loans-tab';
 import { PayrollNewRunDialog } from '@/components/forms/payroll-new-run-dialog';
+import { PayrollPoliciesTab } from '@/components/forms/payroll-policies-tab';
 import { PayrollRunActionButton } from '@/components/forms/payroll-run-action-button';
 import { PayrollRunDetailDialog } from '@/components/forms/payroll-run-detail-dialog';
 import { PayrollSalariesTab } from '@/components/forms/payroll-salaries-tab';
@@ -66,6 +67,7 @@ const PAYROLL_TABS = [
   { id: 'inputs', label: 'Inputs', description: 'Bonus, arrears and overtime' },
   { id: 'expenses', label: 'Expenses', description: 'Claims and reimbursements' },
   { id: 'loans', label: 'Loans', description: 'Advances and EMI recovery' },
+  { id: 'policies', label: 'Policies', description: 'Salary basis, overtime and Comp-Off rules' },
 ] as const;
 
 export default function PayrollPage() {
@@ -166,7 +168,7 @@ export default function PayrollPage() {
         </div>
       </section>
 
-      <div className="grid gap-2 rounded-lg border border-slate-200 bg-white p-2 shadow-sm sm:grid-cols-2 xl:grid-cols-6">
+      <div className="grid gap-2 rounded-lg border border-slate-200 bg-white p-2 shadow-sm sm:grid-cols-2 xl:grid-cols-7">
         {PAYROLL_TABS.map((item) => (
           <Button
             key={item.id}
@@ -196,6 +198,8 @@ export default function PayrollPage() {
         <PayrollInputsTab />
       ) : tab === 'loans' ? (
         <PayrollLoansTab />
+      ) : tab === 'policies' ? (
+        <PayrollPoliciesTab />
       ) : (
         <div className="grid gap-5 xl:grid-cols-[0.85fr_1.35fr]">
           <Card className="flex h-full flex-col overflow-hidden border-slate-200 bg-white">
