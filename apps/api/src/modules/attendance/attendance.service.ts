@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -9,6 +10,7 @@ import {
   AttendanceCaptureMode,
   AttendanceStatus,
   CompOffStatus,
+  CompOffUsagePeriod,
   Prisma,
   PunchDirection,
   ShiftSwapStatus,
@@ -23,6 +25,7 @@ import {
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
 import { NON_WORKING_ATTENDANCE_STATUSES } from '../../common/utils/employment-status';
+import { PayrollPolicyService } from '../payroll/payroll-policy.service';
 import { AttendanceQrService } from './attendance-qr.service';
 import { DeviceBindingService } from './device-binding.service';
 import { haversineMeters } from './geo-distance';
@@ -186,6 +189,7 @@ export class AttendanceService {
     private readonly shifts: ShiftResolutionService,
     private readonly devices: DeviceBindingService,
     private readonly qr: AttendanceQrService,
+    private readonly payrollPolicies: PayrollPolicyService,
   ) {}
 
   private requireEmployee(user: AuthUser): string {
@@ -2779,6 +2783,8 @@ export class AttendanceService {
         },
       });
     }
+    const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
+    const compOffPolicyCache = new Map<string, boolean>();
     const byEmployee = new Map<string, { overtimeMinutes: number; allowance: number }>();
     for (const record of records) {
       const current = byEmployee.get(record.employeeId) ?? { overtimeMinutes: 0, allowance: 0 };
@@ -2786,28 +2792,11 @@ export class AttendanceService {
       if (record.shift?.shiftAllowanceAmount && ['PRESENT', 'LATE', 'HALF_DAY'].includes(record.status)) {
         current.allowance += record.shift.shiftAllowanceAmount;
       }
-      if (
-        record.shift?.compOffEligible &&
-        ['WEEKEND', 'HOLIDAY'].includes(record.status) &&
-        (record.workingMinutes ?? 0) >= Math.min(record.shift.halfDayAfterMinutes, record.shift.minWorkingMinutes)
-      ) {
-        await this.prisma.compOffGrant.upsert({
-          where: { id: `${record.id}` },
-          create: {
-            tenantId,
-            employeeId: record.employeeId,
-            sourceAttendanceRecordId: record.id,
-            earnedDate: record.date,
-            days: 1,
-            expiresAt: new Date(record.date.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
-            notes: 'Generated from finalized weekend/holiday work',
-          },
-          update: {},
-        }).catch(async () => {
-          const existingGrant = await this.prisma.compOffGrant.findFirst({ where: { sourceAttendanceRecordId: record.id } });
-          return existingGrant;
-        });
-      }
+      await this.grantAutomaticCompOff(tenantId, record, {
+        holidaySet,
+        locationByEmployee,
+        compOffPolicyCache,
+      });
       byEmployee.set(record.employeeId, current);
     }
     for (const [employeeId, totals] of byEmployee.entries()) {
@@ -2865,10 +2854,88 @@ export class AttendanceService {
   }
 
   /**
-   * Manually credits a comp-off. HR needs this because the automatic grant only
-   * fires at month finalization, and only for days the system itself classified
-   * as weekly-off or holiday work — an ad-hoc credit (an on-call Sunday, a day
-   * worked before the tenant's holiday calendar was loaded) has no other route.
+   * Automatically credits a comp-off for one finalized attendance record, if the tenant's
+   * payroll policy, the employee's shift and the day itself all qualify.
+   *
+   * The day's calendar classification — weekly off or holiday — is computed here directly
+   * from the shift and the holiday calendar, independently of `record.status`. A day the
+   * employee actually punched is classified `PRESENT`/`LATE`/`HALF_DAY` by worked-minutes
+   * alone (see `classifyAttendanceStatus`) and never becomes `WEEKEND`/`HOLIDAY` — those
+   * statuses are written only for days with no punches at all — so gating on the final
+   * status would never grant anything for a day that was actually worked.
+   *
+   * Idempotent by construction: a comp-off already linked to this attendance record (via
+   * `sourceAttendanceRecordId`) is left alone, so re-finalizing the same month never grants
+   * twice. `AttendanceRecord` is unique per `(employeeId, date)` and finalization only
+   * updates existing records rather than recreating them, so a record's id is a stable key
+   * across repeated finalizations of the same day.
+   */
+  private async grantAutomaticCompOff(
+    tenantId: string,
+    record: Prisma.AttendanceRecordGetPayload<{ include: { shift: true } }>,
+    context: {
+      holidaySet: Set<string>;
+      locationByEmployee: Map<string, string | null>;
+      compOffPolicyCache: Map<string, boolean>;
+    },
+  ): Promise<void> {
+    const shift = record.shift;
+    if (!shift?.compOffEligible) return;
+
+    const dayKey = record.date.toISOString().slice(0, 10);
+    const dayOfWeek = record.date.getUTCDay();
+    const isWeeklyOff = shift.weeklyOffDays.includes(dayOfWeek);
+    const isHoliday = context.holidaySet.has(dayKey);
+    if (!isWeeklyOff && !isHoliday) return;
+
+    const qualifyingMinutes = Math.min(shift.halfDayAfterMinutes, shift.minWorkingMinutes);
+    if ((record.workingMinutes ?? 0) < qualifyingMinutes) return;
+
+    const locationId = context.locationByEmployee.get(record.employeeId) ?? null;
+    const locationKey = locationId ?? '';
+    let compOffEnabled = context.compOffPolicyCache.get(locationKey);
+    if (compOffEnabled === undefined) {
+      const policy = await this.payrollPolicies.resolve(tenantId, locationId);
+      compOffEnabled = policy.compOffEnabled;
+      context.compOffPolicyCache.set(locationKey, compOffEnabled);
+    }
+    if (!compOffEnabled) return;
+
+    // Matched by attendance record first — the stable idempotency key across re-finalizations
+    // of this exact day — and, as a fallback, by the same (employeeId, earnedDate, AVAILABLE|
+    // USED) guard `createCompOff` uses. The fallback exists for a grant credited manually
+    // before this attendance record existed (so it carries no `sourceAttendanceRecordId`),
+    // which would otherwise not be found by the first check alone.
+    const alreadyGranted = await this.prisma.compOffGrant.findFirst({
+      where: {
+        tenantId,
+        employeeId: record.employeeId,
+        OR: [
+          { sourceAttendanceRecordId: record.id },
+          { earnedDate: record.date, status: { in: [CompOffStatus.AVAILABLE, CompOffStatus.USED] } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (alreadyGranted) return;
+
+    await this.prisma.compOffGrant.create({
+      data: {
+        tenantId,
+        employeeId: record.employeeId,
+        sourceAttendanceRecordId: record.id,
+        earnedDate: record.date,
+        days: 1,
+        expiresAt: new Date(record.date.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+        notes: isHoliday ? 'Generated from finalized holiday work' : 'Generated from finalized weekly-off work',
+      },
+    });
+  }
+
+  /**
+   * Manually credits a comp-off. HR needs this for a credit outside the automatic path —
+   * an ad-hoc grant (an on-call day, a day worked before the tenant's holiday calendar was
+   * loaded, a correction) — or for a tenant with `PayrollPolicy.compOffEnabled` off.
    *
    * The earned day is linked to its attendance record when one exists, so the
    * grant and the day it was earned on stay traceable to each other, and a
@@ -2916,21 +2983,120 @@ export class AttendanceService {
     });
   }
 
-  /** Marks a grant used, cancelled or expired. Only an available grant can move. */
+  /**
+   * Marks a grant used, cancelled or expired. Only an available grant can move.
+   *
+   * `USED` additionally requires `usedOnDate` — the specific scheduled working day the
+   * comp-off is being spent against — validated by {@link validateCompOffUsage}: it must
+   * fall in the same usage period as `earnedDate` (or, with carry-forward on, no later than
+   * the grant's own `expiresAt`), and it must be a day the employee was actually scheduled
+   * to work, not a weekly off or holiday. An available balance alone never grants usage;
+   * the work date must be named.
+   *
+   * The transition is applied with `updateMany` gated on `status: AVAILABLE`, so a grant
+   * decided twice concurrently only ever moves once — the loser gets a 409, not a silently
+   * duplicated use — the same optimistic-concurrency pattern `respondToClarification` uses
+   * for expense claims.
+   */
   async decideCompOff(user: AuthUser, id: string, dto: DecideCompOffDto) {
     const grant = await this.prisma.compOffGrant.findFirst({
       where: { id, tenantId: user.tenantId },
-      include: { employee: { select: { managerId: true } } },
+      include: { employee: { select: { managerId: true, locationId: true } } },
     });
     if (!grant) throw new NotFoundException('Comp-off not found');
     if (grant.status !== CompOffStatus.AVAILABLE) {
       throw new BadRequestException(`This comp-off is already ${grant.status.toLowerCase()}`);
     }
     assertCanDecideApproval(user, grant.employeeId, grant.employee.managerId);
-    return this.prisma.compOffGrant.update({
-      where: { id },
-      data: { status: dto.status, ...(dto.notes && { notes: dto.notes }) },
+
+    const usedOnDate =
+      dto.status === CompOffStatus.USED
+        ? await this.validateCompOffUsage(user.tenantId, grant, dto.usedOnDate)
+        : undefined;
+
+    const { count } = await this.prisma.compOffGrant.updateMany({
+      where: { id, status: CompOffStatus.AVAILABLE },
+      data: {
+        status: dto.status,
+        ...(usedOnDate && { usedOnDate }),
+        ...(dto.notes && { notes: dto.notes }),
+      },
     });
+    if (count === 0) {
+      throw new ConflictException('This comp-off was already decided. Reload it to see where it stands.');
+    }
+    return this.prisma.compOffGrant.findFirstOrThrow({ where: { id } });
+  }
+
+  /**
+   * Validates a comp-off usage request and returns the day it resolves to.
+   *
+   * Usage-period rule (from `PayrollPolicy.compOffUsagePeriod`, resolved for the employee's
+   * location): `usedOnDate` must fall in the same calendar month (`MONTHLY`) or calendar year
+   * (`ANNUAL`) as `earnedDate`. `compOffCarryForwardEnabled` governs only whether crossing
+   * that period boundary is allowed at all — it does not relax anything else. When it does
+   * allow crossing, the grant's own `expiresAt` (already set at grant time, independent of
+   * this policy) remains the outer limit: carry-forward lets the grant survive into the next
+   * period, not indefinitely.
+   */
+  private async validateCompOffUsage(
+    tenantId: string,
+    grant: {
+      employeeId: string;
+      earnedDate: Date;
+      expiresAt: Date | null;
+      employee: { locationId: string | null };
+    },
+    usedOnDateInput?: string,
+  ): Promise<Date> {
+    if (!usedOnDateInput) {
+      throw new BadRequestException('usedOnDate is required to mark a comp-off used');
+    }
+    const usedOnDate = requireAttendanceDate(usedOnDateInput, 'usedOnDate');
+
+    const policy = await this.payrollPolicies.resolve(tenantId, grant.employee.locationId);
+    const samePeriod = this.compOffUsagePeriodMatches(
+      policy.compOffUsagePeriod,
+      grant.earnedDate,
+      usedOnDate,
+    );
+    if (!samePeriod) {
+      if (!policy.compOffCarryForwardEnabled) {
+        const unit = policy.compOffUsagePeriod === CompOffUsagePeriod.ANNUAL ? 'calendar year' : 'calendar month';
+        throw new BadRequestException(`This comp-off must be used within the same ${unit} it was earned in`);
+      }
+      // Carry-forward lets usage cross into a later period, but never past the grant's own
+      // expiry — the same ceiling that already governs every grant regardless of this policy.
+      if (grant.expiresAt && usedOnDate > grant.expiresAt) {
+        throw new BadRequestException('This comp-off has expired and can no longer be used');
+      }
+    }
+
+    const { isWeeklyOff } = await this.weeklyOffAt(tenantId, grant.employeeId, usedOnDate);
+    if (isWeeklyOff) {
+      throw new BadRequestException('A comp-off cannot be used on a weekly off');
+    }
+    const dayKey = usedOnDate.toISOString().slice(0, 10);
+    const isHoliday = (await this.holidayDateSet(tenantId, usedOnDate, usedOnDate)).has(dayKey);
+    if (isHoliday) {
+      throw new BadRequestException('A comp-off cannot be used on a holiday');
+    }
+
+    return usedOnDate;
+  }
+
+  /**
+   * Whether `usedOnDate` falls in the same usage period as `earnedDate`: the same calendar
+   * month for `MONTHLY`, the same calendar year for `ANNUAL`.
+   */
+  private compOffUsagePeriodMatches(
+    period: CompOffUsagePeriod,
+    earnedDate: Date,
+    usedOnDate: Date,
+  ): boolean {
+    if (earnedDate.getUTCFullYear() !== usedOnDate.getUTCFullYear()) return false;
+    if (period === CompOffUsagePeriod.ANNUAL) return true;
+    return earnedDate.getUTCMonth() === usedOnDate.getUTCMonth();
   }
 
   async listShiftSwaps(user: AuthUser) {

@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AgeCategory, Prisma } from '@prisma/client';
+import { AgeCategory, CompOffUsagePeriod, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
@@ -28,6 +28,11 @@ import {
   WaiveLoanDto,
 } from './dto/payroll.dto';
 import { PayrollCalculatorService } from './payroll-calculator.service';
+import { PayrollPolicyService } from './payroll-policy.service';
+import { hashPolicySnapshot } from './payroll-policy-snapshot';
+import { ResolvedDenominator, SalaryDenominatorService } from './salary-denominator.service';
+
+const POLICY_STALE_MESSAGE = 'Payroll policy changed since this run was processed. Reprocess to apply.';
 
 /**
  * Employee statuses that may file a claim. Same set leave self-service accepts, so a
@@ -90,7 +95,16 @@ const EXPENSE_POLICY_LIMITS: Record<string, number> = {
   MEDICAL: 15000,
 };
 
-const EARNING_INPUTS = new Set(['BONUS', 'ARREAR', 'INCENTIVE', 'OVERTIME', 'REIMBURSEMENT', 'LEAVE_ENCASHMENT', 'FULL_AND_FINAL']);
+const EARNING_INPUTS = new Set([
+  'BONUS',
+  'ARREAR',
+  'INCENTIVE',
+  'OVERTIME',
+  'REIMBURSEMENT',
+  'LEAVE_ENCASHMENT',
+  'FULL_AND_FINAL',
+  'COMP_OFF_PAYOUT',
+]);
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -102,6 +116,8 @@ export class PayrollService {
     private readonly prisma: PrismaService,
     private readonly calculator: PayrollCalculatorService,
     private readonly tdsEngine: TdsEngineService,
+    private readonly denominators: SalaryDenominatorService,
+    private readonly payrollPolicies: PayrollPolicyService,
   ) {}
 
   // ── Structures ────────────────────────────────────────────────────────────
@@ -387,12 +403,16 @@ export class PayrollService {
       _sum: { netPay: true, grossPay: true },
     });
     const totalMap = new Map(totals.map((t) => [t.payrollRunId, t._sum]));
-    return runs.map((r) => ({
-      ...r,
-      employees: r._count.entries,
-      totalNet: totalMap.get(r.id)?.netPay ?? 0,
-      totalGross: totalMap.get(r.id)?.grossPay ?? 0,
-    }));
+    return Promise.all(
+      runs.map(async (r) => ({
+        ...r,
+        employees: r._count.entries,
+        totalNet: totalMap.get(r.id)?.netPay ?? 0,
+        totalGross: totalMap.get(r.id)?.grossPay ?? 0,
+        policyStale: await this.isPolicyStale(tenantId, r),
+        policySnapshotAvailable: this.hasPolicySnapshot(r),
+      })),
+    );
   }
 
   async getRun(tenantId: string, id: string) {
@@ -431,6 +451,8 @@ export class PayrollService {
     return {
       ...run,
       entries,
+      policyStale: await this.isPolicyStale(tenantId, run),
+      policySnapshotAvailable: this.hasPolicySnapshot(run),
       totals: {
         totalNet,
         totalGross,
@@ -650,17 +672,46 @@ export class PayrollService {
   }
 
   async processRun(tenantId: string, id: string, actorId?: string) {
+    return this.executeRun(tenantId, id, actorId, 'PROCESS');
+  }
+
+  /**
+   * Recomputes a run that has already been processed, so it picks up whatever changed since -
+   * a payroll policy above all. Only REVIEW and APPROVED runs qualify: LOCKED, PUBLISHED and
+   * CLOSED are immutable. An APPROVED run drops back to REVIEW and must be approved again.
+   *
+   * It is the same computation as `processRun`, which already replaces each employee's entry
+   * (upsert) and each comp-off payout it owns (delete + recreate), so repeating it never
+   * accumulates amounts.
+   */
+  async reprocessRun(tenantId: string, id: string, actorId?: string) {
+    return this.executeRun(tenantId, id, actorId, 'REPROCESS');
+  }
+
+  private async executeRun(tenantId: string, id: string, actorId: string | undefined, mode: 'PROCESS' | 'REPROCESS') {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
-    if (!['DRAFT', 'PROCESSING'].includes(run.status)) {
+    if (mode === 'PROCESS' && !['DRAFT', 'PROCESSING'].includes(run.status)) {
       throw new BadRequestException(`Run is ${run.status}; only DRAFT runs can be processed`);
     }
+    if (mode === 'REPROCESS' && !['REVIEW', 'APPROVED'].includes(run.status)) {
+      throw new BadRequestException(`Run is ${run.status}; only REVIEW or APPROVED runs can be reprocessed`);
+    }
 
-    const daysInMonth = new Date(run.year, run.month, 0).getDate();
     const monthStart = new Date(Date.UTC(run.year, run.month - 1, 1));
     const monthEnd = new Date(Date.UTC(run.year, run.month, 0));
+    const calendarDays = monthEnd.getUTCDate();
 
-    await this.prisma.payrollRun.update({ where: { id }, data: { status: 'PROCESSING' } });
+    // Claimed against the status read above, not just written: a run that was locked or
+    // reprocessed by someone else in the meantime must not be pulled back into REVIEW by
+    // this call finishing later. PROCESSING also keeps approve/lock out while it recomputes.
+    const claimed = await this.prisma.payrollRun.updateMany({
+      where: { id, tenantId, status: run.status },
+      data: { status: 'PROCESSING' },
+    });
+    if (claimed.count === 0) {
+      throw new ConflictException('Payroll run changed while it was being processed; reload and try again');
+    }
     const employees = await this.prisma.employee.findMany({
       where: {
         tenantId,
@@ -702,8 +753,40 @@ export class PayrollService {
       },
     });
 
+    // The policy inputs this run is computed with, recorded so a later policy change can be
+    // detected. Taken before anything below reads a policy: if one is edited mid-run the
+    // stored snapshot is then the older one, so the run reads as stale instead of silently
+    // claiming to match a policy part of it may not have used.
+    const policySnapshot = await this.payrollPolicies.snapshotForLocations(
+      tenantId,
+      employees.map((employee) => employee.locationId),
+    );
+
+    // Salary denominator per employee, from the PayrollPolicy that applies at their location.
+    // Resolved before any entry is written so a misconfigured FIXED_DAYS policy fails the run
+    // outright instead of paying part of it on a denominator the policy did not ask for.
+    const denominators = await this.denominators.resolveForMonth(
+      tenantId,
+      run.month,
+      run.year,
+      employees.map((employee) => ({ id: employee.id, locationId: employee.locationId })),
+    );
+
+    // Unused AVAILABLE Comp-Off is resolved into a PAY earning (or left UNPAID) before the
+    // variable-input batch below is read, so a payout this call creates is picked up by that
+    // same read - the existing earning-input pipeline, not a parallel one. Deletes and
+    // recreates its own inputs for this run every time, so a rerun never doubles a payout.
+    await this.applyUnusedCompOffPayouts(tenantId, run, employees, denominators, monthStart, monthEnd);
+
+    // Whether an already-APPROVED OVERTIME input actually pays out, per the PayrollPolicy at
+    // each employee's own location - resolved once per location, not per employee.
+    const overtimePaidByEmployee = await this.resolveOvertimePaidByEmployee(tenantId, employees);
+
     const attendanceWarnings = await this.attendanceWarningMap(tenantId, monthStart, monthEnd);
-    const attendanceLopByEmployee = await this.attendanceLossDayMap(tenantId, monthStart, monthEnd);
+    // Attendance-absence and LWP LOP, broken down per date rather than summed per employee,
+    // so a used Comp-Off's `usedOnDate` can offset the exact day it names (see processing
+    // loop below) instead of being netted against the employee's total.
+    const lopContributions = await this.lopContributionsByDate(tenantId, monthStart, monthEnd);
     const attendanceFinalized =
       run.runType === 'MONTHLY' ? await this.hasMonthlyAttendanceFinalization(run) : true;
     const taxYear = await this.activeTaxYear(tenantId, monthStart, monthEnd);
@@ -717,72 +800,70 @@ export class PayrollService {
         )
       : null;
 
-    // Unpaid leave days (LWP) reduce payable days
-    const lwpRequests = await this.prisma.leaveRequest.findMany({
-      where: {
-        tenantId,
-        status: 'APPROVED',
-        leaveType: { isPaid: false },
-        fromDate: { lte: monthEnd },
-        toDate: { gte: monthStart },
-      },
-      select: { employeeId: true, days: true, fromDate: true, toDate: true },
-    });
-    const lwpByEmployee = new Map<string, number>();
-    for (const r of lwpRequests) {
-      const daysInPeriod = this.leaveDaysInPeriod(r, monthStart, monthEnd);
-      if (daysInPeriod <= 0) continue;
-      lwpByEmployee.set(r.employeeId, (lwpByEmployee.get(r.employeeId) ?? 0) + daysInPeriod);
-    }
     const employeeIds = employees.map((employee) => employee.id);
-    const [variableInputs, payrollExpenses, pendingLeave, pendingExpenses, duplicateCodes] = await Promise.all([
-      this.prisma.payrollVariableInput.findMany({
-        where: {
-          tenantId,
-          employeeId: { in: employeeIds },
-          status: 'APPROVED',
-          OR: [
-            { payrollRunId: run.id },
-            { payrollRunId: null, month: run.month, year: run.year },
-          ],
-        },
-      }),
-      this.prisma.expenseClaim.findMany({
-        where: {
-          tenantId,
-          employeeId: { in: employeeIds },
-          status: 'APPROVED',
-          reimbursementMethod: 'PAYROLL',
-        },
-      }),
-      this.prisma.leaveRequest.groupBy({
-        by: ['employeeId'],
-        where: {
-          tenantId,
-          employeeId: { in: employeeIds },
-          status: 'PENDING',
-          fromDate: { lte: monthEnd },
-          toDate: { gte: monthStart },
-        },
-        _count: true,
-      }),
-      this.prisma.expenseClaim.groupBy({
-        by: ['employeeId'],
-        where: { tenantId, employeeId: { in: employeeIds }, status: { in: ['SUBMITTED', 'CLARIFICATION_REQUESTED'] } },
-        _count: true,
-      }),
-      this.prisma.employee.groupBy({
-        by: ['employeeCode'],
-        where: { tenantId },
-        _count: true,
-        having: { employeeCode: { _count: { gt: 1 } } },
-      }),
-    ]);
+    const [variableInputs, payrollExpenses, pendingLeave, pendingExpenses, duplicateCodes, usedCompOffGrants] =
+      await Promise.all([
+        this.prisma.payrollVariableInput.findMany({
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'APPROVED',
+            OR: [
+              { payrollRunId: run.id },
+              { payrollRunId: null, month: run.month, year: run.year },
+            ],
+          },
+        }),
+        this.prisma.expenseClaim.findMany({
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'APPROVED',
+            reimbursementMethod: 'PAYROLL',
+          },
+        }),
+        this.prisma.leaveRequest.groupBy({
+          by: ['employeeId'],
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'PENDING',
+            fromDate: { lte: monthEnd },
+            toDate: { gte: monthStart },
+          },
+          _count: true,
+        }),
+        this.prisma.expenseClaim.groupBy({
+          by: ['employeeId'],
+          where: { tenantId, employeeId: { in: employeeIds }, status: { in: ['SUBMITTED', 'CLARIFICATION_REQUESTED'] } },
+          _count: true,
+        }),
+        this.prisma.employee.groupBy({
+          by: ['employeeCode'],
+          where: { tenantId },
+          _count: true,
+          having: { employeeCode: { _count: { gt: 1 } } },
+        }),
+        // Only USED grants whose usedOnDate falls inside this payroll month can offset
+        // anything here; AVAILABLE/EXPIRED/CANCELLED grants are never read for payroll, and
+        // a grant used outside this month cannot reach a date this run has no record of.
+        // Nothing here writes to CompOffGrant - payroll only ever reads it.
+        this.prisma.compOffGrant.findMany({
+          where: {
+            tenantId,
+            employeeId: { in: employeeIds },
+            status: 'USED',
+            usedOnDate: { gte: monthStart, lte: monthEnd },
+          },
+          select: { employeeId: true, usedOnDate: true },
+        }),
+      ]);
     const inputsByEmployee = this.groupByEmployee(variableInputs);
     const expensesByEmployee = this.groupByEmployee(payrollExpenses);
     const pendingLeaveByEmployee = new Map(pendingLeave.map((row) => [row.employeeId, row._count]));
     const pendingExpenseByEmployee = new Map(pendingExpenses.map((row) => [row.employeeId, row._count]));
     const duplicateCodeSet = new Set(duplicateCodes.map((row) => row.employeeCode));
+    const usedCompOffDatesByEmployee = this.groupByEmployee(usedCompOffGrants);
 
     let processed = 0;
     let errorCount = 0;
@@ -813,16 +894,41 @@ export class PayrollService {
       const unfinalized = attendanceWarnings.get(emp.id);
       if (unfinalized) warnings.push(`${unfinalized} attendance record(s) are not finalized`);
 
-      const attendanceLop = attendanceLopByEmployee.get(emp.id) ?? 0;
+      const attendanceLop = lopContributions.attendanceTotalByEmployee.get(emp.id) ?? 0;
       if (attendanceLop > 0) warnings.push(`${attendanceLop} attendance LOP day(s) from finalized absences/half-days`);
-      const lopDays = Math.min((lwpByEmployee.get(emp.id) ?? 0) + attendanceLop, daysInMonth);
-      const payableDays = daysInMonth - lopDays;
+      // Comp-Off offset is applied per date before the employee's days are totalled: a used
+      // grant removes only the LOP its own usedOnDate actually contributed - 1 for an
+      // absence, 0.5 for a half day, nothing if that date had none - and never the leftover
+      // from one date onto another. See applyCompOffOffsets.
+      const usedOnDates = (usedCompOffDatesByEmployee.get(emp.id) ?? [])
+        .map((grant) => grant.usedOnDate)
+        .filter((date): date is Date => date !== null);
+      const { lopDays: rawLopDays, offsetDays: compOffOffsetDays } = this.applyCompOffOffsets(
+        lopContributions.byDate.get(emp.id) ?? new Map<string, number>(),
+        usedOnDates,
+      );
+      if (compOffOffsetDays > 0) {
+        warnings.push(`${compOffOffsetDays} day(s) of LOP offset by used comp-off`);
+      }
+      // The configured denominator drives monthly salary -> daily salary -> LOP alike: LOP is
+      // capped at it so a full month of absence zeroes pay and never turns it negative. An
+      // unusable denominator still reports the LOP it found, capped at the calendar month.
+      const denominator = denominators.get(emp.id);
+      if (denominator?.error) errors.push(denominator.error);
+      const denominatorDays = denominator?.days ?? calendarDays;
+      const lopCap = denominator?.error ? calendarDays : denominatorDays;
+      const lopDays = Math.min(rawLopDays, lopCap);
+      // Clamped rather than merely capped: an unusable denominator is 0 while its LOP is still
+      // reported against the calendar month, and payable days must never go negative even
+      // though that path writes a zeroed entry anyway. Comp-Off can only ever reduce lopDays,
+      // so payableDays can never exceed denominatorDays because of it.
+      const payableDays = Math.max(0, denominatorDays - lopDays);
       const dueLoans = emp.loans.map((loan) => ({
         ...loan,
         due: this.loanDueForMonth(loan, run.month, run.year),
       })).filter((loan) => loan.due > 0);
       const emi = dueLoans.reduce((s, l) => s + l.due, 0);
-      if (!salary) {
+      if (!salary || denominator?.error) {
         await this.prisma.payrollRunEmployee.upsert({
           where: { payrollRunId_employeeId: { payrollRunId: run.id, employeeId: emp.id } },
           create: {
@@ -855,12 +961,18 @@ export class PayrollService {
       const result = this.calculateProratedMonth({
         salaries,
         payableDays,
-        daysInMonth,
+        denominatorDays,
         monthStart,
         monthEnd,
         monthlyEmiDeduction: emi,
       });
-      const manualInputs = inputsByEmployee.get(emp.id) ?? [];
+      // An APPROVED OVERTIME input still exists and is still APPROVED either way - it is
+      // filtered out of this run's own earning calculation only, never deleted or mutated,
+      // so re-enabling the policy later picks it back up unchanged. DRAFT OVERTIME was never
+      // in inputsByEmployee to begin with (that query is already APPROVED-only).
+      const manualInputs = (inputsByEmployee.get(emp.id) ?? []).filter(
+        (input) => input.type !== 'OVERTIME' || overtimePaidByEmployee.get(emp.id) !== false,
+      );
       const expenseInputs = (expensesByEmployee.get(emp.id) ?? []).map((expense) => ({
         id: expense.id,
         type: 'REIMBURSEMENT',
@@ -965,12 +1077,56 @@ export class PayrollService {
         data: { reimbursedInPayrollRunId: run.id },
       });
     }
-    await this.prisma.payrollRun.update({ where: { id }, data: { status: 'REVIEW' } });
-    await this.audit(tenantId, actorId, 'PAYROLL_RUN_PROCESSED', 'PayrollRun', id, undefined, {
-      processed,
-      errors: errorCount,
-      warnings: warningCount,
+    // A recompute replaces the run's results outright, so an employee who has dropped out of
+    // scope since the last pass (exited, moved location) must not keep a stale entry behind -
+    // nor the tax computation snapshot recorded for it, which is keyed to this run and feeds
+    // its TDS summary. Removed together so neither outlives the other.
+    // `EmployeeMonthlyTds` is deliberately left alone: it is one row per employee per tax
+    // month (not per run), `payrollRunId` on it is only whichever run wrote it last, and later
+    // months' TDS and the tax module's history read it independently of this run.
+    await this.prisma.$transaction([
+      this.prisma.payrollRunEmployee.deleteMany({
+        where: { payrollRunId: run.id, employeeId: { notIn: employeeIds } },
+      }),
+      this.prisma.taxComputationSnapshot.deleteMany({
+        where: { tenantId, payrollRunId: run.id, employeeId: { notIn: employeeIds } },
+      }),
+    ]);
+    const policyHash = hashPolicySnapshot(policySnapshot);
+    // The warning override attested to the warnings of the previous pass; this pass has its
+    // own, so the override is cleared and must be given again if warnings remain.
+    await this.prisma.payrollRun.update({
+      where: { id },
+      data: {
+        status: 'REVIEW',
+        policySnapshot: policySnapshot as unknown as Prisma.InputJsonValue,
+        policyHash,
+        warningOverrideReason: null,
+        warningsOverriddenAt: null,
+        warningsOverriddenById: null,
+      },
     });
+    if (mode === 'REPROCESS') {
+      await this.audit(
+        tenantId,
+        actorId,
+        'PAYROLL_RUN_REPROCESSED',
+        'PayrollRun',
+        id,
+        {
+          status: run.status,
+          policyHash: run.policyHash,
+          warningsOverridden: Boolean(run.warningsOverriddenAt),
+        },
+        { status: 'REVIEW', policyHash, processed, errors: errorCount, warnings: warningCount },
+      );
+    } else {
+      await this.audit(tenantId, actorId, 'PAYROLL_RUN_PROCESSED', 'PayrollRun', id, undefined, {
+        processed,
+        errors: errorCount,
+        warnings: warningCount,
+      });
+    }
     return { processed, errors: errorCount, warnings: warningCount, status: 'REVIEW' };
   }
 
@@ -978,6 +1134,7 @@ export class PayrollService {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
     if (run.status !== 'REVIEW') throw new BadRequestException('Run must be in REVIEW to approve');
+    if (await this.isPolicyStale(tenantId, run)) throw new BadRequestException(POLICY_STALE_MESSAGE);
     const entries = await this.prisma.payrollRunEmployee.findMany({
       where: { payrollRunId: id },
       select: { errors: true, warnings: true },
@@ -1003,6 +1160,28 @@ export class PayrollService {
     return updated;
   }
 
+  /**
+   * Whether a run still awaiting sign-off was processed under payroll policies that have since
+   * changed. Only REVIEW and APPROVED runs can be stale: earlier runs have no results to
+   * outdate, and later ones are frozen. Nothing is recalculated here or on a policy save -
+   * the run just reports the mismatch until it is reprocessed.
+   */
+  private async isPolicyStale(
+    tenantId: string,
+    run: { status: string; policySnapshot: Prisma.JsonValue | null; policyHash: string | null },
+  ): Promise<boolean> {
+    if (!['REVIEW', 'APPROVED'].includes(run.status)) return false;
+    // A legacy run (processed before snapshots were recorded) has nothing to compare against
+    // and is never reconstructed, so it stays non-stale until it is reprocessed.
+    if (!this.hasPolicySnapshot(run)) return false;
+    return this.payrollPolicies.isSnapshotStale(tenantId, run);
+  }
+
+  /** Whether a snapshot was recorded for the run; false only for legacy runs. */
+  private hasPolicySnapshot(run: { policySnapshot: Prisma.JsonValue | null; policyHash: string | null }): boolean {
+    return Boolean(run.policyHash && run.policySnapshot);
+  }
+
   async overrideRunWarnings(tenantId: string, id: string, userId: string, dto: OverrideWarningsDto) {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
@@ -1022,6 +1201,10 @@ export class PayrollService {
   async lockRun(tenantId: string, id: string, userId: string) {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
+    // Ahead of the status check and of anything below that writes: a run whose policy has
+    // changed since it was processed must not be frozen (or reach LOCKED at all), and locking
+    // records loan installments, which cannot be undone by reprocessing afterwards.
+    if (await this.isPolicyStale(tenantId, run)) throw new BadRequestException(POLICY_STALE_MESSAGE);
     if (run.status !== 'APPROVED') throw new BadRequestException('Run must be APPROVED before locking');
     await this.recordLoanInstallmentsForRun(run);
     const updated = await this.prisma.payrollRun.update({
@@ -1288,6 +1471,31 @@ export class PayrollService {
     return updated;
   }
 
+  /**
+   * Whether an APPROVED `OVERTIME` variable input actually pays out for each employee, per
+   * `PayrollPolicy.overtimePaymentEnabled` resolved at their own location - two employees in
+   * the same run can legitimately resolve different policies, same as the salary denominator
+   * and unused-Comp-Off payout already do. Resolved once per location, not per employee.
+   */
+  private async resolveOvertimePaidByEmployee(
+    tenantId: string,
+    employees: Array<{ id: string; locationId: string | null }>,
+  ): Promise<Map<string, boolean>> {
+    const policyCache = new Map<string, boolean>();
+    const result = new Map<string, boolean>();
+    for (const employee of employees) {
+      const locationKey = employee.locationId ?? '';
+      let overtimePaymentEnabled = policyCache.get(locationKey);
+      if (overtimePaymentEnabled === undefined) {
+        const policy = await this.payrollPolicies.resolve(tenantId, employee.locationId);
+        overtimePaymentEnabled = policy.overtimePaymentEnabled;
+        policyCache.set(locationKey, overtimePaymentEnabled);
+      }
+      result.set(employee.id, overtimePaymentEnabled);
+    }
+    return result;
+  }
+
   private async attendanceWarningMap(tenantId: string, monthStart: Date, monthEnd: Date) {
     const grouped = await this.prisma.attendanceRecord.groupBy({
       by: ['employeeId'],
@@ -1329,48 +1537,267 @@ export class PayrollService {
     return Boolean(finalization);
   }
 
-  private async attendanceLossDayMap(tenantId: string, monthStart: Date, monthEnd: Date) {
-    const records = await this.prisma.attendanceRecord.findMany({
-      where: {
-        tenantId,
-        date: { gte: monthStart, lte: monthEnd },
-        isFinalized: true,
-        status: { in: ['ABSENT', 'HALF_DAY'] },
-      },
-      select: { employeeId: true, status: true },
-    });
-    const result = new Map<string, number>();
-    for (const record of records) {
-      result.set(record.employeeId, (result.get(record.employeeId) ?? 0) + (record.status === 'HALF_DAY' ? 0.5 : 1));
+  /**
+   * Per-employee, per-date LOP contribution for the payroll month, before any Comp-Off
+   * offset is applied - the day-level detail a Comp-Off `usedOnDate` is matched against
+   * (see {@link applyCompOffOffsets}), keyed by the ISO day the contribution falls on.
+   *
+   * Attendance and LWP are independent sources that can both land on the same date; their
+   * contributions are summed there rather than one replacing the other, matching how the
+   * pre-existing aggregate (`attendanceLop + lwp`) totalled them.
+   *
+   * A leave request's `days` total is spread evenly across its own calendar span - the same
+   * assumption the original `leaveDaysInPeriod` used to prorate a request across a month
+   * boundary - just decomposed to one day at a time here so a specific date can be matched
+   * and offset without touching any other day of a multi-day request.
+   */
+  private async lopContributionsByDate(
+    tenantId: string,
+    monthStart: Date,
+    monthEnd: Date,
+  ): Promise<{ byDate: Map<string, Map<string, number>>; attendanceTotalByEmployee: Map<string, number> }> {
+    const [attendanceRecords, lwpRequests] = await Promise.all([
+      this.prisma.attendanceRecord.findMany({
+        where: {
+          tenantId,
+          date: { gte: monthStart, lte: monthEnd },
+          isFinalized: true,
+          status: { in: ['ABSENT', 'HALF_DAY'] },
+        },
+        select: { employeeId: true, date: true, status: true },
+      }),
+      this.prisma.leaveRequest.findMany({
+        where: {
+          tenantId,
+          status: 'APPROVED',
+          leaveType: { isPaid: false },
+          fromDate: { lte: monthEnd },
+          toDate: { gte: monthStart },
+        },
+        select: { employeeId: true, days: true, fromDate: true, toDate: true },
+      }),
+    ]);
+
+    const result = new Map<string, Map<string, number>>();
+    const add = (employeeId: string, dayKey: string, amount: number) => {
+      if (amount <= 0) return;
+      const byDate = result.get(employeeId) ?? new Map<string, number>();
+      byDate.set(dayKey, (byDate.get(dayKey) ?? 0) + amount);
+      result.set(employeeId, byDate);
+    };
+
+    // Tracked separately from `result` only so callers can report "N attendance LOP day(s)"
+    // as they did before this method existed - it plays no part in the offset itself.
+    const attendanceTotalByEmployee = new Map<string, number>();
+    for (const record of attendanceRecords) {
+      const amount = record.status === 'HALF_DAY' ? 0.5 : 1;
+      add(record.employeeId, this.dayKey(record.date), amount);
+      attendanceTotalByEmployee.set(
+        record.employeeId,
+        (attendanceTotalByEmployee.get(record.employeeId) ?? 0) + amount,
+      );
     }
-    return result;
+
+    for (const leave of lwpRequests) {
+      const clippedFrom = leave.fromDate < monthStart ? monthStart : leave.fromDate;
+      const clippedTo = leave.toDate > monthEnd ? monthEnd : leave.toDate;
+      if (clippedTo < clippedFrom) continue;
+      const totalSpanDays = this.inclusiveDayCount(leave.fromDate, leave.toDate);
+      if (totalSpanDays <= 0) continue;
+      const dailyRate = leave.days / totalSpanDays;
+      for (let d = new Date(clippedFrom); d <= clippedTo; d.setUTCDate(d.getUTCDate() + 1)) {
+        add(leave.employeeId, this.dayKey(d), dailyRate);
+      }
+    }
+
+    return { byDate: result, attendanceTotalByEmployee };
   }
 
   /**
-   * The portion of an approved leave request that falls inside the payroll
-   * period. A request contained in the period keeps its stored `days` verbatim,
-   * so single-month and half-day requests are unchanged. A request straddling a
-   * month boundary is split across its calendar span, which keeps the sum of the
-   * monthly portions equal to the request total and stops the same leave days
-   * from being deducted again in the adjacent month.
+   * Removes, from one employee's per-date LOP map, the contribution of every date named by
+   * a USED Comp-Off's `usedOnDate`. Each date is offset by exactly what it contributed - 1
+   * for a full absence, 0.5 for a half day, nothing for a date with no LOP - never the
+   * grant's own `days`, and never applied to any other date.
+   *
+   * A date already brought to zero (by an earlier grant, or one that had no LOP to begin
+   * with) is left alone, so two grants that happen to share a `usedOnDate` cannot
+   * double-offset the same day, and the total can never go negative.
    */
-  private leaveDaysInPeriod(
-    leave: { fromDate: Date; toDate: Date; days: number },
-    periodStart: Date,
-    periodEnd: Date,
-  ): number {
-    const clippedFrom = leave.fromDate < periodStart ? periodStart : leave.fromDate;
-    const clippedTo = leave.toDate > periodEnd ? periodEnd : leave.toDate;
-    if (clippedTo < clippedFrom) return 0;
-    const totalSpanDays = this.inclusiveDayCount(leave.fromDate, leave.toDate);
-    if (totalSpanDays <= 0) return 0;
-    const inPeriodSpanDays = this.inclusiveDayCount(clippedFrom, clippedTo);
-    if (inPeriodSpanDays >= totalSpanDays) return leave.days;
-    return round2((leave.days * inPeriodSpanDays) / totalSpanDays);
+  private applyCompOffOffsets(
+    byDate: Map<string, number>,
+    usedOnDates: Date[],
+  ): { lopDays: number; offsetDays: number } {
+    const working = new Map(byDate);
+    let offsetDays = 0;
+    for (const usedOnDate of usedOnDates) {
+      const key = this.dayKey(usedOnDate);
+      const contribution = working.get(key) ?? 0;
+      if (contribution > 0) {
+        working.set(key, 0);
+        offsetDays += contribution;
+      }
+    }
+    let lopDays = 0;
+    for (const contribution of working.values()) lopDays += contribution;
+    return { lopDays: round2(lopDays), offsetDays: round2(offsetDays) };
+  }
+
+  private dayKey(date: Date): string {
+    return date.toISOString().slice(0, 10);
   }
 
   private inclusiveDayCount(from: Date, to: Date): number {
     return Math.floor((to.getTime() - from.getTime()) / 86_400_000) + 1;
+  }
+
+  /**
+   * Resolves unused AVAILABLE Comp-Off for this run's employees into `PayrollPolicy.
+   * compOffUnusedTreatment`: `PAY` becomes a `COMP_OFF_PAYOUT` variable input through the
+   * existing earning-input pipeline (see `inputComponents`/`EARNING_INPUTS`); `UNPAID`
+   * creates nothing. `AVAILABLE` grants are never read by LOP or read here for any purpose
+   * other than this payout - they cannot offset absence (only a `USED` grant's `usedOnDate`
+   * can, see `applyCompOffOffsets`) and `CompOffGrant` itself is never written.
+   *
+   * A grant becomes eligible for the run whose month contains the date its usage period
+   * actually closes (see {@link compOffClosureDate}): the end of its earned month/year for
+   * `MONTHLY`/`ANNUAL`, or, when `compOffCarryForwardEnabled` lets it survive that boundary,
+   * the later of that period end and its own `expiresAt` (unchanged from Phase 4, never
+   * invented here). Tying eligibility to that one closing month, rather than "any AVAILABLE
+   * grant whose period has already ended", is what keeps a rerun of a later month from paying
+   * the same grant again without needing to mutate its status. A grant already past its own
+   * `expiresAt` at processing time is excluded outright, independent of that closure date.
+   *
+   * Idempotent the same way attendance finalization keeps its own OVERTIME/SHIFT_ALLOWANCE
+   * inputs in sync: every `COMP_OFF_PAYOUT` input already recorded against this run is deleted
+   * and, only where still eligible, recreated - inside one transaction - rather than probed
+   * with a findFirst before deciding whether to create.
+   */
+  private async applyUnusedCompOffPayouts(
+    tenantId: string,
+    run: { id: string; month: number; year: number },
+    employees: Array<{
+      id: string;
+      locationId: string | null;
+      employeeSalaries: Array<{ ctc: number; components: Prisma.JsonValue }>;
+    }>,
+    denominators: Map<string, ResolvedDenominator>,
+    monthStart: Date,
+    monthEnd: Date,
+  ): Promise<void> {
+    const employeeIds = employees.map((employee) => employee.id);
+    const deleteStale = this.prisma.payrollVariableInput.deleteMany({
+      where: { tenantId, payrollRunId: run.id, type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
+    });
+    if (!employeeIds.length) {
+      await this.prisma.$transaction([deleteStale]);
+      return;
+    }
+
+    const grants = await this.prisma.compOffGrant.findMany({
+      where: { tenantId, employeeId: { in: employeeIds }, status: 'AVAILABLE' },
+      select: { id: true, employeeId: true, earnedDate: true, expiresAt: true, days: true },
+    });
+
+    const processingNow = new Date();
+    const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
+    const policyCache = new Map<string, Awaited<ReturnType<PayrollPolicyService['resolve']>>>();
+    const resolvePolicy = async (employeeId: string) => {
+      const locationKey = locationByEmployee.get(employeeId) ?? '';
+      let policy = policyCache.get(locationKey);
+      if (!policy) {
+        policy = await this.payrollPolicies.resolve(tenantId, locationByEmployee.get(employeeId) ?? null);
+        policyCache.set(locationKey, policy);
+      }
+      return policy;
+    };
+
+    const eligibleByEmployee = new Map<string, { days: number; grantIds: string[] }>();
+    for (const grant of grants) {
+      if (grant.expiresAt && grant.expiresAt < processingNow) continue;
+      const policy = await resolvePolicy(grant.employeeId);
+      const closureDate = this.compOffClosureDate(policy, grant);
+      if (closureDate < monthStart || closureDate > monthEnd) continue;
+      const entry = eligibleByEmployee.get(grant.employeeId) ?? { days: 0, grantIds: [] };
+      entry.days = round2(entry.days + grant.days);
+      entry.grantIds.push(grant.id);
+      eligibleByEmployee.set(grant.employeeId, entry);
+    }
+
+    const salaryByEmployee = new Map(
+      employees.map((employee) => [employee.id, employee.employeeSalaries[employee.employeeSalaries.length - 1]]),
+    );
+    const creates: Prisma.PayrollVariableInputCreateManyInput[] = [];
+    for (const [employeeId, eligible] of eligibleByEmployee) {
+      if (eligible.days <= 0) continue;
+      const policy = await resolvePolicy(employeeId);
+      if (policy.compOffUnusedTreatment !== 'PAY') continue;
+      const salary = salaryByEmployee.get(employeeId);
+      const denominator = denominators.get(employeeId);
+      if (!salary || !denominator || denominator.error || denominator.days <= 0) continue;
+
+      // Same denominator-driven daily rate LOP already uses (see `calculateConfiguredMonth`'s
+      // `proration = payableDays / denominatorDays`), just evaluated at a full month
+      // (proration 1) so the rate reflects the configured salary undiluted by this month's
+      // own attendance - no separate Comp-Off rate formula.
+      const fullMonth = this.calculateConfiguredMonth({
+        ctc: salary.ctc,
+        storedComponents: salary.components,
+        payableDays: denominator.days,
+        denominatorDays: denominator.days,
+      });
+      const dailyRate = fullMonth.grossPay / denominator.days;
+      const amount = round2(dailyRate * eligible.days);
+      if (amount <= 0) continue;
+
+      creates.push({
+        tenantId,
+        employeeId,
+        payrollRunId: run.id,
+        month: run.month,
+        year: run.year,
+        type: 'COMP_OFF_PAYOUT',
+        label: `Unused comp-off payout (${eligible.days} day${eligible.days === 1 ? '' : 's'})`,
+        amount,
+        taxable: true,
+        status: 'APPROVED',
+        source: 'COMP_OFF',
+        metadata: { grantIds: eligible.grantIds, days: eligible.days, dailyRate: round2(dailyRate) },
+      });
+    }
+
+    const ops: Prisma.PrismaPromise<Prisma.BatchPayload>[] = [deleteStale];
+    if (creates.length) ops.push(this.prisma.payrollVariableInput.createMany({ data: creates }));
+    await this.prisma.$transaction(ops);
+  }
+
+  /**
+   * The date a Comp-Off grant's usage window closes.
+   *
+   * `validateCompOffUsage` only ever checks `expiresAt` when a usage crosses into a *later*
+   * period than `earnedDate` - within the same period, a grant stays usable through the
+   * period's own end regardless of `expiresAt` (e.g. the default 90-day auto-expiry ending
+   * before an `ANNUAL` period does). So the actual close of a grant's usage window is never
+   * earlier than its period end: without carry-forward it's exactly the period end; with
+   * carry-forward it's the later of the period end and `expiresAt` - the same ceiling
+   * `validateCompOffUsage` applies once carry-forward lets usage cross that boundary - never
+   * earlier, and never past an `expiresAt` it doesn't have.
+   */
+  private compOffClosureDate(
+    policy: { compOffUsagePeriod: CompOffUsagePeriod; compOffCarryForwardEnabled: boolean },
+    grant: { earnedDate: Date; expiresAt: Date | null },
+  ): Date {
+    const periodEnd = this.compOffPeriodEnd(policy.compOffUsagePeriod, grant.earnedDate);
+    if (!policy.compOffCarryForwardEnabled) return periodEnd;
+    if (!grant.expiresAt || grant.expiresAt <= periodEnd) return periodEnd;
+    return grant.expiresAt;
+  }
+
+  /** Last day of the calendar month (`MONTHLY`) or calendar year (`ANNUAL`) `earnedDate` falls in. */
+  private compOffPeriodEnd(period: CompOffUsagePeriod, earnedDate: Date): Date {
+    if (period === CompOffUsagePeriod.ANNUAL) {
+      return new Date(Date.UTC(earnedDate.getUTCFullYear(), 11, 31));
+    }
+    return new Date(Date.UTC(earnedDate.getUTCFullYear(), earnedDate.getUTCMonth() + 1, 0));
   }
 
   private async activeTaxYear(tenantId: string, monthStart: Date, monthEnd: Date) {
@@ -1760,12 +2187,12 @@ export class PayrollService {
     ctc: number;
     storedComponents: Prisma.JsonValue;
     payableDays: number;
-    daysInMonth: number;
+    denominatorDays: number;
     monthlyEmiDeduction?: number;
   }) {
     const stored = this.payrollComponents(input.storedComponents);
     if (!stored.length) return this.calculator.calculateMonth(input);
-    const proration = input.daysInMonth > 0 ? input.payableDays / input.daysInMonth : 1;
+    const proration = input.denominatorDays > 0 ? input.payableDays / input.denominatorDays : 1;
     const { earnings, employer, basic, grossPay } = this.configuredEarnings(stored, proration);
     const deductions = this.configuredDeductions(stored, grossPay, basic, proration, input.monthlyEmiDeduction);
     const totalDeductions = round2(deductions.reduce((sum, component) => sum + component.monthly, 0));
@@ -1849,19 +2276,19 @@ export class PayrollService {
   private calculateProratedMonth(input: {
     salaries: Array<{ ctc: number; components: Prisma.JsonValue; effectiveFrom: Date; effectiveTo: Date | null }>;
     payableDays: number;
-    daysInMonth: number;
+    denominatorDays: number;
     monthStart: Date;
     monthEnd: Date;
     monthlyEmiDeduction?: number;
   }) {
-    const { salaries, payableDays, daysInMonth, monthStart, monthEnd, monthlyEmiDeduction } = input;
+    const { salaries, payableDays, denominatorDays, monthStart, monthEnd, monthlyEmiDeduction } = input;
     if (salaries.length <= 1) {
       const salary = salaries[0];
       return this.calculateConfiguredMonth({
         ctc: salary.ctc,
         storedComponents: salary.components,
         payableDays,
-        daysInMonth,
+        denominatorDays,
         monthlyEmiDeduction,
       });
     }
@@ -1875,14 +2302,16 @@ export class PayrollService {
         return { salary, days: this.inclusiveDayCount(segmentStart, segmentEnd) };
       })
       .filter((segment) => segment.days > 0);
-    const totalSegmentDays = segments.reduce((sum, segment) => sum + segment.days, 0) || daysInMonth;
+    // Calendar span of each revision segment, used only to split payableDays between them.
+    // The denominator that turns those payable days into a proration stays the configured one.
+    const totalSegmentDays = segments.reduce((sum, segment) => sum + segment.days, 0) || denominatorDays;
 
     let earnings: Array<{ code: string; name: string; type: 'EARNING'; monthly: number; annual: number }> = [];
     let employer: Array<{ code: string; name: string; type: 'EMPLOYER_CONTRIBUTION'; monthly: number; annual: number }> = [];
     for (const segment of segments) {
       const stored = this.payrollComponents(segment.salary.components);
       const segmentPayableDays = (payableDays * segment.days) / totalSegmentDays;
-      const proration = daysInMonth > 0 ? segmentPayableDays / daysInMonth : 0;
+      const proration = denominatorDays > 0 ? segmentPayableDays / denominatorDays : 0;
       const segmentResult = stored.length
         ? this.configuredEarnings(stored, proration)
         : this.fallbackEarnings(segment.salary.ctc, proration);
@@ -1894,7 +2323,7 @@ export class PayrollService {
 
     const latest = salaries[salaries.length - 1];
     const latestStored = this.payrollComponents(latest.components);
-    const overallProration = daysInMonth > 0 ? payableDays / daysInMonth : 1;
+    const overallProration = denominatorDays > 0 ? payableDays / denominatorDays : 1;
     const deductions = this.configuredDeductions(
       latestStored.length ? latestStored : this.fallbackDeductionStubs(),
       grossPay,

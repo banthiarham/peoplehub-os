@@ -75,47 +75,111 @@ const RUN_ACTIONS: Record<string, RunAction> = {
   },
 };
 
+/** Recomputes a REVIEW or APPROVED run so it picks up whatever changed since it was processed. */
+const REPROCESS_ACTION: RunAction = {
+  label: 'Reprocess',
+  success: 'Payroll run reprocessed — ready for review',
+  run: (id) => api.post(`/payroll/runs/${id}/reprocess`),
+  capability: 'payrollLifecycle',
+};
+
+export const POLICY_STALE_MESSAGE =
+  'Payroll policy changed since this run was processed. Reprocess to apply.';
+
 interface PayrollRunActionButtonProps {
   runId: string;
   status: string;
+  /** The payroll policy changed since the run was processed; blocks approval until reprocessed. */
+  policyStale?: boolean;
   size?: ButtonProps['size'];
 }
 
-/** Renders the next lifecycle action for a payroll run (Process / Approve / Publish). */
-export function PayrollRunActionButton({ runId, status, size = 'sm' }: PayrollRunActionButtonProps) {
+/**
+ * Renders the next lifecycle action for a payroll run (Process / Approve / Publish), plus
+ * Reprocess while the run is still in REVIEW or APPROVED.
+ */
+export function PayrollRunActionButton({ runId, status, policyStale = false, size = 'sm' }: PayrollRunActionButtonProps) {
+  const action = RUN_ACTIONS[status];
+  const reprocessable = status === 'REVIEW' || status === 'APPROVED';
+  // Approve is the one step a stale run may not take; the API refuses it as well.
+  const approvalBlocked = status === 'REVIEW' && policyStale;
+
+  if (!action && !reprocessable) return null;
+
+  return (
+    <div className="flex items-center gap-2">
+      {action && (
+        <RunActionControl
+          action={action}
+          runId={runId}
+          size={size}
+          variant="secondary"
+          disabled={approvalBlocked}
+          hint={approvalBlocked ? POLICY_STALE_MESSAGE : undefined}
+        />
+      )}
+      {reprocessable && (
+        <RunActionControl
+          action={REPROCESS_ACTION}
+          runId={runId}
+          size={size}
+          variant={policyStale ? 'default' : 'outline'}
+          hint={policyStale ? POLICY_STALE_MESSAGE : undefined}
+          confirm={
+            status === 'APPROVED'
+              ? 'Reprocessing moves this approved run back to review. It must be approved again. Continue?'
+              : undefined
+          }
+        />
+      )}
+    </div>
+  );
+}
+
+interface RunActionControlProps {
+  action: RunAction;
+  runId: string;
+  size: ButtonProps['size'];
+  variant: ButtonProps['variant'];
+  disabled?: boolean;
+  hint?: string;
+  confirm?: string;
+}
+
+function RunActionControl({ action, runId, size, variant, disabled, hint, confirm }: RunActionControlProps) {
   const queryClient = useQueryClient();
   const toast = useToast();
   const { data: session } = useSession();
-  const action = RUN_ACTIONS[status];
   // Finance Admin, HR Admin and Manager can read payroll but cannot move a run through
   // its lifecycle, so the control is not rendered for them. The API rejects it regardless.
-  const permitted = action ? allows(viewerFromSession(session), action.capability) : false;
+  const permitted = allows(viewerFromSession(session), action.capability);
 
   const mutation = useMutation({
-    mutationFn: () => {
-      if (!action) throw new Error(`No action for status ${status}`);
-      return action.run(runId);
-    },
+    mutationFn: () => action.run(runId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['payroll'] });
-      toast(action?.success ?? 'Done', 'success');
+      toast(action.success, 'success');
     },
     onError: (err: unknown) => toast(payrollApiError(err), 'error'),
   });
 
-  if (!action || !permitted) return null;
+  if (!permitted) return null;
 
   return (
-    <Button
-      size={size}
-      variant="secondary"
-      disabled={mutation.isPending}
-      onClick={(e) => {
-        e.stopPropagation();
-        mutation.mutate();
-      }}
-    >
-      {mutation.isPending ? 'Working…' : action.label}
-    </Button>
+    // A disabled button swallows pointer events, so the explanation lives on the wrapper.
+    <span title={hint}>
+      <Button
+        size={size}
+        variant={variant}
+        disabled={disabled || mutation.isPending}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (confirm && !window.confirm(confirm)) return;
+          mutation.mutate();
+        }}
+      >
+        {mutation.isPending ? 'Working…' : action.label}
+      </Button>
+    </span>
   );
 }

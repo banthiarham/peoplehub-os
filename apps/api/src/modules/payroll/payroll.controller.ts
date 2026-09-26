@@ -251,6 +251,16 @@ export class PayrollController {
     return this.payroll.processRun(user.tenantId, id, user.userId);
   }
 
+  @Post('runs/:id/reprocess')
+  @Roles(...PAYROLL_LIFECYCLE_ROLES)
+  @Scopes('payroll:run')
+  @ApiOperation({
+    summary: 'Recompute a REVIEW or APPROVED run with current policies; an APPROVED run returns to REVIEW',
+  })
+  reprocessRun(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.payroll.reprocessRun(user.tenantId, id, user.userId);
+  }
+
   @Post('runs/:id/override-warnings')
   @Roles(...PAYROLL_LIFECYCLE_ROLES)
   @Scopes('payroll:run')

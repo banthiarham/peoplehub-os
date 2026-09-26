@@ -5,6 +5,7 @@ import { DeviceBindingService } from './device-binding.service';
 import { AttendanceQrService } from './attendance-qr.service';
 import { signQrToken } from './qr-token';
 import { ShiftResolutionService } from './shift-resolution.service';
+import { PayrollPolicyService } from '../payroll/payroll-policy.service';
 
 /**
  * Every collaborator shares the same prisma double: stubbing any of them
@@ -20,6 +21,7 @@ function newAttendanceService(prisma: unknown, env?: Record<string, string>): At
     new ShiftResolutionService(client as never),
     new DeviceBindingService(client as never, config),
     new AttendanceQrService(client as never, config),
+    new PayrollPolicyService(client as never),
   );
 }
 
@@ -136,6 +138,13 @@ function withPunchEvents(prisma: Record<string, any>): Record<string, any> {
     findFirst: jest.fn().mockResolvedValue(null),
     ...(prisma.holiday ?? {}),
   };
+  // PayrollPolicyService.resolve reads this. Empty by default: a test that says nothing
+  // about payroll policy means the tenant configured none, so it falls back to
+  // compOffEnabled: false and automatic comp-off granting stays off, matching production.
+  prisma.payrollPolicy = {
+    findFirst: jest.fn().mockResolvedValue(null),
+    ...(prisma.payrollPolicy ?? {}),
+  };
   return prisma;
 }
 
@@ -159,11 +168,16 @@ function buildFinalizeHarness(options: {
   existing?: ExistingRecordFixture[];
   approvedLeaves?: Array<{ employeeId: string; fromDate: Date; toDate: Date }>;
   holidays?: Date[];
+  /** Matched against the real `where`, same convention as PayrollPolicyService's own specs. */
+  payrollPolicies?: Array<Record<string, unknown>>;
+  /** Pre-existing comp-off grants, to exercise idempotency across a re-finalization. */
+  compOffGrants?: Array<Record<string, unknown>>;
 } = {}) {
   const employees = options.employees ?? [
     { id: 'emp-1', employeeCode: 'PH001', locationId: 'loc-b' },
   ];
   const existing = options.existing ?? [];
+  const compOffGrants = options.compOffGrants ?? [];
   const prisma = {
     employee: {
       count: jest.fn().mockResolvedValue(employees.length),
@@ -220,7 +234,41 @@ function buildFinalizeHarness(options: {
       deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
       create: jest.fn().mockResolvedValue({}),
     },
-    compOffGrant: { upsert: jest.fn().mockResolvedValue({}), findFirst: jest.fn() },
+    // Matched against the real `where` so a grant already linked to the attendance record,
+    // or an earlier manual credit for the same day, is genuinely found rather than assumed.
+    compOffGrant: {
+      findFirst: jest.fn(({ where }: { where: Record<string, unknown> }) => {
+        const matches = (grant: Record<string, unknown>) => {
+          if (where.sourceAttendanceRecordId !== undefined) {
+            return grant.sourceAttendanceRecordId === where.sourceAttendanceRecordId;
+          }
+          const clauses = (where.OR as Array<Record<string, unknown>>) ?? [where];
+          return clauses.some((clause) =>
+            Object.entries(clause).every(([key, value]) => {
+              if (key === 'status' && value && typeof value === 'object') {
+                return (value as { in: string[] }).in.includes(grant.status as string);
+              }
+              return grant[key] === value;
+            }),
+          );
+        };
+        return Promise.resolve(compOffGrants.find(matches) ?? null);
+      }),
+      create: jest.fn((args: { data: Record<string, unknown> }) => {
+        const created = { id: `grant-${compOffGrants.length + 1}`, status: 'AVAILABLE', ...args.data };
+        compOffGrants.push(created);
+        return Promise.resolve(created);
+      }),
+    },
+    payrollPolicy: {
+      findFirst: jest.fn(({ where }: { where: Record<string, unknown> }) =>
+        Promise.resolve(
+          (options.payrollPolicies ?? []).find((policy) =>
+            Object.entries(where).every(([key, value]) => policy[key] === value),
+          ) ?? null,
+        ),
+      ),
+    },
     shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
     shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
   };
@@ -229,7 +277,7 @@ function buildFinalizeHarness(options: {
     prisma.attendanceRecord.updateMany.mock.calls
       .map(([args]: [{ data: { status?: string } }]) => args)
       .find((args) => args.data.status === 'ON_LEAVE');
-  return { prisma, service, reconcileCall };
+  return { prisma, service, reconcileCall, compOffGrants };
 }
 
 describe('AttendanceService', () => {
@@ -2296,6 +2344,302 @@ describe('AttendanceService', () => {
     });
   });
 
+  describe('automatic comp-off earning at finalization', () => {
+    // A comp-off eligible shift with a five-day week (Sat/Sun off), qualifying at 240
+    // worked minutes - the same min(halfDayAfterMinutes, minWorkingMinutes) threshold the
+    // production code already used before this fix.
+    const eligibleShift = {
+      id: 'shift-1',
+      weeklyOffDays: [0, 6],
+      halfDayAfterMinutes: 240,
+      minWorkingMinutes: 480,
+      compOffEligible: true,
+    };
+    const compOffEnabledPolicy = [
+      { id: 'p1', tenantId: 'tenant-1', locationId: null, compOffEnabled: true },
+    ];
+    const saturday = new Date(Date.UTC(2026, 6, 4));
+    const sunday = new Date(Date.UTC(2026, 6, 5));
+    const weekday = new Date(Date.UTC(2026, 6, 6));
+    const holiday = new Date(Date.UTC(2026, 6, 15)); // a Wednesday
+
+    it('grants a comp-off when an eligible employee works a weekly off', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(1);
+      expect(compOffGrants[0]).toMatchObject({
+        tenantId: 'tenant-1',
+        employeeId: 'emp-1',
+        sourceAttendanceRecordId: 'record-1',
+        earnedDate: saturday,
+        days: 1,
+      });
+    });
+
+    it('grants a comp-off when an eligible employee works a holiday', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        holidays: [holiday],
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: holiday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(1);
+      expect(compOffGrants[0]).toMatchObject({ employeeId: 'emp-1', earnedDate: holiday });
+    });
+
+    // The whole point of this phase: the day's calendar classification is detected
+    // independently of the final attendance status, because a punched weekly-off/holiday
+    // is classified PRESENT/LATE/HALF_DAY by worked minutes alone and never WEEKEND/HOLIDAY.
+    it.each(['PRESENT', 'LATE', 'HALF_DAY'])(
+      'still earns a comp-off when the final status is %s, not WEEKEND/HOLIDAY',
+      async (status) => {
+        const { service, compOffGrants } = buildFinalizeHarness({
+          payrollPolicies: compOffEnabledPolicy,
+          existing: [
+            {
+              id: 'record-1',
+              employeeId: 'emp-1',
+              date: sunday,
+              status,
+              workingMinutes: 240,
+              shift: eligibleShift,
+            },
+          ],
+        });
+
+        await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+        expect(compOffGrants).toHaveLength(1);
+      },
+    );
+
+    it('grants nothing for a shift that is not comp-off eligible', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: { ...eligibleShift, compOffEligible: false },
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(0);
+    });
+
+    it('grants nothing when the tenant payroll policy has compOffEnabled: false', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: [{ id: 'p1', tenantId: 'tenant-1', locationId: null, compOffEnabled: false }],
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(0);
+    });
+
+    it('grants nothing when no payroll policy is configured at all (default is disabled)', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(0);
+    });
+
+    it('grants nothing for a regular weekday, even if otherwise eligible', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: weekday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(0);
+    });
+
+    it('grants nothing when the employee has no qualifying work on the weekly off', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: saturday,
+            status: 'ABSENT',
+            workingMinutes: 0,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(0);
+    });
+
+    it('does not create a duplicate grant when the same month is re-finalized', async () => {
+      const record = {
+        id: 'record-1',
+        employeeId: 'emp-1',
+        date: saturday,
+        status: 'PRESENT',
+        workingMinutes: 480,
+        shift: eligibleShift,
+      };
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        existing: [record],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+      expect(compOffGrants).toHaveLength(1);
+
+      // Re-finalizing the same month must find the grant already linked to this
+      // attendance record (by sourceAttendanceRecordId) and skip creating another.
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(1);
+    });
+
+    it('does not duplicate a comp-off already credited manually for the same day', async () => {
+      // A manual grant made before this attendance record existed carries no
+      // sourceAttendanceRecordId, so idempotency falls back to the (employeeId,
+      // earnedDate, AVAILABLE|USED) guard `createCompOff` itself uses.
+      const { service, compOffGrants } = buildFinalizeHarness({
+        payrollPolicies: compOffEnabledPolicy,
+        compOffGrants: [
+          {
+            id: 'manual-grant',
+            tenantId: 'tenant-1',
+            employeeId: 'emp-1',
+            sourceAttendanceRecordId: null,
+            earnedDate: saturday,
+            status: 'AVAILABLE',
+          },
+        ],
+        existing: [
+          {
+            id: 'record-1',
+            employeeId: 'emp-1',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(1);
+    });
+
+    it('treats different employees independently for eligibility and policy', async () => {
+      const { service, compOffGrants } = buildFinalizeHarness({
+        employees: [
+          { id: 'emp-eligible', employeeCode: 'PH001', locationId: null },
+          { id: 'emp-ineligible-shift', employeeCode: 'PH002', locationId: null },
+          { id: 'emp-policy-off', employeeCode: 'PH003', locationId: 'loc-b' },
+        ],
+        payrollPolicies: [
+          { id: 'tenant-default', tenantId: 'tenant-1', locationId: null, compOffEnabled: true },
+          { id: 'loc-b-policy', tenantId: 'tenant-1', locationId: 'loc-b', compOffEnabled: false },
+        ],
+        existing: [
+          {
+            id: 'record-eligible',
+            employeeId: 'emp-eligible',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+          {
+            id: 'record-ineligible-shift',
+            employeeId: 'emp-ineligible-shift',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: { ...eligibleShift, compOffEligible: false },
+          },
+          {
+            id: 'record-policy-off',
+            employeeId: 'emp-policy-off',
+            date: saturday,
+            status: 'PRESENT',
+            workingMinutes: 480,
+            shift: eligibleShift,
+          },
+        ],
+      });
+
+      await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+
+      expect(compOffGrants).toHaveLength(1);
+      expect(compOffGrants[0]).toMatchObject({ employeeId: 'emp-eligible' });
+    });
+  });
+
   it('deletes unfinalized attendance records', async () => {
     const prisma = {
       attendanceRecord: {
@@ -4095,15 +4439,27 @@ describe('AttendanceService', () => {
 });
 
 describe('manual comp-off grants', () => {
+  /**
+   * `updateMany`/`findFirstOrThrow` back `decideCompOff`'s atomic transition; `shiftAssignment`/
+   * `shift` back the weekly-off check `USED` now runs. A five-day week (Sat/Sun off) is the
+   * default so a plain weekday `usedOnDate` needs no per-test shift fixture.
+   */
   function compOffHarness(overrides: Record<string, any> = {}) {
+    let grantRow: Record<string, unknown> | null = null;
     const prisma = {
       employee: { findFirst: jest.fn().mockResolvedValue({ id: 'emp-1' }) },
       attendanceRecord: { findUnique: jest.fn().mockResolvedValue(null) },
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue(null),
+        findFirstOrThrow: jest.fn(() => Promise.resolve(grantRow)),
         create: jest.fn((args: any) => Promise.resolve({ id: 'grant-1', ...args.data })),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn((args: any) => {
+          grantRow = { id: args.where.id, ...args.data };
+          return Promise.resolve({ count: 1 });
+        }),
       },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       ...overrides,
     };
     return { prisma, service: newAttendanceService(prisma) };
@@ -4162,31 +4518,235 @@ describe('manual comp-off grants', () => {
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED', employeeId: 'emp-1', employee: { managerId: 'mgr-1' } }),
         create: jest.fn(),
-        update: jest.fn(),
+        updateMany: jest.fn(),
       },
     });
 
     await expect(
       service.decideCompOff(hrAdminUser, 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('already used');
-    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
   });
 
-  it('marks an available grant used', async () => {
+  it('marks an available grant used for a valid scheduled working date', async () => {
+    // 2026-08-17 is a Monday, in the same calendar month as the 2026-08-15 earned date.
     const { prisma, service } = compOffHarness({
       compOffGrant: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-1', employee: { managerId: 'mgr-1' } }),
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: new Date(Date.UTC(2026, 10, 13)),
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
         create: jest.fn(),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'USED',
+          usedOnDate: new Date(Date.UTC(2026, 7, 17)),
+        }),
       },
     });
 
-    await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never });
-
-    expect(prisma.compOffGrant.update).toHaveBeenCalledWith({
-      where: { id: 'grant-1' },
-      data: { status: 'USED' },
+    const result = await service.decideCompOff(hrAdminUser, 'grant-1', {
+      status: 'USED' as never,
+      usedOnDate: '2026-08-17',
     });
+
+    expect(prisma.compOffGrant.updateMany).toHaveBeenCalledWith({
+      where: { id: 'grant-1', status: 'AVAILABLE' },
+      data: { status: 'USED', usedOnDate: new Date(Date.UTC(2026, 7, 17)) },
+    });
+    expect(result).toMatchObject({ status: 'USED', usedOnDate: new Date(Date.UTC(2026, 7, 17)) });
+  });
+
+  it('rejects marking a grant used without a usedOnDate', async () => {
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never }),
+    ).rejects.toThrow('usedOnDate is required');
+  });
+
+  it('rejects a weekly-off date as the usage date', async () => {
+    // 2026-08-15 is a Saturday - a weekly off on the default [0, 6] shift.
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 1)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-15' }),
+    ).rejects.toThrow('weekly off');
+  });
+
+  it('rejects a holiday as the usage date', async () => {
+    const { service } = compOffHarness({
+      holiday: { findMany: jest.fn().mockResolvedValue([{ date: new Date(Date.UTC(2026, 7, 17)) }]) },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 1)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
+    ).rejects.toThrow('holiday');
+  });
+
+  it('rejects usage in a later calendar month under a MONTHLY policy', async () => {
+    const { service } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'MONTHLY', compOffCarryForwardEnabled: false,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)), // August
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      // 2026-09-14 is a Monday, but a different calendar month than the August earned date.
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-09-14' }),
+    ).rejects.toThrow('same calendar month');
+  });
+
+  it('rejects usage in a later calendar year under an ANNUAL policy', async () => {
+    const { service } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: false,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 11, 15)), // December 2026
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      // Monday, but 2027 - a different calendar year than the December 2026 earned date.
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-04' }),
+    ).rejects.toThrow('same calendar year');
+  });
+
+  it('allows crossing the ANNUAL boundary when carry-forward is enabled and the grant has not expired', async () => {
+    const { service, prisma } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: true,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 11, 15)), // December 2026
+          expiresAt: new Date(Date.UTC(2027, 2, 15)), // still valid into 2027
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
+      },
+    });
+
+    await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-04' });
+
+    expect(prisma.compOffGrant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'USED' }) }),
+    );
+  });
+
+  it('still enforces the expiry ceiling when carry-forward is enabled', async () => {
+    const { service } = compOffHarness({
+      payrollPolicy: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'p1', tenantId: 'tenant-1', locationId: null,
+          compOffUsagePeriod: 'ANNUAL', compOffCarryForwardEnabled: true,
+        }),
+      },
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 11, 15)), // December 2026
+          expiresAt: new Date(Date.UTC(2027, 0, 1)), // expires Jan 1, 2027
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-04' }),
+    ).rejects.toThrow('expired');
+  });
+
+  it('does not create a duplicate use when the same grant is decided twice', async () => {
+    // The second call observes the grant already USED via the where-guarded updateMany
+    // returning zero rows affected - the concurrent-decision path, not a fresh lookup race.
+    const { service } = compOffHarness({
+      compOffGrant: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-1',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: null,
+          employee: { managerId: 'mgr-1', locationId: null },
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+    });
+
+    await expect(
+      service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
+    ).rejects.toThrow('already decided');
   });
 });
 
@@ -4195,8 +4755,13 @@ describe('decideCompOff authorization', () => {
     const prisma = {
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue(null),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn((args: { where: { id: string } }) =>
+          Promise.resolve({ id: args.where.id, status: 'USED' }),
+        ),
       },
+      shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       ...overrides,
     };
     return { prisma, service: newAttendanceService(prisma) };
@@ -4215,14 +4780,14 @@ describe('decideCompOff authorization', () => {
         findFirst: jest.fn().mockResolvedValue({
           id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-mgr', employee: { managerId: 'emp-grandmgr' },
         }),
-        update: jest.fn(),
+        updateMany: jest.fn(),
       },
     });
 
     await expect(
       service.decideCompOff(manager(), 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('You cannot approve your own request.');
-    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
   });
 
   it('denies a Manager deciding a comp-off outside their team', async () => {
@@ -4231,29 +4796,36 @@ describe('decideCompOff authorization', () => {
         findFirst: jest.fn().mockResolvedValue({
           id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-target', employee: { managerId: 'someone-else' },
         }),
-        update: jest.fn(),
+        updateMany: jest.fn(),
       },
     });
 
     await expect(
       service.decideCompOff(manager(), 'grant-1', { status: 'CANCELLED' as never }),
     ).rejects.toThrow('You can only approve requests from employees who report to you.');
-    expect(prisma.compOffGrant.update).not.toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
   });
 
   it('lets a Manager decide a direct report comp-off', async () => {
     const { prisma, service } = compOffHarness({
       compOffGrant: {
         findFirst: jest.fn().mockResolvedValue({
-          id: 'grant-1', status: 'AVAILABLE', employeeId: 'emp-target', employee: { managerId: 'emp-mgr' },
+          id: 'grant-1',
+          status: 'AVAILABLE',
+          employeeId: 'emp-target',
+          earnedDate: new Date(Date.UTC(2026, 7, 15)),
+          expiresAt: null,
+          employee: { managerId: 'emp-mgr', locationId: null },
         }),
-        update: jest.fn((args: any) => Promise.resolve({ id: args.where.id, ...args.data })),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findFirstOrThrow: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
       },
     });
 
-    await service.decideCompOff(manager(), 'grant-1', { status: 'USED' as never });
+    // 2026-08-17 is a Monday in the same calendar month as the grant's earned date.
+    await service.decideCompOff(manager(), 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' });
 
-    expect(prisma.compOffGrant.update).toHaveBeenCalled();
+    expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
   });
 });
 

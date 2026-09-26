@@ -18,6 +18,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table';
 import { PayrollPayslipView, type PayslipComponent } from './payroll-payslip-view';
+import { POLICY_STALE_MESSAGE } from './payroll-run-action-button';
 
 const MONTH_NAMES = [
   'January',
@@ -57,6 +58,7 @@ interface RunDetail {
   month: number;
   year: number;
   status: string;
+  policyStale?: boolean;
   entries: RunEntry[];
   totals: {
     totalNet: number;
@@ -142,6 +144,14 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
                   : 'Loading run details…'}
               </DialogDescription>
             </DialogHeader>
+            {run?.policyStale && (
+              <div
+                role="alert"
+                className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm font-medium text-amber-700"
+              >
+                {POLICY_STALE_MESSAGE}
+              </div>
+            )}
             {run && ((run.totals.errors ?? 0) > 0 || (run.totals.warnings ?? 0) > 0) && (
               <div className="rounded-lg border border-line bg-canvas p-3 text-sm">
                 {(run.totals.errors ?? 0) > 0 && (
