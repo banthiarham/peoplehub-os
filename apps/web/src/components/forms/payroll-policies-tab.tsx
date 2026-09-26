@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Settings2 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -137,149 +137,178 @@ export function PayrollPoliciesTab() {
   const scopeLabel = (row: PayrollPolicyRow) =>
     row.locationId === null ? 'Tenant default' : (locations?.find((l) => l.id === row.locationId)?.name ?? 'Location');
 
+  const formRef = useRef<HTMLDivElement>(null);
+  const editRow = (row: PayrollPolicyRow) => {
+    setScope(row.locationId ?? 'tenant');
+    // Below the two-column breakpoint the form sits above this list, so Edit would otherwise
+    // change something the admin cannot see.
+    if (window.matchMedia('(max-width: 1279px)').matches) {
+      formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
   return (
-    <div className="grid gap-4 xl:grid-cols-[420px_1fr]">
-      <Card className="p-4">
-        <div className="flex items-center justify-between gap-3">
-          <h2 className="text-sm font-semibold">Payroll policy</h2>
-          {inherited ? (
-            <Badge variant="info">Inherited</Badge>
-          ) : scopedPolicy ? (
-            <Badge variant="success">Configured</Badge>
-          ) : null}
-        </div>
-        <p className="mt-1 text-xs text-ink-muted">
-          Controls the salary denominator, overtime payment, and Comp-Off rules payroll processing uses.
-          A location without its own policy inherits the tenant default.
-        </p>
-
-        <label className="mt-3 block space-y-1.5 text-xs font-medium text-ink-muted">
-          Scope
-          <Select className="w-full" value={scope} onChange={(e) => setScope(e.target.value)}>
-            <option value="tenant">Tenant default</option>
-            {locations?.map((location) => (
-              <option key={location.id} value={location.id}>
-                {location.name}
-                {location.city ? ` · ${location.city}` : ''}
-              </option>
-            ))}
-          </Select>
-        </label>
-
-        {isLoading ? (
-          <div className="mt-4 space-y-2">
-            {[...Array(5)].map((_, i) => (
-              <Skeleton key={i} className="h-10" />
-            ))}
+    <div className="grid items-start gap-4 xl:grid-cols-[420px_minmax(0,1fr)]">
+      <div ref={formRef} className="scroll-mt-4">
+        <Card className="p-4">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-sm font-semibold">Payroll policy</h2>
+            {inherited ? (
+              <Badge variant="info">Inherited</Badge>
+            ) : scopedPolicy ? (
+              <Badge variant="success">Configured</Badge>
+            ) : null}
           </div>
-        ) : (
-          <form
-            className="mt-4 space-y-4"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (fixedDaysValid) save.mutate();
-            }}
-          >
-            <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
-              Salary basis
-              <Select
-                className="w-full"
-                value={form.salaryBasis}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, salaryBasis: e.target.value as SalaryBasis }))
-                }
-              >
-                <option value="CALENDAR_DAYS">Calendar days</option>
-                <option value="FIXED_DAYS">Fixed days</option>
-                <option value="WORKING_DAYS">Working days</option>
-              </Select>
-            </label>
+          <p className="mt-1 text-xs text-ink-muted">
+            Controls the salary denominator, overtime payment, and Comp-Off rules payroll processing uses.
+            A location without its own policy inherits the tenant default.
+          </p>
 
-            {form.salaryBasis === 'FIXED_DAYS' && (
-              <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
-                Fixed days per month
-                <Input
-                  type="number"
-                  min={1}
-                  max={31}
-                  value={form.fixedDays ?? ''}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, fixedDays: e.target.value === '' ? null : Number(e.target.value) }))
-                  }
-                  required
-                />
-                {!fixedDaysValid && (
-                  <span className="block text-[11px] font-normal text-danger">
-                    Enter a whole number of days between 1 and 31.
-                  </span>
+          <label className="mt-3 block space-y-1.5 text-xs font-medium text-ink-muted">
+            Scope
+            <Select className="w-full" value={scope} onChange={(e) => setScope(e.target.value)}>
+              <option value="tenant">Tenant default</option>
+              {locations?.map((location) => (
+                <option key={location.id} value={location.id}>
+                  {location.name}
+                  {location.city ? ` · ${location.city}` : ''}
+                </option>
+              ))}
+            </Select>
+          </label>
+
+          {isLoading ? (
+            <div className="mt-3 space-y-2">
+              {[...Array(4)].map((_, i) => (
+                <Skeleton key={i} className="h-10" />
+              ))}
+            </div>
+          ) : (
+            <form
+              className="mt-3 space-y-3"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (fixedDaysValid) save.mutate();
+              }}
+            >
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label
+                  className={`block space-y-1.5 text-xs font-medium text-ink-muted ${
+                    form.salaryBasis === 'FIXED_DAYS' ? '' : 'sm:col-span-2'
+                  }`}
+                >
+                  Salary basis
+                  <Select
+                    className="w-full"
+                    value={form.salaryBasis}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, salaryBasis: e.target.value as SalaryBasis }))
+                    }
+                  >
+                    <option value="CALENDAR_DAYS">Calendar days</option>
+                    <option value="FIXED_DAYS">Fixed days</option>
+                    <option value="WORKING_DAYS">Working days</option>
+                  </Select>
+                </label>
+
+                {form.salaryBasis === 'FIXED_DAYS' && (
+                  <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+                    Fixed days per month
+                    <Input
+                      type="number"
+                      min={1}
+                      max={31}
+                      value={form.fixedDays ?? ''}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, fixedDays: e.target.value === '' ? null : Number(e.target.value) }))
+                      }
+                      required
+                    />
+                    {!fixedDaysValid && (
+                      <span className="block text-[11px] font-normal text-danger">
+                        Enter a whole number of days between 1 and 31.
+                      </span>
+                    )}
+                  </label>
                 )}
-              </label>
-            )}
+              </div>
 
-            <label className="flex items-center gap-2 text-sm text-ink-muted">
-              <input
-                type="checkbox"
-                checked={form.overtimePaymentEnabled}
-                onChange={(e) => setForm((f) => ({ ...f, overtimePaymentEnabled: e.target.checked }))}
-              />
-              Pay approved overtime
-            </label>
+              <div className="flex flex-wrap gap-x-5 gap-y-2">
+                <label className="flex items-center gap-2 text-sm text-ink-muted">
+                  <input
+                    type="checkbox"
+                    checked={form.overtimePaymentEnabled}
+                    onChange={(e) => setForm((f) => ({ ...f, overtimePaymentEnabled: e.target.checked }))}
+                  />
+                  Pay approved overtime
+                </label>
 
-            <label className="flex items-center gap-2 text-sm text-ink-muted">
-              <input
-                type="checkbox"
-                checked={form.compOffEnabled}
-                onChange={(e) => setForm((f) => ({ ...f, compOffEnabled: e.target.checked }))}
-              />
-              Enable Comp-Off
-            </label>
+                <label className="flex items-center gap-2 text-sm text-ink-muted">
+                  <input
+                    type="checkbox"
+                    checked={form.compOffEnabled}
+                    onChange={(e) => setForm((f) => ({ ...f, compOffEnabled: e.target.checked }))}
+                  />
+                  Enable Comp-Off
+                </label>
+              </div>
 
-            <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
-              Unused Comp-Off treatment
-              <Select
-                className="w-full"
-                value={form.compOffUnusedTreatment}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, compOffUnusedTreatment: e.target.value as CompOffUnusedTreatment }))
-                }
+              {/* These only apply while Comp-Off is on. Their values are kept and still saved either
+                  way; they just cannot be edited while it is off. */}
+              <fieldset
+                disabled={!form.compOffEnabled}
+                title={form.compOffEnabled ? undefined : 'Applies only while Comp-Off is enabled'}
+                className="m-0 min-w-0 space-y-3 border-0 p-0 disabled:opacity-60"
               >
-                <option value="UNPAID">Unpaid (forfeited)</option>
-                <option value="PAY">Paid out at payroll</option>
-              </Select>
-              <span className="block font-normal text-ink-faint">Applies only while Comp-Off is enabled.</span>
-            </label>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+                    Unused Comp-Off treatment
+                    <Select
+                      className="w-full"
+                      value={form.compOffUnusedTreatment}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, compOffUnusedTreatment: e.target.value as CompOffUnusedTreatment }))
+                      }
+                    >
+                      <option value="UNPAID">Unpaid (forfeited)</option>
+                      <option value="PAY">Paid out at payroll</option>
+                    </Select>
+                  </label>
 
-            <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
-              Comp-Off usage period
-              <Select
-                className="w-full"
-                value={form.compOffUsagePeriod}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, compOffUsagePeriod: e.target.value as CompOffUsagePeriod }))
-                }
-              >
-                <option value="MONTHLY">Monthly</option>
-                <option value="ANNUAL">Annual</option>
-              </Select>
-            </label>
+                  <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+                    Comp-Off usage period
+                    <Select
+                      className="w-full"
+                      value={form.compOffUsagePeriod}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, compOffUsagePeriod: e.target.value as CompOffUsagePeriod }))
+                      }
+                    >
+                      <option value="MONTHLY">Monthly</option>
+                      <option value="ANNUAL">Annual</option>
+                    </Select>
+                  </label>
+                </div>
 
-            <label className="flex items-center gap-2 text-sm text-ink-muted">
-              <input
-                type="checkbox"
-                checked={form.compOffCarryForwardEnabled}
-                onChange={(e) => setForm((f) => ({ ...f, compOffCarryForwardEnabled: e.target.checked }))}
-              />
-              Allow Comp-Off to carry forward past its usage period
-            </label>
+                <label className="flex items-center gap-2 text-sm text-ink-muted">
+                  <input
+                    type="checkbox"
+                    checked={form.compOffCarryForwardEnabled}
+                    onChange={(e) => setForm((f) => ({ ...f, compOffCarryForwardEnabled: e.target.checked }))}
+                  />
+                  Allow Comp-Off to carry forward past its usage period
+                </label>
+              </fieldset>
 
-            <Button type="submit" disabled={!fixedDaysValid || save.isPending} className="w-full">
-              {save.isPending ? 'Saving...' : 'Save policy'}
-            </Button>
-          </form>
-        )}
-      </Card>
+              <Button type="submit" disabled={!fixedDaysValid || save.isPending} className="w-full">
+                {save.isPending ? 'Saving...' : 'Save policy'}
+              </Button>
+            </form>
+          )}
+        </Card>
+      </div>
 
-      <Card className="overflow-hidden">
+      <Card className="min-w-0 overflow-hidden">
         <div className="border-b border-line px-4 py-3">
           <h2 className="text-sm font-semibold">Configured policies</h2>
           <p className="mt-1 text-xs text-ink-muted">Tenant default plus any location-specific overrides.</p>
@@ -298,46 +327,49 @@ export function PayrollPoliciesTab() {
                 <TH>Salary basis</TH>
                 <TH>Overtime</TH>
                 <TH>Comp-Off</TH>
-                <TH></TH>
+                <TH>
+                  <span className="sr-only">Actions</span>
+                </TH>
               </TR>
             </THead>
             <TBody>
-              {policies.map((row) => (
-                <TR key={row.id}>
-                  <TD>
-                    <span className="block font-medium">{scopeLabel(row)}</span>
-                    {row.isDefault && <Badge variant="outline">Default</Badge>}
-                  </TD>
-                  <TD>
-                    {row.salaryBasis === 'FIXED_DAYS'
-                      ? `Fixed (${row.fixedDays} days)`
-                      : row.salaryBasis.replace(/_/g, ' ').toLowerCase()}
-                  </TD>
-                  <TD>
-                    <Badge variant={row.overtimePaymentEnabled ? 'success' : 'outline'}>
-                      {row.overtimePaymentEnabled ? 'Paid' : 'Unpaid'}
-                    </Badge>
-                  </TD>
-                  <TD>
-                    {row.compOffEnabled ? (
-                      <Badge variant="success">
-                        {row.compOffUnusedTreatment === 'PAY' ? 'Enabled · pays out' : 'Enabled · unpaid'}
+              {policies.map((row) => {
+                const editing = (row.locationId ?? 'tenant') === scope;
+                return (
+                  <TR key={row.id}>
+                    <TD>
+                      <span className="block font-medium">{scopeLabel(row)}</span>
+                      {row.isDefault && <Badge variant="outline">Default</Badge>}
+                    </TD>
+                    <TD className="whitespace-nowrap">
+                      {row.salaryBasis === 'FIXED_DAYS'
+                        ? `Fixed (${row.fixedDays} days)`
+                        : row.salaryBasis === 'WORKING_DAYS'
+                          ? 'Working days'
+                          : 'Calendar days'}
+                    </TD>
+                    <TD>
+                      <Badge variant={row.overtimePaymentEnabled ? 'success' : 'outline'}>
+                        {row.overtimePaymentEnabled ? 'Paid' : 'Unpaid'}
                       </Badge>
-                    ) : (
-                      <Badge variant="outline">Disabled</Badge>
-                    )}
-                  </TD>
-                  <TD className="text-right">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => setScope(row.locationId ?? 'tenant')}
-                    >
-                      Edit
-                    </Button>
-                  </TD>
-                </TR>
-              ))}
+                    </TD>
+                    <TD>
+                      {row.compOffEnabled ? (
+                        <Badge variant="success">
+                          {row.compOffUnusedTreatment === 'PAY' ? 'Enabled · pays out' : 'Enabled · unpaid'}
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline">Disabled</Badge>
+                      )}
+                    </TD>
+                    <TD className="text-right">
+                      <Button size="sm" variant="outline" disabled={editing} onClick={() => editRow(row)}>
+                        {editing ? 'Editing' : 'Edit'}
+                      </Button>
+                    </TD>
+                  </TR>
+                );
+              })}
             </TBody>
           </Table>
         ) : (
