@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { PayrollService } from './payroll.service';
 import { PayrollPolicyService } from './payroll-policy.service';
+import { hashPolicySnapshot } from './payroll-policy-snapshot';
 import { SalaryDenominatorService } from './salary-denominator.service';
 import { AuthUser } from '../../common/types/auth-user';
 
@@ -81,6 +82,8 @@ function buildProcessRunHarness(options: {
     payrollRun: {
       findFirst: jest.fn().mockResolvedValue(run),
       update: jest.fn().mockResolvedValue(run),
+      // The claim on the run's current status; count 1 means it was still in that status.
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
     employee: {
       findMany: jest.fn().mockResolvedValue(
@@ -195,7 +198,9 @@ function buildProcessRunHarness(options: {
     payrollRunEmployee: {
       findMany: jest.fn().mockResolvedValue([]),
       upsert: jest.fn().mockResolvedValue({}),
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
     },
+    taxComputationSnapshot: { deleteMany: jest.fn().mockResolvedValue({ count: 0 }) },
     // Matched against the real `where` so location-scoped policies resolve by precedence
     // instead of every lookup returning the same row.
     payrollPolicy: {
@@ -1013,6 +1018,7 @@ describe('PayrollService', () => {
       payrollRun: {
         findFirst: jest.fn().mockResolvedValue({ id: 'run-1', tenantId: 'tenant-1', status: 'DRAFT', month: 7, year: 2025, runType: 'MONTHLY' }),
         update: jest.fn().mockResolvedValue({ id: 'run-1', status: 'REVIEW' }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       employee: {
         findMany: jest.fn().mockResolvedValue([
@@ -1068,6 +1074,7 @@ describe('PayrollService', () => {
       payrollRunEmployee: {
         findMany: jest.fn().mockResolvedValue([]),
         upsert: jest.fn().mockResolvedValue({}),
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       employeeTaxProfile: {
         findUnique: jest.fn().mockResolvedValue(null),
@@ -1118,7 +1125,10 @@ describe('PayrollService', () => {
         slabsApplied: [],
       }),
     };
-    const payrollPolicies = { resolve: jest.fn().mockResolvedValue({ overtimePaymentEnabled: true }) };
+    const payrollPolicies = {
+      resolve: jest.fn().mockResolvedValue({ overtimePaymentEnabled: true }),
+      snapshotForLocations: jest.fn().mockResolvedValue({ version: 1, locations: {} }),
+    };
     const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any, payrollPolicies as any);
 
     await expect(service.processRun('tenant-1', 'run-1')).resolves.toEqual({
@@ -2378,6 +2388,7 @@ describe('PayrollService', () => {
         payrollRun: {
           findFirst: jest.fn().mockResolvedValue({ id: 'run-1', tenantId: 'tenant-1', status: 'DRAFT', month: 7, year: 2025, runType: 'MONTHLY' }),
           update: jest.fn().mockResolvedValue({ id: 'run-1', status: 'REVIEW' }),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         },
         employee: {
           findMany: jest.fn().mockResolvedValue([
@@ -2424,7 +2435,11 @@ describe('PayrollService', () => {
         employeeTaxDeclaration: { findMany: jest.fn().mockResolvedValue([]) },
         employeePreviousEmployerIncome: { findMany: jest.fn().mockResolvedValue([]) },
         employeeMonthlyTds: { groupBy: jest.fn().mockResolvedValue([]), upsert: jest.fn().mockResolvedValue({}) },
-        payrollRunEmployee: { findMany: jest.fn().mockResolvedValue([]), upsert: jest.fn().mockResolvedValue({}) },
+        payrollRunEmployee: {
+          findMany: jest.fn().mockResolvedValue([]),
+          upsert: jest.fn().mockResolvedValue({}),
+          deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+        },
         employeeTaxProfile: {
           findUnique: jest.fn().mockResolvedValue(null),
           create: jest.fn().mockResolvedValue({ id: 'profile-1', regime: 'NEW', ageCategory: 'BELOW_60' }),
@@ -2470,7 +2485,10 @@ describe('PayrollService', () => {
           slabsApplied: [],
         }),
       };
-      const payrollPolicies = { resolve: jest.fn().mockResolvedValue({ overtimePaymentEnabled: false }) };
+      const payrollPolicies = {
+        resolve: jest.fn().mockResolvedValue({ overtimePaymentEnabled: false }),
+        snapshotForLocations: jest.fn().mockResolvedValue({ version: 1, locations: {} }),
+      };
       const service = new PayrollService(prisma as any, calculator as any, tdsEngine as any, stubDenominators() as any, payrollPolicies as any);
 
       await service.processRun('tenant-1', 'run-1');
@@ -3114,6 +3132,643 @@ describe('PayrollService', () => {
     expect(result.csv).toContain('Salary expense');
     expect(result.csv).toContain('TDS payable');
     expect(result.csv).toContain('Salary bank payable');
+  });
+});
+
+describe('payroll reprocess and policy staleness', () => {
+  const finalizedJuly = [
+    { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+  ];
+  const STALE_MESSAGE = 'Payroll policy changed since this run was processed. Reprocess to apply.';
+
+  /** A single BASIC earning, so gross is exactly `monthly` at full proration. */
+  const basicSalary = (monthly: number) => ({
+    employeeSalaries: [
+      { ctc: monthly * 12, components: [{ code: 'BASIC', name: 'Basic', type: 'EARNING', monthly }] },
+    ],
+  });
+
+  /** Every field explicit: the fixture row is returned by `resolve` as-is, with no defaults filled in. */
+  const policyRow = (overrides: Record<string, unknown> = {}): Record<string, any> => ({
+    id: 'p1',
+    tenantId: 'tenant-1',
+    locationId: null,
+    salaryBasis: 'CALENDAR_DAYS',
+    fixedDays: null,
+    overtimePaymentEnabled: false,
+    compOffEnabled: true,
+    compOffUnusedTreatment: 'PAY',
+    compOffUsagePeriod: 'MONTHLY',
+    compOffCarryForwardEnabled: false,
+    ...overrides,
+  });
+
+  /** One unused comp-off day: a PAY policy turns it into an earning, UNPAID leaves gross untouched. */
+  const unusedGrant = [
+    {
+      employeeId: 'emp-1',
+      earnedDate: new Date(Date.UTC(2026, 6, 5)),
+      expiresAt: new Date(Date.UTC(2030, 0, 1)),
+      days: 1,
+    },
+  ];
+
+  function harness(runOverrides: Record<string, unknown> = {}, policies = [policyRow()]) {
+    const h = buildProcessRunHarness({
+      run: runOverrides,
+      finalizations: finalizedJuly,
+      payrollPolicies: policies,
+      employeeOverrides: basicSalary(26000),
+      availableCompOffGrants: unusedGrant,
+    });
+    (h.prisma as any).auditLog = { create: jest.fn().mockResolvedValue({}) };
+    return { ...h, policies };
+  }
+
+  type Harness = ReturnType<typeof harness>;
+
+  const runUpdates = (h: Harness) =>
+    (h.prisma.payrollRun.update as jest.Mock).mock.calls.map(([args]) => args.data as Record<string, any>);
+  const lastRunUpdate = (h: Harness) => runUpdates(h).at(-1) as Record<string, any>;
+  const entryCreates = (h: Harness) =>
+    (h.prisma.payrollRunEmployee.upsert as jest.Mock).mock.calls.map(([args]) => args.create);
+
+  /** Processes a fresh run, then presents it to the service as it would read back from the database. */
+  async function processedRun(h: Harness, status = 'REVIEW') {
+    await h.service.processRun('tenant-1', 'run-1');
+    const { policySnapshot, policyHash } = lastRunUpdate(h);
+    const stored = {
+      id: 'run-1',
+      tenantId: 'tenant-1',
+      status,
+      month: 7,
+      year: 2026,
+      entries: [],
+      policySnapshot,
+      policyHash,
+    };
+    (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue(stored);
+    return stored;
+  }
+
+  describe('reprocess', () => {
+    it('recomputes a REVIEW run and leaves it in REVIEW', async () => {
+      const h = harness({ status: 'REVIEW' });
+
+      await expect(h.service.reprocessRun('tenant-1', 'run-1', 'actor-1')).resolves.toMatchObject({
+        processed: 1,
+        errors: 0,
+        status: 'REVIEW',
+      });
+
+      expect(h.prisma.payrollRun.updateMany).toHaveBeenCalledWith({
+        where: { id: 'run-1', tenantId: 'tenant-1', status: 'REVIEW' },
+        data: { status: 'PROCESSING' },
+      });
+      expect(lastRunUpdate(h)).toMatchObject({ status: 'REVIEW' });
+      expect(entryCreates(h)[0].grossPay).toBeCloseTo(26838.71, 2);
+    });
+
+    it('moves an APPROVED run back to REVIEW and clears its warning override', async () => {
+      const h = harness({
+        status: 'APPROVED',
+        policyHash: 'old-hash',
+        warningOverrideReason: 'reviewed',
+        warningsOverriddenAt: new Date('2026-07-30'),
+        warningsOverriddenById: 'user-9',
+      });
+
+      await h.service.reprocessRun('tenant-1', 'run-1', 'actor-1');
+
+      expect(h.prisma.payrollRun.updateMany).toHaveBeenCalledWith({
+        where: { id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED' },
+        data: { status: 'PROCESSING' },
+      });
+      expect(lastRunUpdate(h)).toMatchObject({
+        status: 'REVIEW',
+        warningOverrideReason: null,
+        warningsOverriddenAt: null,
+        warningsOverriddenById: null,
+      });
+    });
+
+    it('audits the reprocess with the state it replaced', async () => {
+      const h = harness({
+        status: 'APPROVED',
+        policyHash: 'old-hash',
+        warningsOverriddenAt: new Date('2026-07-30'),
+      });
+
+      await h.service.reprocessRun('tenant-1', 'run-1', 'actor-1');
+
+      expect((h.prisma as any).auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          tenantId: 'tenant-1',
+          actorId: 'actor-1',
+          action: 'PAYROLL_RUN_REPROCESSED',
+          objectType: 'PayrollRun',
+          objectId: 'run-1',
+          oldValue: { status: 'APPROVED', policyHash: 'old-hash', warningsOverridden: true },
+          newValue: expect.objectContaining({ status: 'REVIEW', processed: 1 }),
+        }),
+      });
+    });
+
+    it('is idempotent: repeating it replaces the results instead of accumulating them', async () => {
+      const h = harness({ status: 'REVIEW' });
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      await h.service.reprocessRun('tenant-1', 'run-1');
+
+      const [first, second, third] = entryCreates(h);
+      expect(second).toEqual(first);
+      expect(third).toEqual(first);
+      // One payout's worth every time, never a second payout stacked on the first.
+      expect(first.grossPay).toBeCloseTo(26838.71, 2);
+      expect(first.components.filter((c: { code: string }) => c.code === 'INPUT_COMP_OFF_PAYOUT')).toHaveLength(1);
+      // Each pass clears the payout inputs it owns before recreating them.
+      expect(h.prisma.payrollVariableInput.deleteMany).toHaveBeenCalledTimes(3);
+    });
+
+    it('drops the entry of an employee who is no longer in the run', async () => {
+      const h = harness({ status: 'REVIEW' });
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+
+      expect(h.prisma.payrollRunEmployee.deleteMany).toHaveBeenCalledWith({
+        where: { payrollRunId: 'run-1', employeeId: { notIn: ['emp-1'] } },
+      });
+    });
+
+    it.each(['DRAFT', 'PROCESSING', 'LOCKED', 'PUBLISHED', 'CLOSED'])(
+      'refuses to reprocess a %s run',
+      async (status) => {
+        const h = harness({ status });
+
+        await expect(h.service.reprocessRun('tenant-1', 'run-1')).rejects.toBeInstanceOf(BadRequestException);
+
+        expect(h.prisma.payrollRun.updateMany).not.toHaveBeenCalled();
+        expect(h.prisma.payrollRun.update).not.toHaveBeenCalled();
+        expect(h.prisma.payrollRunEmployee.upsert).not.toHaveBeenCalled();
+        expect(h.prisma.payrollRunEmployee.deleteMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['REVIEW', 'APPROVED'])('leaves processRun refusing a %s run', async (status) => {
+      const h = harness({ status });
+
+      await expect(h.service.processRun('tenant-1', 'run-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(h.prisma.payrollRunEmployee.upsert).not.toHaveBeenCalled();
+    });
+
+    it('backs off, changing nothing, when the run moved on before it could be claimed', async () => {
+      const h = harness({ status: 'APPROVED' });
+      (h.prisma.payrollRun.updateMany as jest.Mock).mockResolvedValue({ count: 0 });
+
+      await expect(h.service.reprocessRun('tenant-1', 'run-1')).rejects.toBeInstanceOf(ConflictException);
+
+      expect(h.prisma.payrollRun.update).not.toHaveBeenCalled();
+      expect(h.prisma.payrollRunEmployee.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('policy snapshot', () => {
+    it('records the resolved policy inputs and their hash when a run is processed', async () => {
+      const h = harness({ status: 'DRAFT' });
+
+      await h.service.processRun('tenant-1', 'run-1');
+
+      const { policySnapshot, policyHash } = lastRunUpdate(h);
+      expect(policySnapshot).toEqual({
+        version: 1,
+        locations: {
+          '': {
+            salaryBasis: 'CALENDAR_DAYS',
+            fixedDays: null,
+            overtimePaymentEnabled: false,
+            compOffUnusedTreatment: 'PAY',
+            compOffUsagePeriod: 'MONTHLY',
+            compOffCarryForwardEnabled: false,
+          },
+        },
+      });
+      expect(policyHash).toBe(hashPolicySnapshot(policySnapshot));
+    });
+
+    it('resolves each employee location on its own, falling back to the tenant default', async () => {
+      const h = buildProcessRunHarness({
+        run: { status: 'DRAFT' },
+        finalizations: finalizedJuly,
+        payrollPolicies: [
+          policyRow(),
+          policyRow({ id: 'p2', locationId: 'loc-1', salaryBasis: 'FIXED_DAYS', fixedDays: 26 }),
+        ],
+        employeeOverrides: basicSalary(26000),
+        extraEmployees: [{ id: 'emp-1', locationId: 'loc-1' }, { id: 'emp-2', locationId: 'loc-2' }],
+      });
+
+      await h.service.processRun('tenant-1', 'run-1');
+
+      const { policySnapshot } = (h.prisma.payrollRun.update as jest.Mock).mock.calls.at(-1)[0].data;
+      expect(Object.keys(policySnapshot.locations).sort()).toEqual(['loc-1', 'loc-2']);
+      expect(policySnapshot.locations['loc-1']).toMatchObject({ salaryBasis: 'FIXED_DAYS', fixedDays: 26 });
+      expect(policySnapshot.locations['loc-2']).toMatchObject({ salaryBasis: 'CALENDAR_DAYS', fixedDays: null });
+    });
+
+    it('a reprocessed run uses, and stores, the policy as it is now', async () => {
+      const h = harness({ status: 'REVIEW' });
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      const before = lastRunUpdate(h);
+      expect(entryCreates(h)[0].grossPay).toBeCloseTo(26838.71, 2);
+      expect(before.policySnapshot.locations[''].compOffUnusedTreatment).toBe('PAY');
+
+      h.policies[0].compOffUnusedTreatment = 'UNPAID';
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      const after = lastRunUpdate(h);
+
+      expect(entryCreates(h)[1].grossPay).toBeCloseTo(26000, 2);
+      expect(after.policySnapshot.locations[''].compOffUnusedTreatment).toBe('UNPAID');
+      expect(after.policyHash).not.toBe(before.policyHash);
+    });
+  });
+
+  describe('stale policy detection', () => {
+    it('is not stale while the policy is unchanged', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: false });
+    });
+
+    it('goes stale when a policy field that drives payroll changes', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+
+      h.policies[0].compOffUnusedTreatment = 'UNPAID';
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: true });
+    });
+
+    it.each([
+      ['salaryBasis', { salaryBasis: 'FIXED_DAYS', fixedDays: 26 }],
+      ['overtimePaymentEnabled', { overtimePaymentEnabled: true }],
+      ['compOffUsagePeriod', { compOffUsagePeriod: 'ANNUAL' }],
+      ['compOffCarryForwardEnabled', { compOffCarryForwardEnabled: true }],
+    ])('goes stale when %s changes', async (_field, change) => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h, 'APPROVED');
+
+      Object.assign(h.policies[0], change);
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: true });
+    });
+
+    it('ignores changes that cannot alter a computed run', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+
+      h.policies[0].compOffEnabled = false;
+      h.policies[0].updatedAt = new Date();
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: false });
+    });
+
+    it('goes stale when a location gains its own policy that differs from the default it used', async () => {
+      const h = buildProcessRunHarness({
+        run: { status: 'DRAFT' },
+        finalizations: finalizedJuly,
+        payrollPolicies: [policyRow()],
+        employeeOverrides: { ...basicSalary(26000), locationId: 'loc-1' },
+      });
+      await h.service.processRun('tenant-1', 'run-1');
+      const { policySnapshot, policyHash } = (h.prisma.payrollRun.update as jest.Mock).mock.calls.at(-1)[0].data;
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue({
+        id: 'run-1', tenantId: 'tenant-1', status: 'REVIEW', month: 7, year: 2026, entries: [], policySnapshot, policyHash,
+      });
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: false });
+
+      (h.prisma.payrollPolicy as any).findFirst = jest.fn(({ where }: { where: Record<string, unknown> }) =>
+        Promise.resolve(
+          [policyRow(), policyRow({ id: 'p2', locationId: 'loc-1', overtimePaymentEnabled: true })].find((row) =>
+            Object.entries(where).every(([key, value]) => (row as Record<string, unknown>)[key] === value),
+          ) ?? null,
+        ),
+      );
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: true });
+    });
+
+    it('goes stale when the policy is deleted and the fallback differs', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+
+      h.policies.splice(0);
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: true });
+    });
+
+    it('reports the run current again once it is reprocessed', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+      h.policies[0].compOffUnusedTreatment = 'UNPAID';
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: true });
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      const { policySnapshot, policyHash } = lastRunUpdate(h);
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue({
+        id: 'run-1', tenantId: 'tenant-1', status: 'REVIEW', month: 7, year: 2026, entries: [], policySnapshot, policyHash,
+      });
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: false });
+    });
+
+    it('never marks a run stale outside REVIEW and APPROVED', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h, 'LOCKED');
+      h.policies[0].compOffUnusedTreatment = 'UNPAID';
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: false });
+    });
+
+    it('does not report a run processed before snapshots existed as stale', async () => {
+      const h = harness({ status: 'DRAFT' });
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue({
+        id: 'run-1', tenantId: 'tenant-1', status: 'REVIEW', month: 7, year: 2026, entries: [], policySnapshot: null, policyHash: null,
+      });
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({ policyStale: false });
+    });
+
+    it('never recalculates anything just because the policy changed', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+      const updatesBefore = (h.prisma.payrollRun.update as jest.Mock).mock.calls.length;
+      const upsertsBefore = (h.prisma.payrollRunEmployee.upsert as jest.Mock).mock.calls.length;
+
+      h.policies[0].compOffUnusedTreatment = 'UNPAID';
+      await h.service.getRun('tenant-1', 'run-1');
+
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledTimes(updatesBefore);
+      expect(h.prisma.payrollRunEmployee.upsert).toHaveBeenCalledTimes(upsertsBefore);
+    });
+  });
+
+  describe('approval of a stale run', () => {
+    function approvalHarness(policyChanged: boolean, status: 'REVIEW' | 'APPROVED' = 'REVIEW') {
+      const h = harness({ status: 'DRAFT' });
+      return processedRun(h, status).then(() => {
+        (h.prisma.payrollRunEmployee.findMany as jest.Mock).mockResolvedValue([{ errors: [], warnings: [] }]);
+        (h.prisma.payrollRun.update as jest.Mock).mockClear();
+        if (policyChanged) h.policies[0].compOffUnusedTreatment = 'UNPAID';
+        return h;
+      });
+    }
+
+    it('blocks approval when the policy changed since processing', async () => {
+      const h = await approvalHarness(true);
+
+      await expect(h.service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(STALE_MESSAGE);
+      await expect(h.service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(BadRequestException);
+      expect(h.prisma.payrollRun.update).not.toHaveBeenCalled();
+    });
+
+    it('approves once the run has been reprocessed under the new policy', async () => {
+      const h = await approvalHarness(true);
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      const { policySnapshot, policyHash } = lastRunUpdate(h);
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue({
+        id: 'run-1', tenantId: 'tenant-1', status: 'REVIEW', month: 7, year: 2026, entries: [], policySnapshot, policyHash,
+      });
+      (h.prisma.payrollRun.update as jest.Mock).mockClear();
+
+      await h.service.approveRun('tenant-1', 'run-1', 'user-1');
+
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({ where: { id: 'run-1' }, data: { status: 'APPROVED' } });
+    });
+
+    it('approves a run whose policy has not changed', async () => {
+      const h = await approvalHarness(false);
+
+      await h.service.approveRun('tenant-1', 'run-1', 'user-1');
+
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({ where: { id: 'run-1' }, data: { status: 'APPROVED' } });
+    });
+
+    it('still requires REVIEW, so an APPROVED run is refused before staleness is even considered', async () => {
+      const h = await approvalHarness(true, 'APPROVED');
+
+      await expect(h.service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(
+        'Run must be in REVIEW to approve',
+      );
+    });
+  });
+
+  describe('locking a stale run', () => {
+    /** A processed run whose policy has (or has not) changed since, with lock's side effects reset. */
+    async function lockHarness(status: string, policyChanged: boolean) {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h, status);
+      if (policyChanged) h.policies[0].compOffUnusedTreatment = 'UNPAID';
+      (h.prisma.payrollRun.update as jest.Mock).mockClear();
+      (h.prisma.payrollRunEmployee.findMany as jest.Mock).mockClear();
+      return h;
+    }
+
+    it('rejects locking an APPROVED run whose policy changed since it was processed', async () => {
+      const h = await lockHarness('APPROVED', true);
+
+      await expect(h.service.lockRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(STALE_MESSAGE);
+      await expect(h.service.lockRun('tenant-1', 'run-1', 'user-1')).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(h.prisma.payrollRun.update).not.toHaveBeenCalled();
+      // Nothing that lock writes happened either: loan installments are read from the entries first.
+      expect(h.prisma.payrollRunEmployee.findMany).not.toHaveBeenCalled();
+    });
+
+    it('still locks an APPROVED run whose policy has not changed', async () => {
+      const h = await lockHarness('APPROVED', false);
+
+      await h.service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({
+        where: { id: 'run-1' },
+        data: expect.objectContaining({ status: 'LOCKED', lockedById: 'user-1' }),
+      });
+    });
+
+    it('locks once a stale APPROVED run has been reprocessed and approved again', async () => {
+      const h = await lockHarness('APPROVED', true);
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      const { policySnapshot, policyHash } = lastRunUpdate(h);
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue({
+        id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED', month: 7, year: 2026, entries: [], policySnapshot, policyHash,
+      });
+      (h.prisma.payrollRun.update as jest.Mock).mockClear();
+
+      await h.service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({
+        where: { id: 'run-1' },
+        data: expect.objectContaining({ status: 'LOCKED' }),
+      });
+    });
+
+    it('does not let a stale REVIEW run reach LOCKED through lock', async () => {
+      const h = await lockHarness('REVIEW', true);
+
+      await expect(h.service.lockRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(STALE_MESSAGE);
+
+      expect(h.prisma.payrollRun.update).not.toHaveBeenCalled();
+      expect(h.prisma.payrollRunEmployee.findMany).not.toHaveBeenCalled();
+    });
+
+    it('leaves lock refusing a current REVIEW run with the existing status message', async () => {
+      const h = await lockHarness('REVIEW', false);
+
+      await expect(h.service.lockRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(
+        'Run must be APPROVED before locking',
+      );
+    });
+
+    it.each(['LOCKED', 'PUBLISHED', 'CLOSED'])(
+      'leaves lock behaviour on a %s run unchanged, whatever the policy has done since',
+      async (status) => {
+        const h = await lockHarness(status, true);
+
+        await expect(h.service.lockRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(
+          'Run must be APPROVED before locking',
+        );
+        expect(h.prisma.payrollRun.update).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  describe('legacy runs without a policy snapshot', () => {
+    const legacyRun = (status: string) => ({
+      id: 'run-legacy',
+      tenantId: 'tenant-1',
+      status,
+      month: 6,
+      year: 2026,
+      entries: [],
+      policySnapshot: null,
+      policyHash: null,
+    });
+
+    it('reports no snapshot and never stale, however the policy differs from anything today', async () => {
+      const h = harness({ status: 'DRAFT' });
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue(legacyRun('REVIEW'));
+
+      await expect(h.service.getRun('tenant-1', 'run-legacy')).resolves.toMatchObject({
+        policyStale: false,
+        policySnapshotAvailable: false,
+      });
+    });
+
+    it('reports a snapshot as available once the run has been processed', async () => {
+      const h = harness({ status: 'DRAFT' });
+      await processedRun(h);
+
+      await expect(h.service.getRun('tenant-1', 'run-1')).resolves.toMatchObject({
+        policyStale: false,
+        policySnapshotAvailable: true,
+      });
+    });
+
+    it('still approves and locks a legacy run exactly as before', async () => {
+      const h = harness({ status: 'DRAFT' });
+      (h.prisma.payrollRunEmployee.findMany as jest.Mock).mockResolvedValue([{ errors: [], warnings: [] }]);
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue(legacyRun('REVIEW'));
+      await h.service.approveRun('tenant-1', 'run-legacy', 'user-1');
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({ where: { id: 'run-legacy' }, data: { status: 'APPROVED' } });
+
+      (h.prisma.payrollRunEmployee.findMany as jest.Mock).mockResolvedValue([]);
+      (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue(legacyRun('APPROVED'));
+      await h.service.lockRun('tenant-1', 'run-legacy', 'user-1');
+      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({
+        where: { id: 'run-legacy' },
+        data: expect.objectContaining({ status: 'LOCKED' }),
+      });
+    });
+
+    it('lists both flags per run, without reconstructing anything for the legacy one', async () => {
+      const h = harness({ status: 'DRAFT' });
+      const current = await processedRun(h);
+      h.policies[0].compOffUnusedTreatment = 'UNPAID';
+      (h.prisma as any).payrollRun.findMany = jest.fn().mockResolvedValue([
+        { ...current, _count: { entries: 1 } },
+        { ...legacyRun('REVIEW'), _count: { entries: 1 } },
+      ]);
+      (h.prisma as any).payrollRunEmployee.groupBy = jest.fn().mockResolvedValue([]);
+
+      const rows = await h.service.listRuns('tenant-1');
+
+      expect(rows.map((r) => [r.id, r.policyStale, r.policySnapshotAvailable])).toEqual([
+        ['run-1', true, true],
+        ['run-legacy', false, false],
+      ]);
+    });
+  });
+
+  describe('removing an employee from a reprocessed run', () => {
+    it("deletes the employee's entry and run-scoped tax snapshot together, scoped to this run only", async () => {
+      const h = harness({ status: 'REVIEW' });
+      const entryDelete = Promise.resolve({ count: 1 });
+      const snapshotDelete = Promise.resolve({ count: 1 });
+      (h.prisma.payrollRunEmployee.deleteMany as jest.Mock).mockReturnValue(entryDelete);
+      (h.prisma.taxComputationSnapshot.deleteMany as jest.Mock).mockReturnValue(snapshotDelete);
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+
+      expect(h.prisma.payrollRunEmployee.deleteMany).toHaveBeenCalledWith({
+        where: { payrollRunId: 'run-1', employeeId: { notIn: ['emp-1'] } },
+      });
+      expect(h.prisma.taxComputationSnapshot.deleteMany).toHaveBeenCalledWith({
+        where: { tenantId: 'tenant-1', payrollRunId: 'run-1', employeeId: { notIn: ['emp-1'] } },
+      });
+      // Both went into one transaction, so neither can outlive the other.
+      expect(h.prisma.$transaction).toHaveBeenCalledWith([entryDelete, snapshotDelete]);
+    });
+
+    it('leaves the shared per-month TDS ledger alone', async () => {
+      const h = harness({ status: 'REVIEW' });
+      const ledger = { deleteMany: jest.fn(), delete: jest.fn(), update: jest.fn(), upsert: jest.fn() };
+      (h.prisma as any).employeeMonthlyTds = ledger;
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+
+      expect(ledger.deleteMany).not.toHaveBeenCalled();
+      expect(ledger.delete).not.toHaveBeenCalled();
+    });
+
+    it('repeats the same cleanup on every reprocess, so it stays idempotent', async () => {
+      const h = harness({ status: 'REVIEW' });
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+      await h.service.reprocessRun('tenant-1', 'run-1');
+
+      const calls = (h.prisma.taxComputationSnapshot.deleteMany as jest.Mock).mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[1]).toEqual(calls[0]);
+      expect(entryCreates(h)[1]).toEqual(entryCreates(h)[0]);
+    });
+
+    it('scopes the cleanup to the employees still in the run when several remain', async () => {
+      const h = buildProcessRunHarness({
+        run: { status: 'REVIEW' },
+        finalizations: finalizedJuly,
+        employeeOverrides: basicSalary(26000),
+        extraEmployees: [{ id: 'emp-1' }, { id: 'emp-2' }],
+      });
+
+      await h.service.reprocessRun('tenant-1', 'run-1');
+
+      expect(h.prisma.taxComputationSnapshot.deleteMany).toHaveBeenCalledWith({
+        where: { tenantId: 'tenant-1', payrollRunId: 'run-1', employeeId: { notIn: ['emp-1', 'emp-2'] } },
+      });
+    });
   });
 });
 

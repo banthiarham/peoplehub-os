@@ -1434,6 +1434,11 @@ model PayrollRun {
   warningOverrideReason  String?
   warningsOverriddenAt   DateTime?
   warningsOverriddenById String?
+  // The resolved PayrollPolicy inputs (per employee location) this run was last processed
+  // with, and a hash of them. A run is stale when the policies resolve differently now.
+  // Null on runs processed before this was recorded, which are never reported stale.
+  policySnapshot         Json?
+  policyHash             String?
   lockedAt               DateTime?
   lockedById             String?
   publishedAt            DateTime?

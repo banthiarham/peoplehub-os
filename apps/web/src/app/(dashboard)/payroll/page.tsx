@@ -39,6 +39,7 @@ interface RunRow {
   employees: number;
   totalNet: number;
   totalGross: number;
+  policyStale?: boolean;
 }
 
 interface PayrollStats {
@@ -288,7 +289,7 @@ export default function PayrollPage() {
                   <TH className="w-32">Gross</TH>
                   <TH className="w-32">Net</TH>
                   <TH className="w-36">Status</TH>
-                  <TH className="w-28"></TH>
+                  <TH className="w-52"></TH>
                 </TR>
               </THead>
               <TBody>
@@ -304,9 +305,14 @@ export default function PayrollPage() {
                     <TD className="whitespace-nowrap font-medium">{formatINR(r.totalNet, true)}</TD>
                     <TD>
                       <Badge variant={statusVariant(r.status)}>{r.status}</Badge>
+                      {r.policyStale && (
+                        <Badge variant="warning" className="mt-1 block w-fit">
+                          Policy changed
+                        </Badge>
+                      )}
                     </TD>
                     <TD>
-                      <PayrollRunActionButton runId={r.id} status={r.status} />
+                      <PayrollRunActionButton runId={r.id} status={r.status} policyStale={r.policyStale} />
                     </TD>
                   </TR>
                 ))}

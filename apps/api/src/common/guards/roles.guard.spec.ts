@@ -179,7 +179,7 @@ describe('RolesGuard: leave configuration and approval are unchanged', () => {
 });
 
 describe('RolesGuard: payroll run lifecycle', () => {
-  const LIFECYCLE = ['processRun', 'overrideWarnings', 'approveRun', 'lockRun', 'closeRun'];
+  const LIFECYCLE = ['processRun', 'reprocessRun', 'overrideWarnings', 'approveRun', 'lockRun', 'closeRun'];
 
   it.each(LIFECYCLE)('lets a Payroll Admin run %s', (method) => {
     expect(allowed(PayrollController, method, userFor('Payroll Admin'))).toBe(true);

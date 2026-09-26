@@ -29,7 +29,10 @@ import {
 } from './dto/payroll.dto';
 import { PayrollCalculatorService } from './payroll-calculator.service';
 import { PayrollPolicyService } from './payroll-policy.service';
+import { hashPolicySnapshot } from './payroll-policy-snapshot';
 import { ResolvedDenominator, SalaryDenominatorService } from './salary-denominator.service';
+
+const POLICY_STALE_MESSAGE = 'Payroll policy changed since this run was processed. Reprocess to apply.';
 
 /**
  * Employee statuses that may file a claim. Same set leave self-service accepts, so a
@@ -400,12 +403,16 @@ export class PayrollService {
       _sum: { netPay: true, grossPay: true },
     });
     const totalMap = new Map(totals.map((t) => [t.payrollRunId, t._sum]));
-    return runs.map((r) => ({
-      ...r,
-      employees: r._count.entries,
-      totalNet: totalMap.get(r.id)?.netPay ?? 0,
-      totalGross: totalMap.get(r.id)?.grossPay ?? 0,
-    }));
+    return Promise.all(
+      runs.map(async (r) => ({
+        ...r,
+        employees: r._count.entries,
+        totalNet: totalMap.get(r.id)?.netPay ?? 0,
+        totalGross: totalMap.get(r.id)?.grossPay ?? 0,
+        policyStale: await this.isPolicyStale(tenantId, r),
+        policySnapshotAvailable: this.hasPolicySnapshot(r),
+      })),
+    );
   }
 
   async getRun(tenantId: string, id: string) {
@@ -444,6 +451,8 @@ export class PayrollService {
     return {
       ...run,
       entries,
+      policyStale: await this.isPolicyStale(tenantId, run),
+      policySnapshotAvailable: this.hasPolicySnapshot(run),
       totals: {
         totalNet,
         totalGross,
@@ -663,17 +672,46 @@ export class PayrollService {
   }
 
   async processRun(tenantId: string, id: string, actorId?: string) {
+    return this.executeRun(tenantId, id, actorId, 'PROCESS');
+  }
+
+  /**
+   * Recomputes a run that has already been processed, so it picks up whatever changed since -
+   * a payroll policy above all. Only REVIEW and APPROVED runs qualify: LOCKED, PUBLISHED and
+   * CLOSED are immutable. An APPROVED run drops back to REVIEW and must be approved again.
+   *
+   * It is the same computation as `processRun`, which already replaces each employee's entry
+   * (upsert) and each comp-off payout it owns (delete + recreate), so repeating it never
+   * accumulates amounts.
+   */
+  async reprocessRun(tenantId: string, id: string, actorId?: string) {
+    return this.executeRun(tenantId, id, actorId, 'REPROCESS');
+  }
+
+  private async executeRun(tenantId: string, id: string, actorId: string | undefined, mode: 'PROCESS' | 'REPROCESS') {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
-    if (!['DRAFT', 'PROCESSING'].includes(run.status)) {
+    if (mode === 'PROCESS' && !['DRAFT', 'PROCESSING'].includes(run.status)) {
       throw new BadRequestException(`Run is ${run.status}; only DRAFT runs can be processed`);
+    }
+    if (mode === 'REPROCESS' && !['REVIEW', 'APPROVED'].includes(run.status)) {
+      throw new BadRequestException(`Run is ${run.status}; only REVIEW or APPROVED runs can be reprocessed`);
     }
 
     const monthStart = new Date(Date.UTC(run.year, run.month - 1, 1));
     const monthEnd = new Date(Date.UTC(run.year, run.month, 0));
     const calendarDays = monthEnd.getUTCDate();
 
-    await this.prisma.payrollRun.update({ where: { id }, data: { status: 'PROCESSING' } });
+    // Claimed against the status read above, not just written: a run that was locked or
+    // reprocessed by someone else in the meantime must not be pulled back into REVIEW by
+    // this call finishing later. PROCESSING also keeps approve/lock out while it recomputes.
+    const claimed = await this.prisma.payrollRun.updateMany({
+      where: { id, tenantId, status: run.status },
+      data: { status: 'PROCESSING' },
+    });
+    if (claimed.count === 0) {
+      throw new ConflictException('Payroll run changed while it was being processed; reload and try again');
+    }
     const employees = await this.prisma.employee.findMany({
       where: {
         tenantId,
@@ -714,6 +752,15 @@ export class PayrollService {
         },
       },
     });
+
+    // The policy inputs this run is computed with, recorded so a later policy change can be
+    // detected. Taken before anything below reads a policy: if one is edited mid-run the
+    // stored snapshot is then the older one, so the run reads as stale instead of silently
+    // claiming to match a policy part of it may not have used.
+    const policySnapshot = await this.payrollPolicies.snapshotForLocations(
+      tenantId,
+      employees.map((employee) => employee.locationId),
+    );
 
     // Salary denominator per employee, from the PayrollPolicy that applies at their location.
     // Resolved before any entry is written so a misconfigured FIXED_DAYS policy fails the run
@@ -1030,12 +1077,56 @@ export class PayrollService {
         data: { reimbursedInPayrollRunId: run.id },
       });
     }
-    await this.prisma.payrollRun.update({ where: { id }, data: { status: 'REVIEW' } });
-    await this.audit(tenantId, actorId, 'PAYROLL_RUN_PROCESSED', 'PayrollRun', id, undefined, {
-      processed,
-      errors: errorCount,
-      warnings: warningCount,
+    // A recompute replaces the run's results outright, so an employee who has dropped out of
+    // scope since the last pass (exited, moved location) must not keep a stale entry behind -
+    // nor the tax computation snapshot recorded for it, which is keyed to this run and feeds
+    // its TDS summary. Removed together so neither outlives the other.
+    // `EmployeeMonthlyTds` is deliberately left alone: it is one row per employee per tax
+    // month (not per run), `payrollRunId` on it is only whichever run wrote it last, and later
+    // months' TDS and the tax module's history read it independently of this run.
+    await this.prisma.$transaction([
+      this.prisma.payrollRunEmployee.deleteMany({
+        where: { payrollRunId: run.id, employeeId: { notIn: employeeIds } },
+      }),
+      this.prisma.taxComputationSnapshot.deleteMany({
+        where: { tenantId, payrollRunId: run.id, employeeId: { notIn: employeeIds } },
+      }),
+    ]);
+    const policyHash = hashPolicySnapshot(policySnapshot);
+    // The warning override attested to the warnings of the previous pass; this pass has its
+    // own, so the override is cleared and must be given again if warnings remain.
+    await this.prisma.payrollRun.update({
+      where: { id },
+      data: {
+        status: 'REVIEW',
+        policySnapshot: policySnapshot as unknown as Prisma.InputJsonValue,
+        policyHash,
+        warningOverrideReason: null,
+        warningsOverriddenAt: null,
+        warningsOverriddenById: null,
+      },
     });
+    if (mode === 'REPROCESS') {
+      await this.audit(
+        tenantId,
+        actorId,
+        'PAYROLL_RUN_REPROCESSED',
+        'PayrollRun',
+        id,
+        {
+          status: run.status,
+          policyHash: run.policyHash,
+          warningsOverridden: Boolean(run.warningsOverriddenAt),
+        },
+        { status: 'REVIEW', policyHash, processed, errors: errorCount, warnings: warningCount },
+      );
+    } else {
+      await this.audit(tenantId, actorId, 'PAYROLL_RUN_PROCESSED', 'PayrollRun', id, undefined, {
+        processed,
+        errors: errorCount,
+        warnings: warningCount,
+      });
+    }
     return { processed, errors: errorCount, warnings: warningCount, status: 'REVIEW' };
   }
 
@@ -1043,6 +1134,7 @@ export class PayrollService {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
     if (run.status !== 'REVIEW') throw new BadRequestException('Run must be in REVIEW to approve');
+    if (await this.isPolicyStale(tenantId, run)) throw new BadRequestException(POLICY_STALE_MESSAGE);
     const entries = await this.prisma.payrollRunEmployee.findMany({
       where: { payrollRunId: id },
       select: { errors: true, warnings: true },
@@ -1068,6 +1160,28 @@ export class PayrollService {
     return updated;
   }
 
+  /**
+   * Whether a run still awaiting sign-off was processed under payroll policies that have since
+   * changed. Only REVIEW and APPROVED runs can be stale: earlier runs have no results to
+   * outdate, and later ones are frozen. Nothing is recalculated here or on a policy save -
+   * the run just reports the mismatch until it is reprocessed.
+   */
+  private async isPolicyStale(
+    tenantId: string,
+    run: { status: string; policySnapshot: Prisma.JsonValue | null; policyHash: string | null },
+  ): Promise<boolean> {
+    if (!['REVIEW', 'APPROVED'].includes(run.status)) return false;
+    // A legacy run (processed before snapshots were recorded) has nothing to compare against
+    // and is never reconstructed, so it stays non-stale until it is reprocessed.
+    if (!this.hasPolicySnapshot(run)) return false;
+    return this.payrollPolicies.isSnapshotStale(tenantId, run);
+  }
+
+  /** Whether a snapshot was recorded for the run; false only for legacy runs. */
+  private hasPolicySnapshot(run: { policySnapshot: Prisma.JsonValue | null; policyHash: string | null }): boolean {
+    return Boolean(run.policyHash && run.policySnapshot);
+  }
+
   async overrideRunWarnings(tenantId: string, id: string, userId: string, dto: OverrideWarningsDto) {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
@@ -1087,6 +1201,10 @@ export class PayrollService {
   async lockRun(tenantId: string, id: string, userId: string) {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
+    // Ahead of the status check and of anything below that writes: a run whose policy has
+    // changed since it was processed must not be frozen (or reach LOCKED at all), and locking
+    // records loan installments, which cannot be undone by reprocessing afterwards.
+    if (await this.isPolicyStale(tenantId, run)) throw new BadRequestException(POLICY_STALE_MESSAGE);
     if (run.status !== 'APPROVED') throw new BadRequestException('Run must be APPROVED before locking');
     await this.recordLoanInstallmentsForRun(run);
     const updated = await this.prisma.payrollRun.update({

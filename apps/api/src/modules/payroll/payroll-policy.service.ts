@@ -2,6 +2,14 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { CompOffUnusedTreatment, CompOffUsagePeriod, SalaryBasis } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { UpsertPayrollPolicyDto } from './dto/payroll-policy.dto';
+import {
+  buildPolicySnapshot,
+  hashPolicySnapshot,
+  pickPolicyInputs,
+  snapshotLocationKeys,
+  PayrollPolicyInputs,
+  PayrollPolicySnapshot,
+} from './payroll-policy-snapshot';
 
 /** Upper bound for `fixedDays`: a payable-day count is a day count within one month. */
 export const MAX_FIXED_DAYS = 31;
@@ -140,6 +148,40 @@ export class PayrollPolicyService {
       updatedAt: null,
       inherited: true,
     };
+  }
+
+  /**
+   * Resolves the effective policy inputs for each distinct location in `locationIds` (null =
+   * no location) into a snapshot, using the same `resolve` precedence payroll itself uses.
+   */
+  async snapshotForLocations(
+    tenantId: string,
+    locationIds: Array<string | null>,
+  ): Promise<PayrollPolicySnapshot> {
+    const keys = Array.from(new Set(locationIds.map((locationId) => locationId ?? '')));
+    const locations: Record<string, PayrollPolicyInputs> = {};
+    for (const key of keys) {
+      locations[key] = pickPolicyInputs(await this.resolve(tenantId, key || null));
+    }
+    return buildPolicySnapshot(locations);
+  }
+
+  /**
+   * Whether the policies now resolve differently from the snapshot a run was processed with.
+   * Compared over the same locations the run used. A run with no recorded snapshot (processed
+   * before snapshots existed) cannot be shown to be stale, so it is reported as current.
+   */
+  async isSnapshotStale(
+    tenantId: string,
+    stored: { policySnapshot: unknown; policyHash: string | null },
+  ): Promise<boolean> {
+    const keys = snapshotLocationKeys(stored.policySnapshot);
+    if (!stored.policyHash || !keys) return false;
+    const current = await this.snapshotForLocations(
+      tenantId,
+      keys.map((key) => key || null),
+    );
+    return hashPolicySnapshot(current) !== stored.policyHash;
   }
 
   /**
