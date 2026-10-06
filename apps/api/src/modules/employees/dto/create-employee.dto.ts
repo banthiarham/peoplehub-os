@@ -279,6 +279,13 @@ export class TerminateEmployeeDto {
   confirmName!: string;
 }
 
+export class RejectProfileChangeDto {
+  @ApiPropertyOptional({ description: 'Why the change is being declined. Stored on the change and the audit log.' })
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
+
 export class BulkImportEmployeesDto {
   @ApiProperty({ type: [CreateEmployeeDto] })
   @IsArray()

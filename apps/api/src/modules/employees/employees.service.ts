@@ -334,13 +334,11 @@ export class EmployeesService {
     const entries = Object.entries(rest).filter(([, value]) => value !== undefined);
     const sensitive = entries.filter(([key]) => sensitiveFields.has(key));
     const normal = Object.fromEntries(entries.filter(([key]) => !sensitiveFields.has(key))) as UpdateEmployeeDto;
-    const canUpdateLegalEntity = user.roles.includes('Tenant Owner');
-    const pendingSensitive = user.isSuperAdmin
-      ? []
-      : sensitive.filter(([key]) => key !== 'legalEntityId' || !canUpdateLegalEntity);
-    const directSensitive = user.isSuperAdmin
-      ? sensitive
-      : sensitive.filter(([key]) => key === 'legalEntityId' && canUpdateLegalEntity);
+    // Tenant Owner gets the same direct-apply trust as Super Admin: both bypass
+    // the maker-checker approval queue entirely, rather than only for legalEntityId.
+    const bypassApproval = user.isSuperAdmin || user.roles.includes('Tenant Owner');
+    const pendingSensitive = bypassApproval ? [] : sensitive;
+    const directSensitive = bypassApproval ? sensitive : [];
 
     if (pendingSensitive.length) {
       await this.createPendingSensitiveChanges(user, existing, pendingSensitive);
@@ -401,7 +399,7 @@ export class EmployeesService {
       throw new ForbiddenException('Not allowed to approve profile changes');
     }
     const change = await this.prisma.employeeProfileChange.findFirst({
-      where: { id: changeId, approvedAt: null, employee: { tenantId: user.tenantId } },
+      where: { id: changeId, approvedAt: null, rejectedAt: null, employee: { tenantId: user.tenantId } },
       include: { employee: true },
     });
     if (!change) throw new NotFoundException('Pending profile change not found');
@@ -432,9 +430,38 @@ export class EmployeesService {
     return updated;
   }
 
+  async rejectProfileChange(user: AuthUser, changeId: string, reason?: string) {
+    if (!user.isSuperAdmin && !user.roles.some((r) => ['Tenant Owner', 'HR Admin'].includes(r))) {
+      throw new ForbiddenException('Not allowed to reject profile changes');
+    }
+    const change = await this.prisma.employeeProfileChange.findFirst({
+      where: { id: changeId, approvedAt: null, rejectedAt: null, employee: { tenantId: user.tenantId } },
+    });
+    if (!change) throw new NotFoundException('Pending profile change not found');
+    if (change.changedById === user.userId) throw new BadRequestException('Maker cannot reject their own change');
+    return this.prisma.$transaction(async (tx) => {
+      const rejected = await tx.employeeProfileChange.update({
+        where: { id: change.id },
+        data: { rejectedById: user.userId, rejectedAt: new Date(), reason: reason?.trim() || change.reason },
+      });
+      await tx.auditLog.create({
+        data: {
+          tenantId: user.tenantId,
+          actorId: user.userId,
+          action: 'employee.profile_change.rejected',
+          objectType: 'EmployeeProfileChange',
+          objectId: change.id,
+          oldValue: { [change.fieldName]: change.oldValue },
+          newValue: { [change.fieldName]: change.newValue },
+        },
+      });
+      return rejected;
+    });
+  }
+
   async pendingProfileChanges(user: AuthUser) {
     return this.prisma.employeeProfileChange.findMany({
-      where: { approvedAt: null, employee: { tenantId: user.tenantId } },
+      where: { approvedAt: null, rejectedAt: null, employee: { tenantId: user.tenantId } },
       include: { employee: { select: { id: true, firstName: true, lastName: true, employeeCode: true } } },
       orderBy: { createdAt: 'desc' },
     });
