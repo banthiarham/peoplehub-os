@@ -18,6 +18,7 @@ import {
   YAxis,
 } from 'recharts';
 import { api } from '@/lib/api';
+import { useToast } from '@/components/ui/toaster';
 import { CHART_COLORS } from '@/lib/colors';
 import { downloadFile } from '@/lib/download';
 import { Button } from '@/components/ui/button';
@@ -48,6 +49,29 @@ type Dashboard = {
   upcoming: { birthdays: Array<{ id: string; name: string; date: string | null }>; anniversaries: Array<{ id: string; name: string; date: string | null }>; holidays: Array<{ name: string; date: string }> };
 };
 
+/** The report kinds the builder serves, and how they are labelled. */
+const REPORTS = [
+  { value: 'employees', label: 'Employees' },
+  { value: 'attendance', label: 'Attendance (monthly register)' },
+  { value: 'attendanceSummary', label: 'Attendance summary' },
+  { value: 'payroll', label: 'Payroll' },
+  { value: 'expenses', label: 'Expenses' },
+  { value: 'tickets', label: 'Helpdesk tickets' },
+] as const;
+
+type ReportKind = (typeof REPORTS)[number]['value'];
+
+/** Reports built from the attendance ledger, which take the extra day options. */
+const ATTENDANCE_REPORTS: ReportKind[] = ['attendance', 'attendanceSummary'];
+
+type ColumnSpec = { key: string; label: string; numeric?: boolean };
+/** `rows` is a capped preview; `rowCount` is how many the export contains. */
+type ReportTable = {
+  columns: ColumnSpec[];
+  rows: Array<Record<string, unknown>>;
+  rowCount: number;
+};
+
 type TrendPoint = { month: string; headcount: number; joins: number; exits: number };
 type AttritionData = { monthly: Array<{ month: string; headcount: number; exits: number; attritionPct: number }>; byDepartment: Array<{ name: string; exits: number }> };
 type NameValue = { name: string; value: number };
@@ -69,7 +93,11 @@ function buildParams(filters: Record<string, string | undefined>) {
 }
 
 export default function ReportsPage() {
-  const [report, setReport] = useState<'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets'>('employees');
+  const [report, setReport] = useState<ReportKind>('employees');
+  const [format, setFormat] = useState<'xlsx' | 'csv'>('xlsx');
+  const [includeNonWorkingDays, setIncludeNonWorkingDays] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const toast = useToast();
   const [departmentId, setDepartmentId] = useState('');
   const [locationId, setLocationId] = useState('');
   const [legalEntityId, setLegalEntityId] = useState('');
@@ -82,9 +110,35 @@ export default function ReportsPage() {
     () => buildParams({ departmentId, locationId, legalEntityId, managerId, employmentType }),
     [departmentId, locationId, legalEntityId, managerId, employmentType],
   );
+  const isAttendanceReport = ATTENDANCE_REPORTS.includes(report);
   const reportParams = useMemo(
-    () => buildParams({ report, from, to, departmentId, locationId, legalEntityId, managerId, employmentType }),
-    [report, from, to, departmentId, locationId, legalEntityId, managerId, employmentType],
+    () =>
+      buildParams({
+        report,
+        from,
+        to,
+        departmentId,
+        locationId,
+        legalEntityId,
+        managerId,
+        employmentType,
+        // Only sent for the register, and only when switched off: the default is
+        // to include them so the file reconciles to whole calendar months.
+        ...(report === 'attendance' && !includeNonWorkingDays
+          ? { includeNonWorkingDays: 'false' }
+          : {}),
+      }),
+    [
+      report,
+      from,
+      to,
+      departmentId,
+      locationId,
+      legalEntityId,
+      managerId,
+      employmentType,
+      includeNonWorkingDays,
+    ],
   );
 
   const { data: options } = useQuery<EmployeeOptions>({
@@ -107,10 +161,16 @@ export default function ReportsPage() {
     queryKey: ['analytics', 'demographics', filterParams],
     queryFn: () => api.get(`/analytics/demographics?${filterParams}`).then((r) => r.data),
   });
-  const { data: builderRows } = useQuery<Array<Record<string, unknown>>>({
+  const { data: builderTable, error: builderError } = useQuery<ReportTable>({
     queryKey: ['analytics', 'report-builder', reportParams],
     queryFn: () => api.get(`/analytics/reports/builder?${reportParams}`).then((r) => r.data),
+    // A range too wide to export is answered with a 400 explaining how to narrow
+    // it; retrying cannot change that.
+    retry: false,
   });
+  const builderColumns = builderTable?.columns ?? [];
+  const builderRows = builderTable?.rows ?? [];
+  const builderRowCount = builderTable?.rowCount ?? 0;
 
   const loading = !options || !dashboard || !trend || !attrition || !demographics;
 
@@ -132,8 +192,18 @@ export default function ReportsPage() {
     );
   }
 
-  async function downloadReportCsv() {
-    await downloadFile(`/analytics/reports/builder/export?${reportParams}`, `${report}-report.csv`);
+  async function downloadReport() {
+    setExporting(true);
+    try {
+      await downloadFile(
+        `/analytics/reports/builder/export?${reportParams}&format=${format}`,
+        `${report}-report.${format}`,
+      );
+    } catch {
+      toast('Export failed. Narrow the date range or filters and try again.', 'error');
+    } finally {
+      setExporting(false);
+    }
   }
 
   return (
@@ -188,39 +258,83 @@ export default function ReportsPage() {
             </div>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-3">
-            <Select value={report} onChange={(e) => setReport(e.target.value as typeof report)} className="w-56">
-              <option value="employees">Employees</option>
-              <option value="attendance">Attendance</option>
-              <option value="payroll">Payroll</option>
-              <option value="expenses">Expenses</option>
-              <option value="tickets">Helpdesk tickets</option>
+            <Select value={report} onChange={(e) => setReport(e.target.value as ReportKind)} className="w-64">
+              {REPORTS.map((item) => (
+                <option key={item.value} value={item.value}>{item.label}</option>
+              ))}
             </Select>
-            <Button variant="outline" onClick={downloadReportCsv}>
-              <Download className="h-4 w-4" /> Export CSV
+            <Select
+              value={format}
+              onChange={(e) => setFormat(e.target.value as 'xlsx' | 'csv')}
+              className="w-40"
+              aria-label="Export format"
+            >
+              <option value="xlsx">Excel (.xlsx)</option>
+              <option value="csv">CSV</option>
+            </Select>
+            {report === 'attendance' && (
+              <label className="flex items-center gap-2 text-sm text-ink-muted">
+                <input
+                  type="checkbox"
+                  checked={includeNonWorkingDays}
+                  onChange={(e) => setIncludeNonWorkingDays(e.target.checked)}
+                />
+                Include weekly offs &amp; holidays
+              </label>
+            )}
+            <Button variant="outline" onClick={downloadReport} disabled={exporting}>
+              <Download className="h-4 w-4" /> {exporting ? 'Preparing…' : 'Export'}
             </Button>
-            <span className="text-sm text-ink-muted">{builderRows?.length ?? 0} rows ready</span>
+            <span className="text-sm text-ink-muted">
+              {builderRowCount.toLocaleString('en-IN')} rows ready
+            </span>
           </div>
-          {!!builderRows?.length && (
+          {isAttendanceReport && (
+            <p className="mt-2 text-xs text-ink-muted">
+              {report === 'attendance'
+                ? 'One row per employee per day, including absent, on-leave, weekly-off and holiday days. Defaults to the current month when no dates are set.'
+                : 'One row per employee per month. Attendance figures only — no payroll LOP or payable days.'}
+            </p>
+          )}
+          {!!builderError && (
+            <p className="mt-3 rounded-lg border border-line bg-canvas px-3 py-2 text-sm text-danger">
+              {errorMessage(builderError)}
+            </p>
+          )}
+          {!!builderRows.length && (
             <div className="mt-4 overflow-x-auto rounded border border-line">
               <Table>
                 <THead>
                   <TR>
-                    {Object.keys(builderRows[0]).slice(0, 6).map((key) => (
-                      <TH key={key}>{key}</TH>
+                    {builderColumns.map((column) => (
+                      <TH key={column.key} className={column.numeric ? 'text-right' : undefined}>
+                        {column.label}
+                      </TH>
                     ))}
                   </TR>
                 </THead>
                 <TBody>
-                  {builderRows.slice(0, 5).map((row, index) => (
+                  {builderRows.slice(0, 10).map((row, index) => (
                     <TR key={index}>
-                      {Object.keys(builderRows[0]).slice(0, 6).map((key) => (
-                        <TD key={key}>{String(row[key] ?? '')}</TD>
+                      {builderColumns.map((column) => (
+                        <TD
+                          key={column.key}
+                          className={column.numeric ? 'whitespace-nowrap text-right' : 'whitespace-nowrap'}
+                        >
+                          {String(row[column.key] ?? '')}
+                        </TD>
                       ))}
                     </TR>
                   ))}
                 </TBody>
               </Table>
             </div>
+          )}
+          {builderRowCount > 10 && (
+            <p className="mt-2 text-xs text-ink-muted">
+              Showing the first 10 of {builderRowCount.toLocaleString('en-IN')} rows — the export
+              contains all of them.
+            </p>
           )}
         </CardContent>
       </Card>
@@ -359,6 +473,12 @@ export default function ReportsPage() {
       </div>
     </div>
   );
+}
+
+/** Surfaces the API's own explanation — the row-limit refusal names what to narrow. */
+function errorMessage(error: unknown): string {
+  const detail = (error as { response?: { data?: { message?: string } } })?.response?.data?.message;
+  return detail ?? 'Could not build this report. Adjust the filters and try again.';
 }
 
 function DonutCard({ title, data }: { title: string; data: NameValue[] }) {

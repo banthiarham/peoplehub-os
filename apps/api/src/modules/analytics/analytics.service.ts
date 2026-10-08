@@ -1,7 +1,81 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
-import { toCsv } from '../../common/utils/csv';
+import { toLabelledCsv } from '../../common/utils/csv';
+import { parseAttendanceDate } from '../../common/utils/attendance-date';
+import { buildWorkbook, type InfoSheet, type SheetSpec } from '../../common/utils/xlsx';
+import { AttendanceService } from '../attendance/attendance.service';
+import {
+  buildRegisterRows,
+  buildSummaryRows,
+  groupRowsByMonth,
+  isoDay,
+  REGISTER_COLUMNS,
+  SUMMARY_COLUMNS,
+  type ColumnSpec,
+  type ReportEmployee,
+  type ReportRow,
+} from './attendance-report';
+
+/**
+ * The reports the builder can produce.
+ *
+ * `attendance` is the per-day register; `attendanceSummary` totals the same
+ * days per employee per month. Both are attendance-only: no LOP, denominator,
+ * payable-day or paid/unpaid-leave figure appears in either, because those are
+ * payroll policy rather than attendance fact.
+ */
+export type ReportKind =
+  | 'employees'
+  | 'attendance'
+  | 'attendanceSummary'
+  | 'payroll'
+  | 'expenses'
+  | 'tickets';
+
+export const REPORT_KINDS: ReportKind[] = [
+  'employees',
+  'attendance',
+  'attendanceSummary',
+  'payroll',
+  'expenses',
+  'tickets',
+];
+
+export type ReportFormat = 'csv' | 'xlsx';
+
+/**
+ * Hard ceiling on exported rows.
+ *
+ * The register emits one row per employee per day, so the old 2,000 cap clipped
+ * a single month of seventy people — silently, because it was a `take`. This is
+ * an explicit refusal instead: a reviewer is told to narrow the range rather
+ * than handed a file that quietly stops partway through a month.
+ */
+export const MAX_REPORT_ROWS = 50_000;
+
+/**
+ * Rows the on-screen preview is sent. The table shows the first handful; the
+ * rest would be megabytes of JSON nobody renders.
+ */
+export const PREVIEW_ROW_LIMIT = 50;
+
+/** Status fills for the register's Status column, as `AARRGGBB`. */
+const STATUS_FILLS: Record<string, string> = {
+  Present: 'FFE4F3EA',
+  Late: 'FFFDF0D5',
+  'Half Day': 'FFFDF0D5',
+  Absent: 'FFFBE2E2',
+  'Missing Punch': 'FFFBE2E2',
+  'On Leave': 'FFE4EDF9',
+  'Weekly Off': 'FFF0F1F2',
+  Holiday: 'FFF0F1F2',
+};
+
+/** Employment statuses with no attendance to report: employment never started. */
+const NEVER_STARTED_STATUSES = ['CANDIDATE', 'PREBOARDING'] as const;
+/** Employment statuses whose attendance window must be closed by a relieving date. */
+const ENDED_STATUSES = ['EXITED', 'INACTIVE'] as const;
 
 export type AnalyticsFilters = {
   departmentId?: string;
@@ -37,7 +111,13 @@ function jsonStringArray(value: unknown): string[] {
 
 @Injectable()
 export class AnalyticsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // The attendance ledger is reused rather than re-queried: the register, the
+    // daily attendance screen and month finalization must not be able to
+    // disagree about what an unrecorded day was.
+    private readonly attendance: AttendanceService,
+  ) {}
 
   private employeeScope(tenantId: string, filters: AnalyticsFilters = {}, activeOnly = false): Prisma.EmployeeWhereInput {
     return {
@@ -420,9 +500,9 @@ export class AnalyticsService {
 
   async reportBuilder(
     tenantId: string,
-    report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets',
-    options: AnalyticsFilters & { status?: string } = {},
-  ) {
+    report: ReportKind,
+    options: AnalyticsFilters & { status?: string; includeNonWorkingDays?: boolean } = {},
+  ): Promise<ReportRow[]> {
     const dateRange = this.dateRange(options);
     const employeeScope = this.employeeScope(tenantId, options, false);
     const activeEmployeeScope = this.employeeScope(tenantId, options, true);
@@ -452,31 +532,8 @@ export class AnalyticsService {
       }));
     }
 
-    if (report === 'attendance') {
-      const rows = await this.prisma.attendanceRecord.findMany({
-        where: {
-          tenantId,
-          ...(dateRange && { date: dateRange }),
-          ...(options.status && { status: options.status as never }),
-          employee: { ...employeeScope },
-        },
-        include: {
-          employee: { select: { employeeCode: true, firstName: true, lastName: true, department: { select: { name: true } } } },
-        },
-        orderBy: [{ date: 'desc' }, { employeeId: 'asc' }],
-        take: 2000,
-      });
-      return rows.map((record) => ({
-        date: record.date.toISOString().slice(0, 10),
-        employeeCode: record.employee.employeeCode,
-        name: `${record.employee.firstName} ${record.employee.lastName}`,
-        department: record.employee.department?.name ?? '',
-        status: record.status,
-        punchIn: record.punchIn?.toISOString() ?? '',
-        punchOut: record.punchOut?.toISOString() ?? '',
-        workingMinutes: record.workingMinutes ?? '',
-        source: record.punchSource ?? '',
-      }));
+    if (report === 'attendance' || report === 'attendanceSummary') {
+      return (await this.attendanceReport(tenantId, report, options)).rows;
     }
 
     if (report === 'payroll') {
@@ -558,12 +615,380 @@ export class AnalyticsService {
     }));
   }
 
+  /**
+   * The range an attendance report covers, as UTC day anchors.
+   *
+   * Defaults to the current month when neither bound is given: the builder used
+   * to hand whatever 2,000 records fell out of an unbounded query, which is not
+   * a period anyone asked for.
+   */
+  private attendanceRangeFor(options: AnalyticsFilters): { start: Date; endInclusive: Date } {
+    const today = dateOnly(new Date());
+    const parse = (value: string | undefined, field: string): Date | undefined => {
+      if (!value) return undefined;
+      const parsed = parseAttendanceDate(value);
+      if (!parsed) throw new BadRequestException(`Invalid ${field} — use YYYY-MM-DD`);
+      return parsed;
+    };
+    const from = parse(options.from, 'from');
+    const to = parse(options.to, 'to');
+    if (!from && !to) {
+      return {
+        start: new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1)),
+        endInclusive: today,
+      };
+    }
+    const start = from ?? new Date(Date.UTC(
+      (to as Date).getUTCFullYear(),
+      (to as Date).getUTCMonth(),
+      1,
+    ));
+    const endInclusive = to ?? today;
+    if (start > endInclusive) throw new BadRequestException('`from` must not be after `to`');
+    return { start, endInclusive };
+  }
+
+  /** Whole months the range touches, used to bound the summary's row count. */
+  private monthSpan(start: Date, endInclusive: Date): number {
+    return (
+      (endInclusive.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+      (endInclusive.getUTCMonth() - start.getUTCMonth()) +
+      1
+    );
+  }
+
+  /**
+   * The employee population an attendance report covers.
+   *
+   * Wider than the live attendance roster on purpose: a report over a past
+   * range must still show the days someone worked before they left, so employees
+   * who have since exited are included and their rows are clamped by their
+   * relieving date.
+   *
+   * Three groups are left out, each for a reason the caller is told about:
+   * employment that never started (candidates, preboarding) has no attendance;
+   * anyone whose window cannot overlap the range contributes nothing; and
+   * someone recorded as having ended employment *without* a relieving date has
+   * no closing boundary, so including them would manufacture absences through
+   * to today. That last count is surfaced in the export's Report Info rather
+   * than dropped silently.
+   */
+  private async attendanceEmployees(
+    tenantId: string,
+    options: AnalyticsFilters,
+    start: Date,
+    endInclusive: Date,
+  ) {
+    const scope = this.employeeScope(tenantId, options, false);
+    const select = {
+      id: true,
+      employeeCode: true,
+      firstName: true,
+      lastName: true,
+      locationId: true,
+      joiningDate: true,
+      exitDate: true,
+      department: { select: { name: true } },
+      location: { select: { name: true } },
+    } as const;
+    const joinedByRangeEnd: Prisma.EmployeeWhereInput = {
+      OR: [{ joiningDate: null }, { joiningDate: { lte: endInclusive } }],
+    };
+    const overlapsRange: Prisma.EmployeeWhereInput[] = [
+      joinedByRangeEnd,
+      { OR: [{ exitDate: null }, { exitDate: { gte: start } }] },
+    ];
+    const [employees, endedWithoutExitDate] = await Promise.all([
+      this.prisma.employee.findMany({
+        where: {
+          ...scope,
+          status: { notIn: [...NEVER_STARTED_STATUSES] },
+          AND: [...overlapsRange, { NOT: { status: { in: [...ENDED_STATUSES] }, exitDate: null } }],
+        },
+        select,
+      }),
+      // Counted against the same joining-date bound the population uses, so the
+      // reported number is only those an unclosable window actually cost the
+      // report — not someone who had not joined by the end of the range anyway.
+      this.prisma.employee.count({
+        where: {
+          ...scope,
+          status: { in: [...ENDED_STATUSES] },
+          exitDate: null,
+          AND: [joinedByRangeEnd],
+        },
+      }),
+    ]);
+    return { employees, endedWithoutExitDate };
+  }
+
+  /**
+   * Builds the register or the summary from one batched ledger pass.
+   *
+   * The row ceiling is checked against the range's own dimensions *before* the
+   * ledger is read, so an over-wide request is refused for a few hundred bytes
+   * instead of after assembling tens of thousands of rows.
+   */
+  private async attendanceReport(
+    tenantId: string,
+    report: 'attendance' | 'attendanceSummary',
+    options: AnalyticsFilters & { status?: string; includeNonWorkingDays?: boolean } = {},
+  ): Promise<{ columns: ColumnSpec[]; rows: ReportRow[]; rowCount: number; info: InfoSheet }> {
+    const { start, endInclusive } = this.attendanceRangeFor(options);
+    const { employees, endedWithoutExitDate } = await this.attendanceEmployees(
+      tenantId,
+      options,
+      start,
+      endInclusive,
+    );
+
+    const dayCount =
+      Math.floor((endInclusive.getTime() - start.getTime()) / 86_400_000) + 1;
+    const rowsPerEmployee =
+      report === 'attendance' ? dayCount : this.monthSpan(start, endInclusive);
+    const projected = employees.length * rowsPerEmployee;
+    if (projected > MAX_REPORT_ROWS) {
+      throw new BadRequestException(
+        `This range would export about ${projected.toLocaleString('en-IN')} rows, over the ` +
+          `${MAX_REPORT_ROWS.toLocaleString('en-IN')} row limit. Narrow the date range or ` +
+          'filter by department, location or legal entity.',
+      );
+    }
+
+    const ledger = await this.attendance.rangeLedger(
+      tenantId,
+      employees.map((employee) => ({
+        id: employee.id,
+        locationId: employee.locationId,
+        joiningDate: employee.joiningDate,
+        exitDate: employee.exitDate,
+      })),
+      start,
+      endInclusive,
+    );
+
+    const reportEmployees: ReportEmployee[] = employees.map((employee) => ({
+      id: employee.id,
+      employeeCode: employee.employeeCode,
+      firstName: employee.firstName,
+      lastName: employee.lastName,
+      departmentName: employee.department?.name ?? null,
+      locationName: employee.location?.name ?? null,
+      joiningDate: employee.joiningDate,
+      exitDate: employee.exitDate,
+    }));
+
+    const rows =
+      report === 'attendance'
+        ? buildRegisterRows(reportEmployees, ledger, {
+            includeNonWorkingDays: options.includeNonWorkingDays ?? true,
+          })
+        : buildSummaryRows(reportEmployees, ledger);
+
+    const columns = report === 'attendance' ? REGISTER_COLUMNS : SUMMARY_COLUMNS;
+    return {
+      columns,
+      rows,
+      rowCount: rows.length,
+      info: this.attendanceInfoSheet({
+        report,
+        start,
+        endInclusive,
+        options,
+        employeeCount: employees.length,
+        rowCount: rows.length,
+        endedWithoutExitDate,
+      }),
+    };
+  }
+
+  /** Records how an attendance export was produced, as its own worksheet. */
+  private attendanceInfoSheet(input: {
+    report: 'attendance' | 'attendanceSummary';
+    start: Date;
+    endInclusive: Date;
+    options: AnalyticsFilters & { status?: string; includeNonWorkingDays?: boolean };
+    employeeCount: number;
+    rowCount: number;
+    endedWithoutExitDate: number;
+  }): InfoSheet {
+    const { options } = input;
+    const filters: string[] = [];
+    if (options.departmentId) filters.push(`Department: ${options.departmentId}`);
+    if (options.locationId) filters.push(`Location: ${options.locationId}`);
+    if (options.legalEntityId) filters.push(`Legal entity: ${options.legalEntityId}`);
+    if (options.managerId) filters.push(`Manager: ${options.managerId}`);
+    if (options.employmentType) filters.push(`Employment type: ${options.employmentType}`);
+    const entries: Array<[string, string]> = [
+      ['Report', input.report === 'attendance' ? 'Attendance — Monthly Register' : 'Attendance Summary'],
+      ['Period', `${isoDay(input.start)} to ${isoDay(input.endInclusive)}`],
+      ['Generated at', new Date().toISOString()],
+      ['Employees', String(input.employeeCount)],
+      ['Rows', String(input.rowCount)],
+      ['Filters', filters.length ? filters.join('\n') : 'None'],
+    ];
+    if (input.report === 'attendance') {
+      entries.push([
+        'Weekly offs & holidays',
+        (options.includeNonWorkingDays ?? true) ? 'Included' : 'Excluded',
+      ]);
+    }
+    if (input.endedWithoutExitDate) {
+      entries.push([
+        'Excluded employees',
+        `${input.endedWithoutExitDate} employee(s) are marked as having ended employment but ` +
+          'have no relieving date, so their attendance window cannot be closed. Set a ' +
+          'relieving date to include them.',
+      ]);
+    }
+    entries.push([
+      'Basis',
+      'Attendance only. Days with no attendance record are derived with the same ' +
+        'precedence the attendance screen uses: approved leave, then holiday, then weekly ' +
+        'off, then absent. Days before joining, after relieving and after today are omitted. ' +
+        'No payroll figure (LOP, payable days, denominator) is computed here; ' +
+        '"Unfinalized Days" is the portion payroll would not yet count.',
+    ]);
+    return { name: 'Report Info', title: 'Attendance export', entries };
+  }
+
+  /**
+   * One report as labelled columns plus rows — what both the on-screen preview
+   * and the file exports read, so they cannot drift apart.
+   *
+   * Reports that predate the labelled column set derive their headers from
+   * their row keys, which keeps them working unchanged while still giving the
+   * preview something readable to render.
+   *
+   * `previewLimit` truncates the returned rows while `rowCount` keeps reporting
+   * the full total. The register is one row per employee per day, so a
+   * two-month export runs to thousands of rows; shipping all of them as JSON to
+   * render a ten-row preview would send megabytes on every filter change. The
+   * export path passes no limit and gets everything.
+   */
+  async reportTable(
+    tenantId: string,
+    report: ReportKind,
+    options: AnalyticsFilters & { status?: string; includeNonWorkingDays?: boolean } = {},
+    previewLimit?: number,
+  ): Promise<{ columns: ColumnSpec[]; rows: ReportRow[]; rowCount: number; info?: InfoSheet }> {
+    const table =
+      report === 'attendance' || report === 'attendanceSummary'
+        ? await this.attendanceReport(tenantId, report, options)
+        : await (async () => {
+            const rows = await this.reportBuilder(tenantId, report, options);
+            return { columns: derivedColumns(rows), rows, rowCount: rows.length, info: undefined };
+          })();
+    if (previewLimit !== undefined && table.rows.length > previewLimit) {
+      return { ...table, rows: table.rows.slice(0, previewLimit) };
+    }
+    return table;
+  }
+
   async reportBuilderCsv(
     tenantId: string,
-    report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets',
-    options: AnalyticsFilters & { status?: string } = {},
+    report: ReportKind,
+    options: AnalyticsFilters & { status?: string; includeNonWorkingDays?: boolean } = {},
   ) {
-    const rows = await this.reportBuilder(tenantId, report, options);
-    return { csv: toCsv(rows), filename: `${report}-report.csv` };
+    const { columns, rows } = await this.reportTable(tenantId, report, options);
+    return { csv: toLabelledCsv(columns, rows), filename: reportFilename(report, options, 'csv') };
   }
+
+  /**
+   * An attendance export as a styled workbook.
+   *
+   * The register gets one worksheet per month when the range spans more than
+   * one, plus a combined sheet, because a reviewer works a month at a time even
+   * when they asked for two. Identity columns are frozen and rows band per
+   * employee, so a six-thousand-row register stays navigable.
+   */
+  async reportBuilderWorkbook(
+    tenantId: string,
+    report: ReportKind,
+    options: AnalyticsFilters & { status?: string; includeNonWorkingDays?: boolean } = {},
+  ) {
+    const { columns, rows, info } = await this.reportTable(tenantId, report, options);
+    const sheets: SheetSpec[] = [];
+
+    if (report === 'attendance') {
+      const months = groupRowsByMonth(rows);
+      const base = {
+        columns,
+        // Month, Date, Day, Employee Code, Employee Name.
+        frozenColumns: 5,
+        bandByKey: 'employeeCode',
+        statusKey: 'status',
+        statusFills: STATUS_FILLS,
+      };
+      if (months.length > 1) {
+        sheets.push({ name: 'All Months', rows, ...base });
+        for (const month of months) sheets.push({ name: month.label, rows: month.rows, ...base });
+      } else {
+        sheets.push({ name: months[0]?.label ?? 'Register', rows, ...base });
+      }
+    } else if (report === 'attendanceSummary') {
+      sheets.push({
+        name: 'Attendance Summary',
+        columns,
+        rows,
+        // Month, Employee Code, Employee Name.
+        frozenColumns: 3,
+        bandByKey: 'employeeCode',
+      });
+    } else {
+      sheets.push({ name: titleForReport(report), columns, rows, frozenColumns: 1 });
+    }
+
+    return {
+      buffer: await buildWorkbook(sheets, info),
+      filename: reportFilename(report, options, 'xlsx'),
+    };
+  }
+}
+
+/** Headers for the reports that predate labelled columns: `workEmail` -> `Work Email`. */
+function derivedColumns(rows: ReportRow[]): ColumnSpec[] {
+  if (!rows.length) return [];
+  return Object.keys(rows[0]).map((key) => ({
+    key,
+    label: key
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/^./, (character) => character.toUpperCase()),
+    width: 18,
+    numeric: typeof rows[0][key] === 'number',
+  }));
+}
+
+const REPORT_TITLES: Record<ReportKind, string> = {
+  employees: 'Employees',
+  attendance: 'Attendance Register',
+  attendanceSummary: 'Attendance Summary',
+  payroll: 'Payroll',
+  expenses: 'Expenses',
+  tickets: 'Tickets',
+};
+
+function titleForReport(report: ReportKind): string {
+  return REPORT_TITLES[report] ?? 'Report';
+}
+
+/**
+ * Export filename, carrying the period so a downloaded file still says what it
+ * covers. The period is the only metadata in a CSV: a preamble above the header
+ * would break every parser that opens it.
+ */
+function reportFilename(
+  report: ReportKind,
+  options: AnalyticsFilters,
+  extension: 'csv' | 'xlsx',
+): string {
+  const slug = report === 'attendance' ? 'attendance-register' : kebab(report);
+  const period = options.from || options.to
+    ? `_${options.from ?? 'start'}_to_${options.to ?? 'today'}`
+    : '';
+  return `${slug}${period}.${extension}`;
+}
+
+function kebab(value: string): string {
+  return value.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
 }

@@ -147,19 +147,56 @@ export function earlyDepartureGraceMins(
   );
 }
 
-/** Shared by the interactive punch path and the read-only monthly ledger. */
+/**
+ * The instant after which an arrival counts as late: the shift start plus
+ * whichever grace period the rule or the shift configures.
+ *
+ * Anchored to the punch-in's own day so the boundary is built in the same
+ * wall-clock convention the rest of this module uses. `null` when the shift has
+ * no start time to measure from.
+ */
+function lateArrivalBoundary(
+  punchIn: Date,
+  shift?: Partial<Pick<ShiftTiming, 'startTime' | 'gracePeriodMins'>> | null,
+  rule?: Pick<TimingRule, 'lateMarkAfterMins'> | null,
+): Date | null {
+  // No schedule, nothing to be late for — matching the other helpers here,
+  // which all treat a shift without times as unmeasurable rather than crashing.
+  if (!shift?.startTime) return null;
+  const { hours, minutes } = timeParts(shift.startTime);
+  const boundary = new Date(punchIn);
+  boundary.setHours(hours, minutes + lateArrivalGraceMins(shift, rule), 0, 0);
+  return boundary;
+}
+
+/**
+ * Minutes past the late boundary, and `0` for an on-time arrival or an
+ * unmeasurable shift — the arrival-side counterpart to
+ * {@link earlyDeparture}'s `earlyByMinutes`, rounded up the same way so a
+ * part-minute overrun reads as one minute rather than none.
+ */
+export function lateArrivalMinutes(
+  punchIn: Date,
+  shift?: Partial<Pick<ShiftTiming, 'startTime' | 'gracePeriodMins'>> | null,
+  rule?: Pick<TimingRule, 'lateMarkAfterMins'> | null,
+): number {
+  const boundary = lateArrivalBoundary(punchIn, shift, rule);
+  if (!boundary || punchIn <= boundary) return 0;
+  return Math.ceil((punchIn.getTime() - boundary.getTime()) / 60_000);
+}
+
+/**
+ * Shared by the interactive punch path and the read-only monthly ledger.
+ *
+ * Expressed through {@link lateArrivalMinutes} so the verdict and the reported
+ * shortfall can never disagree about the same punch.
+ */
 export function isLateArrival(
   punchIn: Date,
   shift?: Partial<Pick<ShiftTiming, 'startTime' | 'gracePeriodMins'>> | null,
   rule?: Pick<TimingRule, 'lateMarkAfterMins'> | null,
 ): boolean {
-  // No schedule, nothing to be late for — matching the other helpers here,
-  // which all treat a shift without times as unmeasurable rather than crashing.
-  if (!shift?.startTime) return false;
-  const { hours, minutes } = timeParts(shift.startTime);
-  const boundary = new Date(punchIn);
-  boundary.setHours(hours, minutes + lateArrivalGraceMins(shift, rule), 0, 0);
-  return punchIn > boundary;
+  return lateArrivalMinutes(punchIn, shift, rule) > 0;
 }
 
 const NO_EARLY_DEPARTURE: EarlyDeparture = { isEarlyDeparture: false, earlyByMinutes: 0 };

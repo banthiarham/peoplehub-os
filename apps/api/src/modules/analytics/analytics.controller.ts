@@ -3,7 +3,13 @@ import { FastifyReply } from 'fastify';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuthUser } from '../../common/types/auth-user';
-import { AnalyticsService } from './analytics.service';
+import {
+  AnalyticsService,
+  PREVIEW_ROW_LIMIT,
+  type ReportFormat,
+  type ReportKind,
+} from './analytics.service';
+import { XLSX_CONTENT_TYPE } from '../../common/utils/xlsx';
 import { redactDashboard } from './dashboard-visibility';
 import { Roles } from '../../common/decorators/roles.decorator';
 
@@ -94,9 +100,15 @@ export class AnalyticsController {
 
   @Get('reports/builder')
   @Roles(...REPORTS_ROLES)
+  @ApiOperation({
+    summary: 'Report rows with labelled columns, for the on-screen preview',
+    description:
+      'The attendance reports are built from the attendance ledger, so absent, on-leave, ' +
+      'weekly-off and holiday days are present rather than only the days with a record.',
+  })
   reportBuilder(
     @CurrentUser() user: AuthUser,
-    @Query('report') report: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets' = 'employees',
+    @Query('report') report: ReportKind = 'employees',
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('status') status?: string,
@@ -105,26 +117,41 @@ export class AnalyticsController {
     @Query('legalEntityId') legalEntityId?: string,
     @Query('managerId') managerId?: string,
     @Query('employmentType') employmentType?: string,
+    @Query('includeNonWorkingDays') includeNonWorkingDays?: string,
   ) {
-    return this.analytics.reportBuilder(user.tenantId, report, {
-      from,
-      to,
-      status,
-      departmentId,
-      locationId,
-      legalEntityId,
-      managerId,
-      employmentType,
-    });
+    return this.analytics.reportTable(
+      user.tenantId,
+      report,
+      {
+        from,
+        to,
+        status,
+        departmentId,
+        locationId,
+        legalEntityId,
+        managerId,
+        employmentType,
+        includeNonWorkingDays: parseBooleanFlag(includeNonWorkingDays),
+      },
+      // The preview renders a handful of rows; `rowCount` reports the true total.
+      PREVIEW_ROW_LIMIT,
+    );
   }
 
   @Get('reports/builder/export')
   @Roles(...REPORTS_ROLES)
+  @ApiOperation({
+    summary: 'Download a report as a styled workbook (default) or as CSV',
+    description:
+      'Pass `format=csv` for plain CSV. XLSX adds a frozen header, filters, per-employee ' +
+      'banding, one sheet per month for a multi-month register, and a Report Info sheet.',
+  })
   async reportBuilderExport(
     @CurrentUser() user: AuthUser,
     @Query()
     q: {
-      report?: 'employees' | 'attendance' | 'payroll' | 'expenses' | 'tickets';
+      report?: ReportKind;
+      format?: ReportFormat;
       from?: string;
       to?: string;
       status?: string;
@@ -133,10 +160,12 @@ export class AnalyticsController {
       legalEntityId?: string;
       managerId?: string;
       employmentType?: string;
+      includeNonWorkingDays?: string;
     },
     @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const { csv, filename } = await this.analytics.reportBuilderCsv(user.tenantId, q.report ?? 'employees', {
+    const report = q.report ?? 'employees';
+    const options = {
       from: q.from,
       to: q.to,
       status: q.status,
@@ -145,9 +174,33 @@ export class AnalyticsController {
       legalEntityId: q.legalEntityId,
       managerId: q.managerId,
       employmentType: q.employmentType,
-    });
-    res.header('Content-Type', 'text/csv; charset=utf-8');
+      includeNonWorkingDays: parseBooleanFlag(q.includeNonWorkingDays),
+    };
+
+    if (q.format === 'csv') {
+      const { csv, filename } = await this.analytics.reportBuilderCsv(user.tenantId, report, options);
+      res.header('Content-Type', 'text/csv; charset=utf-8');
+      res.header('Content-Disposition', `attachment; filename="${filename}"`);
+      return csv;
+    }
+
+    const { buffer, filename } = await this.analytics.reportBuilderWorkbook(
+      user.tenantId,
+      report,
+      options,
+    );
+    res.header('Content-Type', XLSX_CONTENT_TYPE);
     res.header('Content-Disposition', `attachment; filename="${filename}"`);
-    return csv;
+    res.header('Content-Length', String(buffer.length));
+    // Returned rather than sent through the reply, matching the CSV routes:
+    // with `passthrough` the adapter sends this, and Fastify writes a Buffer
+    // payload verbatim under the content type set above.
+    return buffer;
   }
+}
+
+/** Query flags arrive as strings; anything but an explicit false reads as unset. */
+function parseBooleanFlag(value: string | undefined): boolean | undefined {
+  if (value === undefined || value === '') return undefined;
+  return !['false', '0', 'no'].includes(value.toLowerCase());
 }
