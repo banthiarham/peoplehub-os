@@ -3,6 +3,7 @@ import {
   earlyDeparture,
   isLateArrival,
   isOvernightShift,
+  lateArrivalMinutes,
   overtimeAfterShiftEnd,
   shiftDurationMinutes,
   shiftEndFor,
@@ -229,5 +230,30 @@ describe('isLateArrival', () => {
 
   it('is never late without a shift', () => {
     expect(isLateArrival(localAt(1, 23, 0), null)).toBe(false);
+  });
+});
+
+describe('lateArrivalMinutes', () => {
+  it('counts from the grace boundary, not from the shift start', () => {
+    // 09:00 + 15m grace = 09:15, so 10:00 is 45 minutes late rather than 60.
+    expect(lateArrivalMinutes(localAt(1, 10, 0), dayShift)).toBe(45);
+    expect(lateArrivalMinutes(localAt(1, 9, 16), dayShift)).toBe(1);
+  });
+
+  it('is zero for an on-time arrival, at the boundary, and without a shift', () => {
+    expect(lateArrivalMinutes(localAt(1, 8, 55), dayShift)).toBe(0);
+    expect(lateArrivalMinutes(localAt(1, 9, 15), dayShift)).toBe(0);
+    expect(lateArrivalMinutes(localAt(1, 23, 0), null)).toBe(0);
+  });
+
+  it('prefers the attendance rule grace over the shift grace', () => {
+    expect(lateArrivalMinutes(localAt(1, 9, 5), dayShift, { lateMarkAfterMins: 0 })).toBe(5);
+  });
+
+  it('agrees with isLateArrival on every arrival', () => {
+    for (const minute of [0, 14, 15, 16, 45, 120]) {
+      const punchIn = localAt(1, 9, minute);
+      expect(lateArrivalMinutes(punchIn, dayShift) > 0).toBe(isLateArrival(punchIn, dayShift));
+    }
   });
 });

@@ -235,6 +235,71 @@ export class ShiftResolutionService {
   }
 
   /**
+   * {@link resolverForRange} for many employees at once: one assignment query
+   * for the whole set and one default-shift lookup, instead of two per
+   * employee.
+   *
+   * A report that walks every employee across a date range would otherwise fire
+   * `2 x employees` queries before reading a single attendance record — 200 for
+   * a two-month, hundred-person export. Precedence is unchanged: assignments
+   * are grouped per employee and each group is sorted by
+   * {@link byAssignmentPrecedence}, exactly as the single-employee resolver
+   * does, so both answer identically for any (employee, date) pair.
+   *
+   * An employee with no covering assignment resolves to the tenant default,
+   * which is also what an employee absent from `employeeIds` would get — so the
+   * returned function is total rather than throwing on an unknown id.
+   */
+  async resolverForEmployeesInRange(
+    tenantId: string,
+    employeeIds: string[],
+    start: Date,
+    end: Date,
+  ) {
+    if (!employeeIds.length) {
+      const fallback = await this.defaultShift(tenantId);
+      return () => ({ shift: fallback, assignedLocationId: null, assignment: null });
+    }
+    const [assignments, fallback] = await Promise.all([
+      this.prisma.shiftAssignment.findMany({
+        where: {
+          employeeId: { in: employeeIds },
+          employee: { tenantId },
+          effectiveFrom: { lte: end },
+          OR: [{ effectiveTo: null }, { effectiveTo: { gte: start } }],
+        },
+        include: { shift: true },
+        orderBy: ASSIGNMENT_PRECEDENCE,
+      }),
+      this.defaultShift(tenantId),
+    ]);
+    const byEmployee = new Map<string, typeof assignments>();
+    for (const assignment of assignments) {
+      const bucket = byEmployee.get(assignment.employeeId);
+      if (bucket) bucket.push(assignment);
+      else byEmployee.set(assignment.employeeId, [assignment]);
+    }
+    for (const bucket of byEmployee.values()) bucket.sort(byAssignmentPrecedence);
+
+    return (employeeId: string, at: Date): ResolvedShift => {
+      const assignment = (byEmployee.get(employeeId) ?? []).find((candidate) =>
+        assignmentCoversDate(candidate, at),
+      );
+      if (!assignment) return { shift: fallback, assignedLocationId: null, assignment: null };
+      return {
+        shift: assignment.shift,
+        assignedLocationId: assignment.locationId ?? null,
+        assignment: {
+          id: assignment.id,
+          source: assignment.source,
+          effectiveFrom: assignment.effectiveFrom,
+          effectiveTo: assignment.effectiveTo,
+        },
+      };
+    };
+  }
+
+  /**
    * Employees whose effective shift on `at` is each shift, resolved through the
    * same precedence as the punch path — including the unassigned employees the
    * tenant default shift actually covers. Lifetime assignment rows are not a

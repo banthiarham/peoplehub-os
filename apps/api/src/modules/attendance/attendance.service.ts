@@ -37,7 +37,12 @@ import {
   syncSystemPunchEvents,
   type PunchEventLike,
 } from './punch-events';
-import { earlyDeparture, isLateArrival, overtimeAfterShiftEnd } from './shift-timing';
+import {
+  earlyDeparture,
+  isLateArrival,
+  lateArrivalMinutes,
+  overtimeAfterShiftEnd,
+} from './shift-timing';
 import {
   AssignShiftDto,
   CheckInDto,
@@ -179,6 +184,50 @@ function monthParts(month: string): { year: number; monthNumber: number; start: 
   const endInclusive = new Date(endExclusive.getTime() - 24 * 60 * 60 * 1000);
   return { year, monthNumber, start, endExclusive, endInclusive };
 }
+
+/**
+ * One employee-day as {@link AttendanceService.rangeLedger} reports it.
+ *
+ * Every field is either copied verbatim from a stored `AttendanceRecord` or
+ * derived read-only; nothing here is persisted. `source` says which, so a
+ * reader can tell a recorded day from a derived one, and `isFinalized` says
+ * whether payroll would currently count it.
+ */
+export type RangeLedgerDay = {
+  date: Date;
+  status: AttendanceStatus;
+  /** `RECORD` when an `AttendanceRecord` exists for the day, else `DERIVED`. */
+  source: 'RECORD' | 'DERIVED';
+  punchIn: Date | null;
+  punchOut: Date | null;
+  /** Gross span, as stored. */
+  workingMinutes: number | null;
+  /** Paired-segment total, as stored. */
+  netMinutes: number | null;
+  overtimeMinutes: number | null;
+  isLate: boolean;
+  lateByMinutes: number;
+  isEarlyDeparture: boolean;
+  earlyDepartureMinutes: number;
+  shiftId: string | null;
+  shiftName: string | null;
+  shiftStartTime: string | null;
+  shiftEndTime: string | null;
+  locationId: string | null;
+  /** Name of the approved leave type covering the day, when one does. */
+  leaveType: string | null;
+  punchSource: string | null;
+  isFinalized: boolean;
+  remarks: string | null;
+};
+
+/** The employee identity {@link AttendanceService.rangeLedger} needs per row. */
+export type RangeLedgerEmployee = {
+  id: string;
+  locationId?: string | null;
+  joiningDate?: Date | null;
+  exitDate?: Date | null;
+};
 
 @Injectable()
 export class AttendanceService {
@@ -1721,6 +1770,210 @@ export class AttendanceService {
       }
     }
     return leaveDaySet;
+  }
+
+  /**
+   * Approved leave expanded to `${employeeId}:YYYY-MM-DD` -> leave type name.
+   *
+   * The same expansion as {@link approvedLeaveDaySet}, carrying the type name
+   * the register reports. Overlapping approved requests on one day keep the
+   * earliest by `fromDate`, so the value is stable rather than query-order
+   * dependent.
+   */
+  private async approvedLeaveTypeByDay(
+    tenantId: string,
+    employeeIds: string[],
+    start: Date,
+    endInclusive: Date,
+  ) {
+    if (!employeeIds.length) return new Map<string, string>();
+    const approvedLeaves = await this.prisma.leaveRequest.findMany({
+      where: {
+        tenantId,
+        employeeId: { in: employeeIds },
+        status: 'APPROVED',
+        fromDate: { lte: endInclusive },
+        toDate: { gte: start },
+      },
+      select: {
+        employeeId: true,
+        fromDate: true,
+        toDate: true,
+        leaveType: { select: { name: true } },
+      },
+      orderBy: [{ fromDate: 'asc' }, { createdAt: 'asc' }],
+    });
+    const byDay = new Map<string, string>();
+    for (const leave of approvedLeaves) {
+      const leaveStart = leave.fromDate < start ? start : leave.fromDate;
+      const leaveEnd = leave.toDate > endInclusive ? endInclusive : leave.toDate;
+      for (let d = new Date(leaveStart); d <= leaveEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+        const key = `${leave.employeeId}:${d.toISOString().slice(0, 10)}`;
+        if (!byDay.has(key)) byDay.set(key, leave.leaveType?.name ?? 'Leave');
+      }
+    }
+    return byDay;
+  }
+
+  /**
+   * {@link attendanceRulesForRange} across several locations at once, so a
+   * report spanning every location pays for one rule query rather than one per
+   * location. Precedence and the per-date matching are unchanged.
+   */
+  private async attendanceRulesForRangeByLocation(
+    tenantId: string,
+    locationIds: Array<string | null>,
+    start: Date,
+    end: Date,
+  ) {
+    const concrete = [...new Set(locationIds.filter((id): id is string => !!id))];
+    const rules = await this.prisma.attendanceRule.findMany({
+      where: {
+        tenantId,
+        isActive: true,
+        effectiveFrom: { lte: end },
+        AND: [{ OR: [{ effectiveTo: null }, { effectiveTo: { gte: start } }] }],
+        OR: [
+          ...(concrete.length ? [{ locationId: { in: concrete } }] : []),
+          { locationId: null },
+          { isDefault: true },
+        ],
+      },
+      orderBy: [{ isDefault: 'asc' }, { updatedAt: 'desc' }],
+    });
+    return (shiftId: string | null | undefined, locationId: string | null, at: Date) =>
+      rules.find(
+        (rule) =>
+          rule.effectiveFrom <= at &&
+          (rule.effectiveTo === null || rule.effectiveTo >= at) &&
+          this.ruleMatches(rule, shiftId, locationId),
+      ) ?? null;
+  }
+
+  /**
+   * Read-only day ledger for many employees across an arbitrary date range.
+   *
+   * The batched sibling of {@link monthlyLedgerFor}, and the engine behind the
+   * attendance register and summary exports. Classification is
+   * {@link classifyExpectedDay} — a stored record wins, then approved leave,
+   * holiday, weekly off, and absent — so this, the daily view in
+   * {@link forDate} and month finalization cannot disagree about what an
+   * unrecorded day was. That matters most for absences: nothing writes an
+   * `ABSENT` record until a month is finalized, so a report that reads the
+   * table alone shows only the days people turned up.
+   *
+   * Every lookup is issued once for the whole set rather than per employee or
+   * per month: the per-employee monthly path costs roughly five queries each,
+   * which a two-month hundred-person export would turn into two hundred.
+   *
+   * Days outside an employee's joining/relieving window, and days after today,
+   * are omitted rather than counted as absent, so no absence is invented for
+   * someone who had not joined or for a date that has not happened.
+   *
+   * Nothing is persisted.
+   */
+  async rangeLedger(
+    tenantId: string,
+    employees: RangeLedgerEmployee[],
+    start: Date,
+    endInclusive: Date,
+  ): Promise<Map<string, RangeLedgerDay[]>> {
+    const byEmployee = new Map<string, RangeLedgerDay[]>();
+    for (const employee of employees) byEmployee.set(employee.id, []);
+    if (!employees.length || start > endInclusive) return byEmployee;
+
+    const today = dateOnly(new Date());
+    // Nothing after today is derivable, so the window never reaches past it.
+    const windowEnd = endInclusive > today ? today : endInclusive;
+    if (start > windowEnd) return byEmployee;
+
+    const employeeIds = employees.map((employee) => employee.id);
+    const [records, holidaySet, leaveTypeByDay, resolveShift, ruleAt] = await Promise.all([
+      this.prisma.attendanceRecord.findMany({
+        where: { tenantId, employeeId: { in: employeeIds }, date: { gte: start, lte: windowEnd } },
+        include: { shift: { select: { name: true, startTime: true, endTime: true } } },
+      }),
+      this.holidayDateSet(tenantId, start, windowEnd),
+      this.approvedLeaveTypeByDay(tenantId, employeeIds, start, windowEnd),
+      this.shifts.resolverForEmployeesInRange(tenantId, employeeIds, start, windowEnd),
+      this.attendanceRulesForRangeByLocation(
+        tenantId,
+        employees.map((employee) => employee.locationId ?? null),
+        start,
+        windowEnd,
+      ),
+    ]);
+
+    const recordByKey = new Map(
+      records.map((record) => [
+        `${record.employeeId}:${record.date.toISOString().slice(0, 10)}`,
+        record,
+      ]),
+    );
+
+    for (const employee of employees) {
+      const joining = employee.joiningDate ? utcDateOnly(employee.joiningDate) : null;
+      const exit = employee.exitDate ? utcDateOnly(employee.exitDate) : null;
+      const employeeStart = joining && joining > start ? joining : start;
+      const employeeEnd = exit && exit < windowEnd ? exit : windowEnd;
+      if (employeeStart > employeeEnd) continue;
+      const days = byEmployee.get(employee.id);
+      if (!days) continue;
+
+      for (let d = new Date(employeeStart); d <= employeeEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+        const date = new Date(d);
+        const key = date.toISOString().slice(0, 10);
+        const record = recordByKey.get(`${employee.id}:${key}`);
+        const { shift, assignedLocationId } = resolveShift(employee.id, date);
+        const locationId = assignedLocationId ?? employee.locationId ?? null;
+        const dayOfWeek = date.getUTCDay();
+        const isWeeklyOff =
+          shift?.weeklyOffDays.includes(dayOfWeek) ?? (dayOfWeek === 0 || dayOfWeek === 6);
+        const leaveType = leaveTypeByDay.get(`${employee.id}:${key}`) ?? null;
+        const status =
+          record?.status ??
+          this.classifyExpectedDay({
+            onLeave: leaveType !== null,
+            isHoliday: holidaySet.has(key),
+            isWeeklyOff,
+          });
+        // The rule only matters once there is a punch to judge, matching
+        // `monthlyLedgerFor`: a day with no punches has no late or early mark.
+        const rule =
+          record?.punchIn || record?.punchOut ? ruleAt(shift?.id, locationId, date) : null;
+        const early = earlyDeparture({
+          punchOut: record?.punchOut,
+          punchIn: record?.punchIn,
+          shift,
+          rule,
+        });
+        const lateBy = record?.punchIn ? lateArrivalMinutes(record.punchIn, shift, rule) : 0;
+        days.push({
+          date,
+          status,
+          source: record ? 'RECORD' : 'DERIVED',
+          punchIn: record?.punchIn ?? null,
+          punchOut: record?.punchOut ?? null,
+          workingMinutes: record?.workingMinutes ?? null,
+          netMinutes: record?.netMinutes ?? null,
+          overtimeMinutes: record?.overtimeMinutes ?? null,
+          isLate: status === 'LATE' || lateBy > 0,
+          lateByMinutes: lateBy,
+          isEarlyDeparture: status === 'EARLY_LEAVING' || early.isEarlyDeparture,
+          earlyDepartureMinutes: early.earlyByMinutes,
+          shiftId: record?.shiftId ?? shift?.id ?? null,
+          shiftName: record?.shift?.name ?? shift?.name ?? null,
+          shiftStartTime: record?.shift?.startTime ?? shift?.startTime ?? null,
+          shiftEndTime: record?.shift?.endTime ?? shift?.endTime ?? null,
+          locationId,
+          leaveType,
+          punchSource: record?.punchSource ?? null,
+          isFinalized: record?.isFinalized ?? false,
+          remarks: record?.remarks ?? null,
+        });
+      }
+    }
+    return byEmployee;
   }
 
   private classifyExpectedDay(input: {
