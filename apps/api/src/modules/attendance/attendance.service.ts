@@ -11,6 +11,7 @@ import {
   AttendanceStatus,
   CompOffStatus,
   CompOffUsagePeriod,
+  PayrollRunStatus,
   Prisma,
   PunchDirection,
   ShiftSwapStatus,
@@ -85,6 +86,19 @@ const LEAVE_RECONCILABLE_STATUSES: AttendanceStatus[] = [
 
 /** How long a comp-off stays available before it lapses, in days. */
 const COMP_OFF_VALIDITY_DAYS = 90;
+
+/**
+ * Payroll run statuses past the point of no return. `lockRun` records loan installments and
+ * `reprocessRun` refuses anything beyond `APPROVED`, so from `LOCKED` onwards a run can never
+ * be recomputed: whatever attendance and comp-off data it was processed from is what it paid.
+ * `REVIEW` and `APPROVED` are deliberately absent - those can still be reprocessed, which is
+ * how a late attendance correction is meant to reach payroll.
+ */
+const PAYROLL_PERIOD_LOCK_STATUSES: PayrollRunStatus[] = [
+  PayrollRunStatus.LOCKED,
+  PayrollRunStatus.PUBLISHED,
+  PayrollRunStatus.CLOSED,
+];
 
 /**
  * Roles whose comp-off ledger view is the whole tenant rather than their own grants.
@@ -2951,6 +2965,15 @@ export class AttendanceService {
 
   async finalizeMonth(tenantId: string, finalizedById: string | undefined, dto: FinalizeAttendanceDto) {
     const { start, endExclusive, endInclusive, year, monthNumber } = monthParts(dto.month);
+    // Ahead of every read and write below: finalizing rewrites attendance statuses and
+    // replaces this month's attendance-generated payroll inputs, which a frozen run has
+    // already been paid from.
+    await this.assertPayrollPeriodOpen(
+      tenantId,
+      { month: monthNumber, year },
+      { locationId: dto.locationId ?? null },
+      'attendance for this month can no longer be finalized',
+    );
     const preview = await this.finalizationPreview(tenantId, dto);
     const finalization = await this.prisma.attendanceFinalization.create({
       data: {
@@ -3114,6 +3137,87 @@ export class AttendanceService {
       }
     }
     return this.finalizationPreview(tenantId, dto);
+  }
+
+  /**
+   * Refuses an operation that would change what an already-frozen payroll run was computed
+   * from. A run at `LOCKED` or later cannot be reprocessed, so letting attendance or comp-off
+   * data move underneath it leaves the payslips it produced unexplainable by the data behind
+   * them - silently, because nothing recalculates.
+   *
+   * Scope matching mirrors `PayrollService.hasMonthlyAttendanceFinalization` in reverse: a run
+   * covers an employee (or a finalized location) when the run is tenant-wide (`locationId:
+   * null`) or scoped to that same location, and likewise for `legalEntityId`. A tenant-wide
+   * operation passes no scope at all and therefore conflicts with every frozen run for the
+   * month, which is correct - it touches every employee the run paid.
+   */
+  private async assertPayrollPeriodOpen(
+    tenantId: string,
+    period: { month: number; year: number },
+    scope: { locationId?: string | null; legalEntityId?: string | null },
+    consequence: string,
+  ): Promise<void> {
+    const overlapping: Prisma.PayrollRunWhereInput[] = [];
+    if (scope.locationId) {
+      overlapping.push({ OR: [{ locationId: null }, { locationId: scope.locationId }] });
+    }
+    if (scope.legalEntityId) {
+      overlapping.push({ OR: [{ legalEntityId: null }, { legalEntityId: scope.legalEntityId }] });
+    }
+
+    const frozen = await this.prisma.payrollRun.findFirst({
+      where: {
+        tenantId,
+        month: period.month,
+        year: period.year,
+        status: { in: PAYROLL_PERIOD_LOCK_STATUSES },
+        ...(overlapping.length > 0 && { AND: overlapping }),
+      },
+      select: { status: true },
+    });
+    if (frozen) {
+      throw new BadRequestException(
+        `Payroll for ${period.year}-${String(period.month).padStart(2, '0')} is already ` +
+          `${frozen.status.toLowerCase()}; ${consequence}`,
+      );
+    }
+  }
+
+  /**
+   * Refuses a comp-off decision when an unused-comp-off payout for this exact grant was
+   * already paid by a frozen run.
+   *
+   * Matched against the payout input `applyUnusedCompOffPayouts` writes - `type:
+   * COMP_OFF_PAYOUT`, `source: COMP_OFF`, the grant's id inside `metadata.grantIds` - rather
+   * than by recomputing the grant's closure month here. The input is the record of what was
+   * actually paid: a tenant whose policy never pays out has none, a grant credited after its
+   * closure month was processed has none, and a payout still attached to a `REVIEW` run is
+   * left alone because reprocessing that run reconciles it. Only a payout inside a run that
+   * can no longer be recomputed is a decision this service must refuse.
+   */
+  private async assertCompOffPayoutNotFrozen(
+    tenantId: string,
+    grant: { id: string; employeeId: string },
+    consequence: string,
+  ): Promise<void> {
+    const paid = await this.prisma.payrollVariableInput.findFirst({
+      where: {
+        tenantId,
+        employeeId: grant.employeeId,
+        type: 'COMP_OFF_PAYOUT',
+        source: 'COMP_OFF',
+        metadata: { path: ['grantIds'], array_contains: grant.id },
+        payrollRun: { status: { in: PAYROLL_PERIOD_LOCK_STATUSES } },
+      },
+      select: { payrollRun: { select: { month: true, year: true, status: true } } },
+    });
+    const run = paid?.payrollRun;
+    if (run) {
+      throw new BadRequestException(
+        `This comp-off was already paid out in ${run.year}-${String(run.month).padStart(2, '0')} ` +
+          `payroll, which is ${run.status.toLowerCase()}; ${consequence}`,
+      );
+    }
   }
 
   async listCompOffs(user: AuthUser) {
@@ -3280,7 +3384,7 @@ export class AttendanceService {
   async decideCompOff(user: AuthUser, id: string, dto: DecideCompOffDto) {
     const grant = await this.prisma.compOffGrant.findFirst({
       where: { id, tenantId: user.tenantId },
-      include: { employee: { select: { managerId: true, locationId: true } } },
+      include: { employee: { select: { managerId: true, locationId: true, legalEntityId: true } } },
     });
     if (!grant) throw new NotFoundException('Comp-off not found');
     if (grant.status !== CompOffStatus.AVAILABLE) {
@@ -3292,6 +3396,31 @@ export class AttendanceService {
       dto.status === CompOffStatus.USED
         ? await this.validateCompOffUsage(user.tenantId, grant, dto.usedOnDate)
         : undefined;
+
+    // Checked after the existing validation, so a malformed or ineligible date still reports
+    // its own error first, and before the transition, so a refusal writes nothing.
+    const payrollScope = {
+      locationId: grant.employee.locationId,
+      legalEntityId: grant.employee.legalEntityId,
+    };
+    if (usedOnDate) {
+      // The LOP offset is read only by the run whose month contains `usedOnDate` (see
+      // `PayrollService.lopContributionsByDate`), so that month - not the earned month - is
+      // the period this decision would change.
+      await this.assertPayrollPeriodOpen(
+        user.tenantId,
+        { month: usedOnDate.getUTCMonth() + 1, year: usedOnDate.getUTCFullYear() },
+        payrollScope,
+        'a comp-off can no longer be used against a date in it',
+      );
+    }
+    // Applies to every decision, not only USED: moving a grant out of AVAILABLE is what
+    // removes it from unused-payout eligibility, whichever terminal status it moves to.
+    await this.assertCompOffPayoutNotFrozen(
+      user.tenantId,
+      grant,
+      `it can no longer be marked ${dto.status.toLowerCase()}`,
+    );
 
     const { count } = await this.prisma.compOffGrant.updateMany({
       where: { id, status: CompOffStatus.AVAILABLE },
