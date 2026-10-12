@@ -42,6 +42,8 @@ describe('WorkflowsService', () => {
       },
       approvalRequestHistory: { create: jest.fn() },
       approvalRequest: { update: jest.fn().mockResolvedValue({ ...request, status: 'APPROVED' }) },
+      // The payroll-period guard reads this. No frozen run here, so the approval applies.
+      payrollRun: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     const prisma = {
       approvalRequest: { findFirst: jest.fn().mockResolvedValue(request) },
@@ -273,5 +275,132 @@ describe('WorkflowsService: decide authorization', () => {
     await expect(service.decide(hrAdmin as any, 'approval-1', 'REJECTED')).resolves.toMatchObject({
       status: 'REJECTED',
     });
+  });
+});
+
+describe('WorkflowsService: regularization against frozen payroll', () => {
+  const request = {
+    id: 'approval-1',
+    tenantId: 'tenant-1',
+    requesterId: 'emp-1',
+    module: 'attendance',
+    objectType: 'AttendanceRegularization',
+    objectId: 'emp-1:2026-07-05',
+    currentStep: 1,
+    status: 'PENDING',
+    comments: [],
+    requestData: {
+      punchIn: '2026-07-05T09:00:00.000Z',
+      punchOut: '2026-07-05T18:00:00.000Z',
+      reason: 'Client visit',
+    },
+  };
+
+  /**
+   * Run fixtures matched against the real `where` the guard issues on the transaction client:
+   * tenant, period, frozen status, and membership through the run's own entries. Modelled, not
+   * stubbed, so a guard that stopped scoping by employee would fail these tests.
+   */
+  function harness(runs: Array<{ tenantId?: string; month: number; year: number; status: string; employeeIds: string[] }>) {
+    const tx = {
+      attendanceRecord: { upsert: jest.fn() },
+      employee: { findUnique: jest.fn().mockResolvedValue({ locationId: 'loc-1' }) },
+      attendancePunchEvent: {
+        deleteMany: jest.fn(),
+        createMany: jest.fn(),
+        count: jest.fn().mockResolvedValue(0),
+      },
+      approvalRequestHistory: { create: jest.fn() },
+      approvalRequest: { update: jest.fn().mockResolvedValue({ ...request, status: 'APPROVED' }) },
+      payrollRun: {
+        findFirst: jest.fn(({ where }: { where: Record<string, any> }) => {
+          const asked: string[] = where.entries?.some?.employeeId?.in ?? [];
+          const frozen = runs.find(
+            (run) =>
+              (run.tenantId ?? 'tenant-1') === where.tenantId &&
+              run.month === where.month &&
+              run.year === where.year &&
+              where.status.in.includes(run.status) &&
+              run.employeeIds.some((employeeId) => asked.includes(employeeId)),
+          );
+          return Promise.resolve(frozen ? { status: frozen.status } : null);
+        }),
+      },
+    };
+    const prisma = {
+      approvalRequest: { findFirst: jest.fn().mockResolvedValue(request) },
+      $transaction: jest.fn((fn: any) => fn(tx)),
+    };
+    return { tx, prisma, service: new WorkflowsService(prisma as any) };
+  }
+
+  it.each(['LOCKED', 'PUBLISHED', 'CLOSED'])(
+    'refuses to apply an approved regularization into a %s payroll month',
+    async (status) => {
+      const { tx, service } = harness([
+        { month: 7, year: 2026, status, employeeIds: ['emp-1'] },
+      ]);
+
+      await expect(service.decide(approver, 'approval-1', 'APPROVED', 'Approved')).rejects.toThrow(
+        `Payroll for 2026-07 is already ${status.toLowerCase()}; this regularization can no longer be applied`,
+      );
+
+      // Nothing written: no record, no punch log, and no approval decision - so the
+      // transaction rolls back and the request is still pending for someone to act on.
+      expect(tx.attendanceRecord.upsert).not.toHaveBeenCalled();
+      expect(tx.attendancePunchEvent.createMany).not.toHaveBeenCalled();
+      expect(tx.attendancePunchEvent.deleteMany).not.toHaveBeenCalled();
+      expect(tx.approvalRequest.update).not.toHaveBeenCalled();
+      expect(tx.approvalRequestHistory.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('checks the regularized date and employee from the request itself', async () => {
+    const { tx, service } = harness([]);
+
+    await service.decide(approver, 'approval-1', 'APPROVED', 'Approved');
+
+    expect(tx.payrollRun.findFirst).toHaveBeenCalledWith({
+      where: {
+        tenantId: 'tenant-1',
+        month: 7,
+        year: 2026,
+        status: { in: ['LOCKED', 'PUBLISHED', 'CLOSED'] },
+        entries: { some: { employeeId: { in: ['emp-1'] } } },
+      },
+      select: { status: true },
+    });
+    expect(tx.attendanceRecord.upsert).toHaveBeenCalled();
+  });
+
+  it.each(['REVIEW', 'APPROVED', 'DRAFT'])('still applies while the run is only %s', async (status) => {
+    const { tx, service } = harness([
+      { month: 7, year: 2026, status, employeeIds: ['emp-1'] },
+    ]);
+
+    await service.decide(approver, 'approval-1', 'APPROVED', 'Approved');
+
+    expect(tx.attendanceRecord.upsert).toHaveBeenCalled();
+    expect(tx.approvalRequest.update).toHaveBeenCalled();
+  });
+
+  it('applies when a frozen run for the month never contained this employee', async () => {
+    const { tx, service } = harness([
+      { month: 7, year: 2026, status: 'LOCKED', employeeIds: ['emp-other'] },
+    ]);
+
+    await service.decide(approver, 'approval-1', 'APPROVED', 'Approved');
+
+    expect(tx.attendanceRecord.upsert).toHaveBeenCalled();
+  });
+
+  it("applies when the frozen run belongs to another tenant", async () => {
+    const { tx, service } = harness([
+      { tenantId: 'tenant-2', month: 7, year: 2026, status: 'LOCKED', employeeIds: ['emp-1'] },
+    ]);
+
+    await service.decide(approver, 'approval-1', 'APPROVED', 'Approved');
+
+    expect(tx.attendanceRecord.upsert).toHaveBeenCalled();
   });
 });

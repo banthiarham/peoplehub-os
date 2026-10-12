@@ -145,6 +145,14 @@ function withPunchEvents(prisma: Record<string, any>): Record<string, any> {
     findFirst: jest.fn().mockResolvedValue(null),
     ...(prisma.payrollPolicy ?? {}),
   };
+  // The payroll-period lock guard reads this. No frozen run by default: a test that says
+  // nothing about payroll means nothing has been locked yet, so attendance stays editable -
+  // which is how a tenant behaves before payroll is ever run.
+  prisma.payrollRun = {
+    findFirst: jest.fn().mockResolvedValue(null),
+    findMany: jest.fn().mockResolvedValue([]),
+    ...(prisma.payrollRun ?? {}),
+  };
   return prisma;
 }
 
@@ -164,28 +172,74 @@ type ExistingRecordFixture = {
  * projection rather than returning one fixed payload.
  */
 /**
- * Applies the real `where` the payroll-period guard issues to a run fixture: tenant, period,
- * one of the frozen statuses, and the location/entity overlap clauses the guard adds only for
- * a scoped operation. Modelled rather than stubbed so a guard that stops scoping its lookup -
- * or widens it past LOCKED/PUBLISHED/CLOSED - fails these tests instead of passing quietly.
+ * A payroll run fixture: the period it covers, its status, and - the thing the guard actually
+ * asks about - the employees its own `PayrollRunEmployee` entries contain. `locationId` and
+ * `legalEntityId` may be set on a fixture to prove they are *not* what membership is read
+ * from.
  */
-function matchesFrozenRunWhere(run: Record<string, any>, where: Record<string, any>): boolean {
-  if (run.tenantId !== where.tenantId) return false;
+interface FrozenRunFixture {
+  tenantId?: string;
+  month: number;
+  year: number;
+  status: string;
+  employeeIds: string[];
+  locationId?: string | null;
+  legalEntityId?: string | null;
+}
+
+/** The employee ids a guard lookup asked about, from `entries: { some: { employeeId: { in } } }`. */
+function requestedEmployeeIds(where: Record<string, any>): string[] {
+  return where.entries?.some?.employeeId?.in ?? [];
+}
+
+/**
+ * Applies the real `where` the payroll-period guard issues to a run fixture: tenant, period,
+ * one of the frozen statuses, and membership through the run's entries. Modelled rather than
+ * stubbed, so a guard that drops the entry filter (and would therefore block on a run that
+ * never covered the employee), or widens past LOCKED/PUBLISHED/CLOSED, fails these tests
+ * instead of passing quietly.
+ */
+function matchesFrozenRunWhere(run: FrozenRunFixture, where: Record<string, any>): boolean {
+  if ((run.tenantId ?? 'tenant-1') !== where.tenantId) return false;
   if (run.month !== where.month || run.year !== where.year) return false;
   if (!where.status.in.includes(run.status)) return false;
-  const overlapClauses = (where.AND as Array<{ OR: Array<Record<string, unknown>> }>) ?? [];
-  return overlapClauses.every((clause) =>
-    clause.OR.some((option) =>
-      Object.entries(option).every(([key, value]) => (run[key] ?? null) === value),
-    ),
-  );
+  return requestedEmployeeIds(where).some((employeeId) => run.employeeIds.includes(employeeId));
 }
 
 /** A `payrollRun.findFirst` double over run fixtures, matched by {@link matchesFrozenRunWhere}. */
-function frozenRunLookup(runs: Array<Record<string, any>>) {
+function frozenRunLookup(runs: FrozenRunFixture[]) {
   return jest.fn(({ where }: { where: Record<string, any> }) =>
     Promise.resolve(runs.find((run) => matchesFrozenRunWhere(run, where)) ?? null),
   );
+}
+
+/**
+ * A `payrollRun.findMany` double for the batched import lookup: filters by tenant, frozen
+ * status, the uploaded periods (`OR`) and membership, and returns each run with its entries
+ * narrowed to the asked-about employees, exactly as the real `select` does.
+ */
+function frozenRunListLookup(runs: FrozenRunFixture[]) {
+  return jest.fn(({ where }: { where: Record<string, any> }) => {
+    const asked = requestedEmployeeIds(where);
+    const periods = (where.OR as Array<{ month: number; year: number }>) ?? [];
+    const matched = runs.filter(
+      (run) =>
+        (run.tenantId ?? 'tenant-1') === where.tenantId &&
+        where.status.in.includes(run.status) &&
+        periods.some((period) => period.month === run.month && period.year === run.year) &&
+        run.employeeIds.some((employeeId) => asked.includes(employeeId)),
+    );
+    return Promise.resolve(
+      matched.map((run) => ({
+        month: run.month,
+        year: run.year,
+        status: run.status,
+        entries: run.employeeIds
+          .filter((employeeId) => asked.includes(employeeId))
+          .map((employeeId) => ({ employeeId })),
+      })),
+    );
+  });
 }
 
 /**
@@ -220,7 +274,7 @@ function buildFinalizeHarness(options: {
   /** Pre-existing comp-off grants, to exercise idempotency across a re-finalization. */
   compOffGrants?: Array<Record<string, unknown>>;
   /** Payroll runs that already exist for the finalized period, for the period-lock guard. */
-  payrollRuns?: Array<Record<string, any>>;
+  payrollRuns?: FrozenRunFixture[];
 } = {}) {
   const employees = options.employees ?? [
     { id: 'emp-1', employeeCode: 'PH001', locationId: 'loc-b' },
@@ -3286,7 +3340,6 @@ describe('AttendanceService', () => {
       shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       attendanceFinalization: { create: jest.fn().mockResolvedValue({ id: 'fin-1' }) },
       payrollVariableInput: { deleteMany: jest.fn(), create: jest.fn() },
-      payrollRun: { findFirst: frozenRunLookup([]) },
     };
     const service = newAttendanceService(prisma);
 
@@ -4551,7 +4604,6 @@ describe('manual comp-off grants', () => {
       shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
       shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       // No frozen payroll by default, so every pre-existing case decides exactly as before.
-      payrollRun: { findFirst: frozenRunLookup([]) },
       payrollVariableInput: { findFirst: frozenPayoutLookup([]) },
       ...overrides,
     };
@@ -4899,7 +4951,6 @@ describe('decideCompOff authorization', () => {
       shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
       shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', weeklyOffDays: [0, 6] }) },
       // No frozen payroll by default, so every pre-existing case decides exactly as before.
-      payrollRun: { findFirst: frozenRunLookup([]) },
       payrollVariableInput: { findFirst: frozenPayoutLookup([]) },
       ...overrides,
     };
@@ -4970,12 +5021,17 @@ describe('decideCompOff authorization', () => {
 
 describe('payroll period lock', () => {
   const JULY = { month: 7, year: 2026 };
-  const run = (overrides: Record<string, any> = {}) => ({
+  /**
+   * A frozen run that covers `emp-1`. `locationId`/`legalEntityId` are set on purpose: the
+   * guard must read membership from the run's entries, never from these.
+   */
+  const run = (overrides: Partial<FrozenRunFixture> = {}): FrozenRunFixture => ({
     tenantId: 'tenant-1',
     ...JULY,
     status: 'LOCKED',
-    locationId: null,
-    legalEntityId: null,
+    employeeIds: ['emp-1'],
+    locationId: 'loc-somewhere-else',
+    legalEntityId: 'entity-somewhere-else',
     ...overrides,
   });
 
@@ -4990,7 +5046,7 @@ describe('payroll period lock', () => {
     };
 
     it.each(['LOCKED', 'PUBLISHED', 'CLOSED'])(
-      'refuses to finalize a month whose payroll run is %s, writing nothing',
+      'refuses to finalize a month whose frozen run (%s) contains an affected employee',
       async (status) => {
         const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ status })] });
 
@@ -5002,7 +5058,7 @@ describe('payroll period lock', () => {
     );
 
     it.each(['DRAFT', 'PROCESSING', 'REVIEW', 'APPROVED'])(
-      'still finalizes a month whose payroll run is only %s',
+      'still finalizes a month whose run is only %s',
       async (status) => {
         const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ status })] });
 
@@ -5012,37 +5068,56 @@ describe('payroll period lock', () => {
       },
     );
 
-    it('finalizes normally when the period has no payroll run at all', async () => {
-      const { prisma, service } = buildFinalizeHarness();
+    it('asks about exactly the employees it is about to finalize', async () => {
+      const { prisma, service } = buildFinalizeHarness({
+        employees: [
+          { id: 'emp-1', employeeCode: 'PH001', locationId: 'loc-b' },
+          { id: 'emp-2', employeeCode: 'PH002', locationId: 'loc-b' },
+        ],
+      });
 
       await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
 
-      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
       expect(prisma.payrollRun.findFirst).toHaveBeenCalledWith({
-        where: { tenantId: 'tenant-1', month: 7, year: 2026, status: { in: ['LOCKED', 'PUBLISHED', 'CLOSED'] } },
+        where: {
+          tenantId: 'tenant-1',
+          month: 7,
+          year: 2026,
+          status: { in: ['LOCKED', 'PUBLISHED', 'CLOSED'] },
+          entries: { some: { employeeId: { in: ['emp-1', 'emp-2'] } } },
+        },
         select: { status: true },
       });
     });
 
-    it('does not block on a locked run for a different month', async () => {
-      const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ month: 6 })] });
-
-      await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
-
-      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
-    });
-
-    it("does not block on another tenant's locked run", async () => {
-      const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ tenantId: 'tenant-2' })] });
-
-      await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
-
-      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
-    });
-
-    it('does not block a location finalization on a run locked for a different location', async () => {
+    it('is blocked when the frozen run contains any one of the affected employees', async () => {
       const { prisma, service } = buildFinalizeHarness({
-        payrollRuns: [run({ locationId: 'loc-other' })],
+        employees: [
+          { id: 'emp-1', employeeCode: 'PH001', locationId: 'loc-b' },
+          { id: 'emp-2', employeeCode: 'PH002', locationId: 'loc-b' },
+        ],
+        payrollRuns: [run({ employeeIds: ['emp-2'] })],
+      });
+
+      await expect(service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' })).rejects.toThrow(
+        'can no longer be finalized',
+      );
+      expectNoWrites(prisma);
+    });
+
+    it('is allowed when a frozen run for the month contains none of them', async () => {
+      const { prisma, service } = buildFinalizeHarness({
+        payrollRuns: [run({ employeeIds: ['emp-elsewhere'] })],
+      });
+
+      await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
+
+      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
+    });
+
+    it("is not blocked by another location's frozen run when its entries do not overlap", async () => {
+      const { prisma, service } = buildFinalizeHarness({
+        payrollRuns: [run({ locationId: 'loc-other', employeeIds: ['emp-at-loc-other'] })],
       });
 
       await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07', locationId: 'loc-b' });
@@ -5050,30 +5125,41 @@ describe('payroll period lock', () => {
       expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
     });
 
-    it('blocks a location finalization on a locked run for that same location', async () => {
-      const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ locationId: 'loc-b' })] });
+    it('is blocked by a frozen run of another location that did pay this employee', async () => {
+      // The employee transferred since: the run is scoped to a location they no longer sit at,
+      // but its entries still contain them, so it still paid them for this month.
+      const { prisma, service } = buildFinalizeHarness({
+        payrollRuns: [run({ locationId: 'loc-other', employeeIds: ['emp-1'] })],
+      });
 
       await expect(
         service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07', locationId: 'loc-b' }),
       ).rejects.toThrow('can no longer be finalized');
-      expect(prisma.attendanceFinalization.create).not.toHaveBeenCalled();
+      expectNoWrites(prisma);
     });
 
-    it('blocks a location finalization on a locked tenant-wide run, which paid that location too', async () => {
-      const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ locationId: null })] });
+    it('does not block on a frozen run for a different month', async () => {
+      const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ month: 6 })] });
 
-      await expect(
-        service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07', locationId: 'loc-b' }),
-      ).rejects.toThrow('can no longer be finalized');
-      expect(prisma.attendanceFinalization.create).not.toHaveBeenCalled();
+      await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
+
+      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
     });
 
-    it('blocks a tenant-wide finalization on a run locked for just one location', async () => {
-      const { service } = buildFinalizeHarness({ payrollRuns: [run({ locationId: 'loc-b' })] });
+    it("does not block on another tenant's frozen run", async () => {
+      const { prisma, service } = buildFinalizeHarness({ payrollRuns: [run({ tenantId: 'tenant-2' })] });
 
-      await expect(service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' })).rejects.toThrow(
-        'can no longer be finalized',
-      );
+      await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
+
+      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
+    });
+
+    it('finalizes normally when the period has no payroll run at all', async () => {
+      const { prisma, service } = buildFinalizeHarness();
+
+      await service.finalizeMonth('tenant-1', 'emp-hr', { month: '2026-07' });
+
+      expect(prisma.attendanceFinalization.create).toHaveBeenCalled();
     });
   });
 
@@ -5087,9 +5173,11 @@ describe('payroll period lock', () => {
      * An available grant earned 2026-08-15 whose usage is being recorded against 2026-07-20 -
      * deliberately a different month from the earned date, so a guard that keys off
      * `earnedDate` instead of `usedOnDate` is visible. ANNUAL usage keeps that crossing valid.
+     * The employee carries no location or legal entity, the case the old scope-overlap guard
+     * over-blocked.
      */
     function harness(options: {
-      payrollRuns?: Array<Record<string, any>>;
+      payrollRuns?: FrozenRunFixture[];
       payouts?: Array<{ employeeId: string; grantIds: string[]; payrollRun: Record<string, any> }>;
       employee?: Record<string, unknown>;
     } = {}) {
@@ -5102,12 +5190,7 @@ describe('payroll period lock', () => {
             employeeId: 'emp-1',
             earnedDate: new Date(Date.UTC(2026, 7, 15)),
             expiresAt: null,
-            employee: {
-              managerId: 'mgr-1',
-              locationId: 'loc-b',
-              legalEntityId: 'entity-1',
-              ...options.employee,
-            },
+            employee: { managerId: 'mgr-1', locationId: null, ...options.employee },
           }),
           updateMany: jest.fn((args: any) => {
             grantRow = { id: args.where.id, ...args.data };
@@ -5142,7 +5225,7 @@ describe('payroll period lock', () => {
       });
 
     it.each(['LOCKED', 'PUBLISHED', 'CLOSED'])(
-      'refuses to mark a grant used against a date in a %s payroll month, leaving the grant alone',
+      'refuses to mark a grant used against a date in a %s payroll month that paid the employee',
       async (status) => {
         const { prisma, service } = harness({ payrollRuns: [run({ status })] });
 
@@ -5153,7 +5236,7 @@ describe('payroll period lock', () => {
       },
     );
 
-    it("checks the usedOnDate's month, not the month the grant was earned in", async () => {
+    it("asks about the usedOnDate's month and this employee's membership", async () => {
       const { prisma, service } = harness();
 
       await markUsed(service);
@@ -5164,16 +5247,31 @@ describe('payroll period lock', () => {
           month: 7,
           year: 2026,
           status: { in: ['LOCKED', 'PUBLISHED', 'CLOSED'] },
-          AND: [
-            { OR: [{ locationId: null }, { locationId: 'loc-b' }] },
-            { OR: [{ legalEntityId: null }, { legalEntityId: 'entity-1' }] },
-          ],
+          entries: { some: { employeeId: { in: ['emp-1'] } } },
         },
         select: { status: true },
       });
     });
 
-    it('does not block on a run locked for the earned month when the used month is open', async () => {
+    it('is not blocked by a frozen run with no entry for this employee', async () => {
+      const { prisma, service } = harness({ payrollRuns: [run({ employeeIds: ['emp-other'] })] });
+
+      await markUsed(service);
+
+      expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
+    });
+
+    it('is blocked by a frozen run that paid an employee who has since moved location', async () => {
+      const { prisma, service } = harness({
+        employee: { locationId: 'loc-new' },
+        payrollRuns: [run({ locationId: 'loc-old', employeeIds: ['emp-1'] })],
+      });
+
+      await expect(markUsed(service)).rejects.toThrow('Payroll for 2026-07 is already locked');
+      expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('does not block on a frozen run for the earned month when the used month is open', async () => {
       const { prisma, service } = harness({ payrollRuns: [run({ month: 8 })] });
 
       await markUsed(service);
@@ -5181,31 +5279,18 @@ describe('payroll period lock', () => {
       expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
     });
 
-    it.each(['REVIEW', 'APPROVED'])('still allows usage while the run is only %s', async (status) => {
-      const { prisma, service } = harness({ payrollRuns: [run({ status })] });
+    it.each(['DRAFT', 'PROCESSING', 'REVIEW', 'APPROVED'])(
+      'still allows usage while the run is only %s',
+      async (status) => {
+        const { prisma, service } = harness({ payrollRuns: [run({ status })] });
 
-      await markUsed(service);
+        await markUsed(service);
 
-      expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
-    });
+        expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
+      },
+    );
 
-    it("does not block on a run locked for another employee's location", async () => {
-      const { prisma, service } = harness({ payrollRuns: [run({ locationId: 'loc-other' })] });
-
-      await markUsed(service);
-
-      expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
-    });
-
-    it("does not block on a run locked for another legal entity", async () => {
-      const { prisma, service } = harness({ payrollRuns: [run({ legalEntityId: 'entity-other' })] });
-
-      await markUsed(service);
-
-      expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
-    });
-
-    it("does not block on another tenant's locked run", async () => {
+    it("does not block on another tenant's frozen run", async () => {
       const { prisma, service } = harness({ payrollRuns: [run({ tenantId: 'tenant-2' })] });
 
       await markUsed(service);
@@ -5279,6 +5364,227 @@ describe('payroll period lock', () => {
       ).rejects.toThrow('cannot be used on a weekly off');
       expect(prisma.payrollRun.findFirst).not.toHaveBeenCalled();
       expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('direct regularization', () => {
+    function harness(payrollRuns: FrozenRunFixture[] = []) {
+      // `Record<string, any>` because `withPunchEvents` attaches the in-memory punch log as
+      // `punchEventRows`, which the no-write assertions read.
+      const prisma: Record<string, any> = {
+        attendanceRecord: { upsert: jest.fn().mockResolvedValue({ id: 'record-1' }) },
+        shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+        shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', overtimeAfterMinutes: 480 }) },
+        employee: { findFirst: jest.fn().mockResolvedValue({ locationId: 'loc-b' }) },
+        payrollRun: { findFirst: frozenRunLookup(payrollRuns) },
+      };
+      return { prisma, service: newAttendanceService(prisma) };
+    }
+
+    const regularize = (service: AttendanceService) =>
+      service.applyRegularization('tenant-1', 'emp-1', {
+        date: new Date(Date.UTC(2026, 6, 20)),
+        punchIn: new Date('2026-07-20T09:00:00.000Z'),
+        punchOut: new Date('2026-07-20T18:00:00.000Z'),
+        reason: 'Client visit',
+      });
+
+    it.each(['LOCKED', 'PUBLISHED', 'CLOSED'])(
+      'refuses to regularize a day inside a %s payroll month, writing nothing',
+      async (status) => {
+        const { prisma, service } = harness([run({ status })]);
+
+        await expect(regularize(service)).rejects.toThrow(
+          `Payroll for 2026-07 is already ${status.toLowerCase()}; this day can no longer be regularized`,
+        );
+        expect(prisma.attendanceRecord.upsert).not.toHaveBeenCalled();
+        // The punch log the regularization would have mirrored into is untouched too.
+        expect(prisma.punchEventRows).toHaveLength(0);
+      },
+    );
+
+    it.each(['DRAFT', 'PROCESSING', 'REVIEW', 'APPROVED'])(
+      'still regularizes while the run is only %s',
+      async (status) => {
+        const { prisma, service } = harness([run({ status })]);
+
+        await regularize(service);
+
+        expect(prisma.attendanceRecord.upsert).toHaveBeenCalled();
+      },
+    );
+
+    it('regularizes normally when the period has no frozen run', async () => {
+      const { prisma, service } = harness();
+
+      await regularize(service);
+
+      expect(prisma.attendanceRecord.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: expect.objectContaining({ status: 'PRESENT' }) }),
+      );
+    });
+
+    it('is not blocked by a frozen run that never contained the employee', async () => {
+      const { prisma, service } = harness([run({ employeeIds: ['emp-other'] })]);
+
+      await regularize(service);
+
+      expect(prisma.attendanceRecord.upsert).toHaveBeenCalled();
+    });
+
+    it("is not blocked by another tenant's frozen run", async () => {
+      const { prisma, service } = harness([run({ tenantId: 'tenant-2' })]);
+
+      await regularize(service);
+
+      expect(prisma.attendanceRecord.upsert).toHaveBeenCalled();
+    });
+  });
+
+  describe('attendance imports', () => {
+    function harness(payrollRuns: FrozenRunFixture[] = []) {
+      const prisma: Record<string, any> = {
+        employee: {
+          findMany: jest.fn().mockResolvedValue([
+            { id: 'emp-1', employeeCode: 'PH001', locationId: 'loc-hq' },
+            { id: 'emp-2', employeeCode: 'PH002', locationId: 'loc-hq' },
+          ]),
+          findFirst: jest.fn().mockResolvedValue({ locationId: 'loc-hq' }),
+        },
+        shiftAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+        shift: { findFirst: jest.fn().mockResolvedValue({ id: 'shift-1', overtimeAfterMinutes: 480 }) },
+        attendanceRecord: { upsert: jest.fn().mockResolvedValue({}) },
+        attendanceCaptureSetting: { findFirst: jest.fn().mockResolvedValue(null) },
+        attendanceRule: { findFirst: jest.fn().mockResolvedValue(null) },
+        payrollRun: { findMany: frozenRunListLookup(payrollRuns) },
+      };
+      return { prisma, service: newAttendanceService(prisma) };
+    }
+
+    it('skips a row whose payroll month is frozen, reporting it row by row', async () => {
+      const { prisma, service } = harness([run()]);
+
+      const result = await service.importAttendanceRows(
+        'tenant-1',
+        { rows: [{ employeeCode: 'PH001', date: '2026-07-20' }] },
+        'MANUAL',
+      );
+
+      expect(result).toMatchObject({ imported: 0, skipped: 1 });
+      expect(result.errors[0]).toMatchObject({
+        row: 1,
+        employeeCode: 'PH001',
+        date: '2026-07-20',
+        error: 'Payroll for 2026-07 is already locked; this day can no longer be imported',
+      });
+      // No record written, and no punch events mirrored for the skipped day.
+      expect(prisma.attendanceRecord.upsert).not.toHaveBeenCalled();
+      expect(prisma.punchEventRows).toHaveLength(0);
+    });
+
+    it('imports the clean rows of a mixed upload and reports only the frozen ones', async () => {
+      // July is frozen for emp-1 only; emp-1's August row and emp-2's July row are both fine.
+      const { prisma, service } = harness([run({ employeeIds: ['emp-1'] })]);
+
+      const result = await service.importAttendanceRows(
+        'tenant-1',
+        {
+          rows: [
+            { employeeCode: 'PH001', date: '2026-07-20' },
+            { employeeCode: 'PH001', date: '2026-08-20' },
+            { employeeCode: 'PH002', date: '2026-07-20' },
+          ],
+        },
+        'MANUAL',
+      );
+
+      expect(result).toMatchObject({ imported: 2, skipped: 1 });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toMatchObject({ row: 1, employeeCode: 'PH001' });
+      const imported = prisma.attendanceRecord.upsert.mock.calls.map(
+        ([args]: [{ where: { employeeId_date: { employeeId: string; date: Date } } }]) =>
+          `${args.where.employeeId_date.employeeId}|${args.where.employeeId_date.date.toISOString().slice(0, 10)}`,
+      );
+      expect(imported).toEqual(['emp-1|2026-08-20', 'emp-2|2026-07-20']);
+    });
+
+    it('resolves the whole upload with one frozen-payroll lookup', async () => {
+      const { prisma, service } = harness([run()]);
+
+      await service.importAttendanceRows(
+        'tenant-1',
+        {
+          rows: [
+            { employeeCode: 'PH001', date: '2026-07-20' },
+            { employeeCode: 'PH001', date: '2026-07-21' },
+            { employeeCode: 'PH002', date: '2026-08-03' },
+          ],
+        },
+        'MANUAL',
+      );
+
+      expect(prisma.payrollRun.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.payrollRun.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            tenantId: 'tenant-1',
+            status: { in: ['LOCKED', 'PUBLISHED', 'CLOSED'] },
+            // Distinct periods only, not one clause per row.
+            OR: [{ month: 7, year: 2026 }, { month: 8, year: 2026 }],
+            entries: { some: { employeeId: { in: ['emp-1', 'emp-2'] } } },
+          }),
+        }),
+      );
+    });
+
+    it('protects a biometric import through the same shared path', async () => {
+      const { prisma, service } = harness([run()]);
+
+      const result = await service.importBiometricPunches('tenant-1', {
+        rows: [{ employeeCode: 'PH001', date: '2026-07-20' }],
+      });
+
+      expect(result).toMatchObject({ imported: 0, skipped: 1 });
+      // Biometric rows are the ones that would otherwise be written as already finalized.
+      expect(prisma.attendanceRecord.upsert).not.toHaveBeenCalled();
+    });
+
+    it("is not blocked by another tenant's frozen run", async () => {
+      const { prisma, service } = harness([run({ tenantId: 'tenant-2' })]);
+
+      const result = await service.importAttendanceRows(
+        'tenant-1',
+        { rows: [{ employeeCode: 'PH001', date: '2026-07-20' }] },
+        'MANUAL',
+      );
+
+      expect(result).toMatchObject({ imported: 1, skipped: 0 });
+      expect(prisma.attendanceRecord.upsert).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the existing row validation and numbering untouched', async () => {
+      const { prisma, service } = harness([run()]);
+
+      const result = await service.importAttendanceRows(
+        'tenant-1',
+        {
+          rows: [
+            { employeeCode: 'PH999', date: '2026-07-20' },
+            { employeeCode: 'PH001', date: '01/07/2026' },
+            { employeeCode: 'PH001', date: '2026-07-20' },
+            { employeeCode: 'PH002', date: '2026-07-20' },
+          ],
+        },
+        'MANUAL',
+      );
+
+      expect(result.errors.map((error: { row: number; error: string }) => [error.row, error.error])).toEqual([
+        [1, 'Employee code not found'],
+        [2, expect.stringContaining('Unsupported date "01/07/2026"')],
+        [3, 'Payroll for 2026-07 is already locked; this day can no longer be imported'],
+      ]);
+      expect(result).toMatchObject({ imported: 1, skipped: 3 });
+      expect(prisma.attendanceRecord.upsert).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -11,7 +11,6 @@ import {
   AttendanceStatus,
   CompOffStatus,
   CompOffUsagePeriod,
-  PayrollRunStatus,
   Prisma,
   PunchDirection,
   ShiftSwapStatus,
@@ -25,6 +24,15 @@ import {
   SUPPORTED_ATTENDANCE_DATE_FORMATS,
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
+import {
+  assertPayrollPeriodOpen,
+  formatPayrollPeriod,
+  PAYROLL_PERIOD_LOCK_STATUSES,
+  frozenPayrollPeriodsFor,
+  payrollPeriodKey,
+  payrollPeriodOf,
+  type PayrollPeriod,
+} from '../../common/utils/payroll-period-lock';
 import { NON_WORKING_ATTENDANCE_STATUSES } from '../../common/utils/employment-status';
 import { PayrollPolicyService } from '../payroll/payroll-policy.service';
 import { AttendanceQrService } from './attendance-qr.service';
@@ -86,19 +94,6 @@ const LEAVE_RECONCILABLE_STATUSES: AttendanceStatus[] = [
 
 /** How long a comp-off stays available before it lapses, in days. */
 const COMP_OFF_VALIDITY_DAYS = 90;
-
-/**
- * Payroll run statuses past the point of no return. `lockRun` records loan installments and
- * `reprocessRun` refuses anything beyond `APPROVED`, so from `LOCKED` onwards a run can never
- * be recomputed: whatever attendance and comp-off data it was processed from is what it paid.
- * `REVIEW` and `APPROVED` are deliberately absent - those can still be reprocessed, which is
- * how a late attendance correction is meant to reach payroll.
- */
-const PAYROLL_PERIOD_LOCK_STATUSES: PayrollRunStatus[] = [
-  PayrollRunStatus.LOCKED,
-  PayrollRunStatus.PUBLISHED,
-  PayrollRunStatus.CLOSED,
-];
 
 /**
  * Roles whose comp-off ledger view is the whole tenant rather than their own grants.
@@ -1452,6 +1447,18 @@ export class AttendanceService {
       select: { id: true, employeeCode: true, locationId: true },
     });
     const employeeByCode = new Map(employees.map((employee) => [employee.employeeCode, employee]));
+    // Which of these employees already have frozen payroll for a month this upload touches,
+    // resolved in one query for the whole file rather than once per row. Rows whose date does
+    // not parse are left out here and keep their own row-level validation error below, rather
+    // than having a payroll period guessed for them.
+    const frozenPeriods = await frozenPayrollPeriodsFor(this.prisma, {
+      tenantId,
+      employeeIds: employees.map((employee) => employee.id),
+      periods: dto.rows
+        .map((row) => parseAttendanceDate(row.date))
+        .filter((date): date is Date => date !== null)
+        .map(payrollPeriodOf),
+    });
     let imported = 0;
     const unknownEmployeeCodes = new Set<string>();
     const errors: Array<{ row: number; employeeCode: string; date: string; error: string }> = [];
@@ -1493,6 +1500,20 @@ export class AttendanceService {
         continue;
       }
       const date = parsedDate.date;
+      // Skipped rather than failing the whole upload, so the rest of the file still imports:
+      // the same row-level error contract an unknown code or a malformed date reports.
+      const frozenStatus = frozenPeriods.get(payrollPeriodKey(employee.id, payrollPeriodOf(date)));
+      if (frozenStatus) {
+        errors.push({
+          row: index + 1,
+          employeeCode: row.employeeCode,
+          date: String(row.date ?? ''),
+          error:
+            `Payroll for ${formatPayrollPeriod(payrollPeriodOf(date))} is already ` +
+            `${frozenStatus.toLowerCase()}; this day can no longer be imported`,
+        });
+        continue;
+      }
       // One resolve per row covers both the shift and the location: capture
       // rules follow wherever the employee actually works that date, which a
       // date-effective assignment may override away from their base location.
@@ -2347,6 +2368,16 @@ export class AttendanceService {
     employeeId: string,
     input: { date: Date; punchIn?: Date; punchOut?: Date; reason: string },
   ) {
+    // Before the record upsert and the punch events it mirrors: a regularization asserts the
+    // day was worked, which removes the LOP a frozen run has already paid for it. Deliberately
+    // keyed on the payroll lock rather than on `isFinalized` - a correction to a finalized
+    // month whose run is still in REVIEW is exactly what reprocessing exists for.
+    await this.assertPayrollPeriodOpen(
+      tenantId,
+      payrollPeriodOf(input.date),
+      [employeeId],
+      'this day can no longer be regularized',
+    );
     const workingMinutes =
       input.punchIn && input.punchOut
         ? Math.max(0, Math.round((input.punchOut.getTime() - input.punchIn.getTime()) / 60000))
@@ -2965,13 +2996,24 @@ export class AttendanceService {
 
   async finalizeMonth(tenantId: string, finalizedById: string | undefined, dto: FinalizeAttendanceDto) {
     const { start, endExclusive, endInclusive, year, monthNumber } = monthParts(dto.month);
-    // Ahead of every read and write below: finalizing rewrites attendance statuses and
-    // replaces this month's attendance-generated payroll inputs, which a frozen run has
-    // already been paid from.
+    // The employees this finalization would rewrite, read before anything is written so the
+    // payroll-period guard below can be asked about exactly them.
+    const employees = await this.prisma.employee.findMany({
+      where: {
+        tenantId,
+        status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
+        ...(dto.locationId && { locationId: dto.locationId }),
+      },
+      select: { id: true, employeeCode: true, locationId: true },
+    });
+    // Ahead of every write below: finalizing rewrites attendance statuses and replaces this
+    // month's attendance-generated payroll inputs, which a frozen run has already been paid
+    // from. A frozen run for another location or entity blocks nothing unless its entries
+    // actually cover one of these employees.
     await this.assertPayrollPeriodOpen(
       tenantId,
       { month: monthNumber, year },
-      { locationId: dto.locationId ?? null },
+      employees.map((employee) => employee.id),
       'attendance for this month can no longer be finalized',
     );
     const preview = await this.finalizationPreview(tenantId, dto);
@@ -2987,14 +3029,6 @@ export class AttendanceService {
       },
     });
 
-    const employees = await this.prisma.employee.findMany({
-      where: {
-        tenantId,
-        status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
-        ...(dto.locationId && { locationId: dto.locationId }),
-      },
-      select: { id: true, employeeCode: true, locationId: true },
-    });
     const existing = await this.prisma.attendanceRecord.findMany({
       where: {
         tenantId,
@@ -3145,42 +3179,18 @@ export class AttendanceService {
    * data move underneath it leaves the payslips it produced unexplainable by the data behind
    * them - silently, because nothing recalculates.
    *
-   * Scope matching mirrors `PayrollService.hasMonthlyAttendanceFinalization` in reverse: a run
-   * covers an employee (or a finalized location) when the run is tenant-wide (`locationId:
-   * null`) or scoped to that same location, and likewise for `legalEntityId`. A tenant-wide
-   * operation passes no scope at all and therefore conflicts with every frozen run for the
-   * month, which is correct - it touches every employee the run paid.
+   * `employeeIds` are the employees the operation would affect, and a run blocks it only when
+   * the run's own `PayrollRunEmployee` entries contain one of them. Membership is never
+   * inferred from the employees' current location or legal entity: the run's entries are what
+   * it actually paid, and they stay right after someone transfers.
    */
-  private async assertPayrollPeriodOpen(
+  private assertPayrollPeriodOpen(
     tenantId: string,
-    period: { month: number; year: number },
-    scope: { locationId?: string | null; legalEntityId?: string | null },
+    period: PayrollPeriod,
+    employeeIds: string[],
     consequence: string,
   ): Promise<void> {
-    const overlapping: Prisma.PayrollRunWhereInput[] = [];
-    if (scope.locationId) {
-      overlapping.push({ OR: [{ locationId: null }, { locationId: scope.locationId }] });
-    }
-    if (scope.legalEntityId) {
-      overlapping.push({ OR: [{ legalEntityId: null }, { legalEntityId: scope.legalEntityId }] });
-    }
-
-    const frozen = await this.prisma.payrollRun.findFirst({
-      where: {
-        tenantId,
-        month: period.month,
-        year: period.year,
-        status: { in: PAYROLL_PERIOD_LOCK_STATUSES },
-        ...(overlapping.length > 0 && { AND: overlapping }),
-      },
-      select: { status: true },
-    });
-    if (frozen) {
-      throw new BadRequestException(
-        `Payroll for ${period.year}-${String(period.month).padStart(2, '0')} is already ` +
-          `${frozen.status.toLowerCase()}; ${consequence}`,
-      );
-    }
+    return assertPayrollPeriodOpen(this.prisma, { tenantId, period, employeeIds }, consequence);
   }
 
   /**
@@ -3384,7 +3394,7 @@ export class AttendanceService {
   async decideCompOff(user: AuthUser, id: string, dto: DecideCompOffDto) {
     const grant = await this.prisma.compOffGrant.findFirst({
       where: { id, tenantId: user.tenantId },
-      include: { employee: { select: { managerId: true, locationId: true, legalEntityId: true } } },
+      include: { employee: { select: { managerId: true, locationId: true } } },
     });
     if (!grant) throw new NotFoundException('Comp-off not found');
     if (grant.status !== CompOffStatus.AVAILABLE) {
@@ -3399,18 +3409,14 @@ export class AttendanceService {
 
     // Checked after the existing validation, so a malformed or ineligible date still reports
     // its own error first, and before the transition, so a refusal writes nothing.
-    const payrollScope = {
-      locationId: grant.employee.locationId,
-      legalEntityId: grant.employee.legalEntityId,
-    };
     if (usedOnDate) {
       // The LOP offset is read only by the run whose month contains `usedOnDate` (see
       // `PayrollService.lopContributionsByDate`), so that month - not the earned month - is
       // the period this decision would change.
       await this.assertPayrollPeriodOpen(
         user.tenantId,
-        { month: usedOnDate.getUTCMonth() + 1, year: usedOnDate.getUTCFullYear() },
-        payrollScope,
+        payrollPeriodOf(usedOnDate),
+        [grant.employeeId],
         'a comp-off can no longer be used against a date in it',
       );
     }
