@@ -2777,6 +2777,177 @@ describe('PayrollService', () => {
       expect(prisma.payrollVariableInput.update).not.toHaveBeenCalled();
     });
 
+    /**
+     * `createPayrollInput` reads the employee, then either the named run or any run for the
+     * input's own period. The period lookup is modelled the way `inputHarness` models it, so a
+     * query that stops matching fails the test instead of silently finding nothing.
+     */
+    function createHarness(options: { existingRuns?: Array<Record<string, unknown>>; employee?: unknown } = {}) {
+      const runs = options.existingRuns ?? [];
+      const prisma = {
+        employee: {
+          findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+            Promise.resolve(
+              options.employee === undefined ? { id: where.id, tenantId: where.tenantId } : options.employee,
+            ),
+          ),
+        },
+        payrollRun: {
+          findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+            Promise.resolve(
+              runs.find((run) =>
+                where.id
+                  ? run.id === where.id && run.tenantId === where.tenantId
+                  : run.tenantId === where.tenantId &&
+                    run.month === where.month &&
+                    run.year === where.year &&
+                    run.status !== where.status.not,
+              ) ?? null,
+            ),
+          ),
+        },
+        payrollVariableInput: {
+          create: jest.fn(({ data }: { data: Record<string, unknown> }) =>
+            Promise.resolve({ id: 'input-new', ...data }),
+          ),
+        },
+        auditLog: { create: jest.fn().mockResolvedValue({}) },
+      };
+      return {
+        prisma,
+        service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any),
+      };
+    }
+
+    const newInput = (overrides: Record<string, unknown> = {}) => ({
+      employeeId: 'emp-1',
+      month: 7,
+      year: 2026,
+      type: 'BONUS',
+      label: 'Festival bonus',
+      amount: 5000,
+      ...overrides,
+    });
+
+    describe('creating a manual payroll input', () => {
+      it.each(['COMP_OFF_PAYOUT', 'SHIFT_ALLOWANCE'])(
+        'refuses %s, which payroll generates for itself',
+        async (type) => {
+          const { prisma, service } = createHarness();
+
+          await expect(
+            service.createPayrollInput('tenant-1', 'user-1', newInput({ type }) as never),
+          ).rejects.toBeInstanceOf(BadRequestException);
+          expect(prisma.payrollVariableInput.create).not.toHaveBeenCalled();
+        },
+      );
+
+      it('refuses a system-owned type however it is cased or padded', async () => {
+        const { prisma, service } = createHarness();
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput({ type: '  comp_off_payout ' }) as never),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(prisma.payrollVariableInput.create).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        'BONUS',
+        'ARREAR',
+        'INCENTIVE',
+        'OVERTIME',
+        'REIMBURSEMENT',
+        'DEDUCTION',
+        'LEAVE_ENCASHMENT',
+        'FULL_AND_FINAL',
+      ])('still accepts the documented manual type %s', async (type) => {
+        const { prisma, service } = createHarness();
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput({ type }) as never),
+        ).resolves.toMatchObject({ type });
+        expect(prisma.payrollVariableInput.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('refuses an input for a period whose payroll has moved past DRAFT', async () => {
+        const { prisma, service } = createHarness({
+          existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'LOCKED' }],
+        });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput() as never),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(prisma.payrollRun.findFirst).toHaveBeenCalledWith({
+          where: { tenantId: 'tenant-1', month: 7, year: 2026, status: { not: 'DRAFT' } },
+        });
+        expect(prisma.payrollVariableInput.create).not.toHaveBeenCalled();
+      });
+
+      it('allows an input for a period whose only run is still DRAFT', async () => {
+        const { prisma, service } = createHarness({
+          existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'DRAFT' }],
+        });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput() as never),
+        ).resolves.toMatchObject({ month: 7, year: 2026 });
+        expect(prisma.payrollVariableInput.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('allows an input for a period with no run at all', async () => {
+        const { prisma, service } = createHarness({ existingRuns: [] });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput() as never),
+        ).resolves.toMatchObject({ type: 'BONUS' });
+        expect(prisma.payrollVariableInput.create).toHaveBeenCalledTimes(1);
+      });
+
+      it("another tenant's processed run does not lock this tenant's period", async () => {
+        const { prisma, service } = createHarness({
+          existingRuns: [{ id: 'run-other', tenantId: 'tenant-2', month: 7, year: 2026, status: 'LOCKED' }],
+        });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput() as never),
+        ).resolves.toMatchObject({ tenantId: 'tenant-1' });
+        expect(prisma.payrollVariableInput.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('leaves the named-run check in place when payrollRunId is supplied', async () => {
+        const { prisma, service } = createHarness({
+          existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'APPROVED' }],
+        });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput({ payrollRunId: 'run-1' }) as never),
+        ).rejects.toThrow('Inputs can only be added before payroll approval');
+        // The period-wide lookup is never reached: a named run answers for itself.
+        expect(prisma.payrollRun.findFirst).toHaveBeenCalledTimes(1);
+        expect(prisma.payrollVariableInput.create).not.toHaveBeenCalled();
+      });
+
+      it('accepts an input against a run that is still in REVIEW', async () => {
+        const { prisma, service } = createHarness({
+          existingRuns: [{ id: 'run-1', tenantId: 'tenant-1', month: 7, year: 2026, status: 'REVIEW' }],
+        });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput({ payrollRunId: 'run-1' }) as never),
+        ).resolves.toMatchObject({ payrollRunId: 'run-1' });
+        expect(prisma.payrollVariableInput.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('refuses an employee from another tenant', async () => {
+        const { prisma, service } = createHarness({ employee: null });
+
+        await expect(
+          service.createPayrollInput('tenant-1', 'user-1', newInput() as never),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        expect(prisma.payrollVariableInput.create).not.toHaveBeenCalled();
+      });
+    });
+
     it('only includes APPROVED inputs when payroll is processed', async () => {
       const { service, prisma } = buildProcessRunHarness({
         finalizations: [{ tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' }],
