@@ -156,19 +156,46 @@ function buildProcessRunHarness(options: {
       groupBy: jest.fn().mockResolvedValue([]),
     },
     payrollVariableInput: {
+      // Two different reads hit this table, and both are matched against their real `where`
+      // rather than answered with a fixed list: the duplicate-payout lookup (type/source on
+      // *other* runs, which also selects the owning run's status) and the calculation's own
+      // input read (APPROVED, this run or run-less rows for the month).
       findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
         Promise.resolve(
-          variableInputStore.filter(
-            (input) =>
-              input.tenantId === where.tenantId &&
-              (where.employeeId?.in ?? []).includes(input.employeeId) &&
-              input.status === where.status &&
-              (where.OR ?? []).some(
-                (clause: { payrollRunId: string | null; month?: number; year?: number }) =>
-                  clause.payrollRunId === input.payrollRunId &&
-                  (clause.month === undefined || (clause.month === input.month && clause.year === input.year)),
-              ),
-          ),
+          variableInputStore
+            .filter((input) => {
+              if (input.tenantId !== where.tenantId) return false;
+              if (!(where.employeeId?.in ?? []).includes(input.employeeId)) return false;
+              if (where.type !== undefined) {
+                return (
+                  input.type === where.type &&
+                  input.source === where.source &&
+                  (where.payrollRunId?.not === undefined ||
+                    input.payrollRunId !== where.payrollRunId.not)
+                );
+              }
+              return (
+                input.status === where.status &&
+                (where.OR ?? []).some(
+                  (clause: { payrollRunId: string | null; month?: number; year?: number }) =>
+                    clause.payrollRunId === input.payrollRunId &&
+                    (clause.month === undefined ||
+                      (clause.month === input.month && clause.year === input.year)),
+                )
+              );
+            })
+            .map((input) =>
+              where.type === undefined
+                ? input
+                : {
+                    ...input,
+                    // The relation the lookup selects. A fixture may state the owning run's
+                    // status; rows this run created carry its own.
+                    payrollRun:
+                      input.payrollRun ??
+                      (input.payrollRunId === run.id ? { status: run.status } : { status: 'REVIEW' }),
+                  },
+            ),
         ),
       ),
       deleteMany: jest.fn(({ where }: { where: Record<string, any> }) => {
@@ -2199,6 +2226,175 @@ describe('PayrollService', () => {
       expect(prisma.payrollVariableInput.deleteMany).toHaveBeenCalledTimes(2);
       const lastCreateCall = (prisma.payrollVariableInput.createMany as jest.Mock).mock.calls.at(-1);
       expect(lastCreateCall[0].data).toHaveLength(1);
+    });
+
+    describe('a grant another run already paid is not paid twice', () => {
+      const JULY_5 = new Date(Date.UTC(2026, 6, 5));
+
+      /** The payout input an earlier run left behind for `grantIds`, as the real one looks. */
+      const foreignPayout = (overrides: Record<string, unknown> = {}) => ({
+        tenantId: 'tenant-1',
+        employeeId: 'emp-1',
+        payrollRunId: 'run-A',
+        month: 7,
+        year: 2026,
+        type: 'COMP_OFF_PAYOUT',
+        label: 'Unused comp-off payout (1 day)',
+        amount: 838.71,
+        taxable: true,
+        status: 'APPROVED',
+        source: 'COMP_OFF',
+        metadata: { grantIds: ['grant-1'], days: 1, dailyRate: 838.71 },
+        payrollRun: { status: 'PUBLISHED' },
+        ...overrides,
+      });
+
+      const oneAvailableGrant = [
+        { id: 'grant-1', employeeId: 'emp-1', earnedDate: JULY_5, expiresAt: farFutureExpiry, days: 1 },
+      ];
+
+      /** 26 000 basic, so the undiluted July gross is 26 000 and one comp-off day is 838.71. */
+      const harnessWith = (options: Record<string, unknown> = {}) =>
+        buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          payrollPolicies: policy(),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: oneAvailableGrant,
+          ...options,
+        });
+
+      const overlapCases: Array<[string, Record<string, unknown>]> = [
+        ['a location-scoped run beside the tenant-wide one that paid it', { locationId: 'loc-b' }],
+        ['a run differing only by pay group', { payGroup: 'India Monthly B' }],
+        ['an off-cycle run for the same month', { runType: 'OFF_CYCLE' }],
+        ['a run created after the first one closed', { id: 'run-2' }],
+      ];
+
+      it.each(overlapCases)('%s creates no second payout', async (_label, runOverrides) => {
+        const { service, prisma, entryFor } = harnessWith({
+          run: runOverrides,
+          variableInputs: [foreignPayout()],
+        });
+
+        await service.processRun('tenant-1', String(runOverrides.id ?? 'run-1'));
+
+        expect(payoutCreates(prisma)).toHaveLength(0);
+        // Gross is the plain month: the already-paid 838.71 is not added again.
+        expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      });
+
+      it.each(['LOCKED', 'PUBLISHED', 'CLOSED', 'REVIEW', 'APPROVED'])(
+        'a payout held by a %s run still blocks a second one',
+        async (status) => {
+          const { service, prisma } = harnessWith({
+            variableInputs: [foreignPayout({ payrollRun: { status } })],
+          });
+
+          await service.processRun('tenant-1', 'run-1');
+
+          expect(payoutCreates(prisma)).toHaveLength(0);
+        },
+      );
+
+      it('names the owning run and its status in the run warnings', async () => {
+        const { service, entryFor } = harnessWith({ variableInputs: [foreignPayout()] });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(entryFor('emp-1').warnings).toContain(
+          'Unused comp-off grant-1 was already paid out in payroll run run-A (published); it is not paid again here',
+        );
+      });
+
+      it('excludes every grant a multi-grant payout recorded', async () => {
+        const { service, prisma, entryFor } = harnessWith({
+          availableCompOffGrants: [
+            ...oneAvailableGrant,
+            { id: 'grant-2', employeeId: 'emp-1', earnedDate: JULY_5, expiresAt: farFutureExpiry, days: 1 },
+          ],
+          variableInputs: [
+            foreignPayout({
+              amount: 1677.42,
+              metadata: { grantIds: ['grant-1', 'grant-2'], days: 2, dailyRate: 838.71 },
+            }),
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(prisma)).toHaveLength(0);
+        expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      });
+
+      it('pays the grants a multi-grant payout did not record', async () => {
+        const { service, prisma } = harnessWith({
+          availableCompOffGrants: [
+            ...oneAvailableGrant,
+            { id: 'grant-9', employeeId: 'emp-1', earnedDate: JULY_5, expiresAt: farFutureExpiry, days: 1 },
+          ],
+          variableInputs: [foreignPayout()],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        const creates = payoutCreates(prisma);
+        expect(creates).toHaveLength(1);
+        expect(creates[0].metadata).toMatchObject({ grantIds: ['grant-9'], days: 1 });
+      });
+
+      it("another tenant's payout does not block this tenant's grant", async () => {
+        const { service, prisma } = harnessWith({
+          variableInputs: [foreignPayout({ tenantId: 'tenant-2' })],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(prisma)).toHaveLength(1);
+      });
+
+      it("a payout for another employee's grant does not block this one", async () => {
+        const { service, prisma } = harnessWith({
+          variableInputs: [
+            foreignPayout({ employeeId: 'emp-other', metadata: { grantIds: ['grant-other'], days: 1 } }),
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(prisma)).toHaveLength(1);
+      });
+
+      it('treats its own payout row as its own to replace, not as a rival claim', async () => {
+        const { service, prisma, entryFor } = harnessWith({
+          variableInputs: [foreignPayout({ payrollRunId: 'run-1', payrollRun: undefined })],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        // Deleted and regenerated, exactly as the rerun path has always done.
+        expect(payoutCreates(prisma)).toHaveLength(1);
+        expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
+      });
+
+      it('drops its own obsolete payout when the owning run reprocesses without the grant', async () => {
+        // The owning run is this one: it pays the grant, the grant is then used elsewhere, and
+        // the next pass deletes the payout it owns without recreating it - so nothing is left
+        // claiming the grant, and a later eligible run is limited only by the existing rules.
+        const { service, prisma } = harnessWith();
+
+        await service.processRun('tenant-1', 'run-1');
+        expect(payoutCreates(prisma)).toHaveLength(1);
+
+        (prisma.compOffGrant.findMany as jest.Mock).mockResolvedValue([]);
+        await service.processRun('tenant-1', 'run-1');
+
+        // Its own rows are deleted on every pass; the second pass created nothing new.
+        expect(prisma.payrollVariableInput.deleteMany).toHaveBeenCalledTimes(2);
+        expect(prisma.payrollVariableInput.deleteMany).toHaveBeenLastCalledWith({
+          where: { tenantId: 'tenant-1', payrollRunId: 'run-1', type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
+        });
+        expect(payoutCreates(prisma)).toHaveLength(1);
+      });
     });
 
     it('18. payroll with no unused Comp-Off is unchanged', async () => {

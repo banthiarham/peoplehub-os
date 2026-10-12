@@ -788,7 +788,16 @@ export class PayrollService {
     // variable-input batch below is read, so a payout this call creates is picked up by that
     // same read - the existing earning-input pipeline, not a parallel one. Deletes and
     // recreates its own inputs for this run every time, so a rerun never doubles a payout.
-    await this.applyUnusedCompOffPayouts(tenantId, run, employees, denominators, monthStart, monthEnd);
+    // Returns the grants it declined to pay because another run already has a payout for
+    // them, reported per employee through this run's own warnings below.
+    const compOffPayoutSkips = await this.applyUnusedCompOffPayouts(
+      tenantId,
+      run,
+      employees,
+      denominators,
+      monthStart,
+      monthEnd,
+    );
 
     // Whether an already-APPROVED OVERTIME input actually pays out, per the PayrollPolicy at
     // each employee's own location - resolved once per location, not per employee.
@@ -922,6 +931,10 @@ export class PayrollService {
       if (compOffOffsetDays > 0) {
         warnings.push(`${compOffOffsetDays} day(s) of LOP offset by used comp-off`);
       }
+      // A grant another run has already paid is not paid again here. Warned rather than
+      // errored: the run itself is correct, and the operator needs to know why an expected
+      // payout is missing - and in which run it already sits.
+      for (const skipped of compOffPayoutSkips.get(emp.id) ?? []) warnings.push(skipped);
       // The configured denominator drives monthly salary -> daily salary -> LOP alike: LOP is
       // capped at it so a full month of absence zeroes pay and never turns it negative. An
       // unusable denominator still reports the LOP it found, capped at the calendar month.
@@ -1707,6 +1720,21 @@ export class PayrollService {
    * inputs in sync: every `COMP_OFF_PAYOUT` input already recorded against this run is deleted
    * and, only where still eligible, recreated - inside one transaction - rather than probed
    * with a findFirst before deciding whether to create.
+   *
+   * A grant another run has already generated a payout for is skipped. Overlapping runs for
+   * one month are creatable (a location-scoped run beside a tenant-wide one, an off-cycle run,
+   * a run re-created once the first is `CLOSED`), each reads the same `AVAILABLE` grants, and
+   * each only ever deletes its own payout rows - so without this check the same grant is paid
+   * by each of them. Ownership is read from the generated input's own `metadata.grantIds`, not
+   * from `CompOffGrant.status`: payroll never writes the grant, which stays `AVAILABLE` after
+   * being paid, so the input is the only record of what was paid. The grant ids it declines
+   * are returned per employee so the run can warn about them.
+   *
+   * This closes the sequential case - one run processed after another. It does not make two
+   * *simultaneous* runs safe: the lookup and the insert are separate statements under the
+   * default Read Committed isolation, so two runs processing at the same instant can each miss
+   * the other's uncommitted payout. Serializing that needs a claim the database can enforce,
+   * which is a separate change.
    */
   private async applyUnusedCompOffPayouts(
     tenantId: string,
@@ -1719,20 +1747,44 @@ export class PayrollService {
     denominators: Map<string, ResolvedDenominator>,
     monthStart: Date,
     monthEnd: Date,
-  ): Promise<void> {
+  ): Promise<Map<string, string[]>> {
+    const skippedByEmployee = new Map<string, string[]>();
     const employeeIds = employees.map((employee) => employee.id);
     const deleteStale = this.prisma.payrollVariableInput.deleteMany({
       where: { tenantId, payrollRunId: run.id, type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
     });
     if (!employeeIds.length) {
       await this.prisma.$transaction([deleteStale]);
-      return;
+      return skippedByEmployee;
     }
 
     const grants = await this.prisma.compOffGrant.findMany({
       where: { tenantId, employeeId: { in: employeeIds }, status: 'AVAILABLE' },
       select: { id: true, employeeId: true, earnedDate: true, expiresAt: true, days: true },
     });
+
+    // Payouts other runs hold for these employees. This run's own rows are excluded, so the
+    // delete-and-recreate rerun path still treats them as its own to replace rather than as
+    // somebody else's claim.
+    const otherRunPayouts = await this.prisma.payrollVariableInput.findMany({
+      where: {
+        tenantId,
+        employeeId: { in: employeeIds },
+        type: 'COMP_OFF_PAYOUT',
+        source: 'COMP_OFF',
+        payrollRunId: { not: run.id },
+      },
+      select: { payrollRunId: true, metadata: true, payrollRun: { select: { status: true } } },
+    });
+    const claimedGrants = new Map<string, { runId: string | null; status: string | null }>();
+    for (const payout of otherRunPayouts) {
+      for (const grantId of this.compOffPayoutGrantIds(payout.metadata)) {
+        claimedGrants.set(grantId, {
+          runId: payout.payrollRunId,
+          status: payout.payrollRun?.status ?? null,
+        });
+      }
+    }
 
     const processingNow = new Date();
     const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
@@ -1750,6 +1802,17 @@ export class PayrollService {
     const eligibleByEmployee = new Map<string, { days: number; grantIds: string[] }>();
     for (const grant of grants) {
       if (grant.expiresAt && grant.expiresAt < processingNow) continue;
+      const claim = claimedGrants.get(grant.id);
+      if (claim) {
+        const owner = claim.runId
+          ? `payroll run ${claim.runId}${claim.status ? ` (${claim.status.toLowerCase()})` : ''}`
+          : 'another payroll run';
+        skippedByEmployee.set(grant.employeeId, [
+          ...(skippedByEmployee.get(grant.employeeId) ?? []),
+          `Unused comp-off ${grant.id} was already paid out in ${owner}; it is not paid again here`,
+        ]);
+        continue;
+      }
       const policy = await resolvePolicy(grant.employeeId);
       const closureDate = this.compOffClosureDate(policy, grant);
       if (closureDate < monthStart || closureDate > monthEnd) continue;
@@ -1804,6 +1867,19 @@ export class PayrollService {
     const ops: Prisma.PrismaPromise<Prisma.BatchPayload>[] = [deleteStale];
     if (creates.length) ops.push(this.prisma.payrollVariableInput.createMany({ data: creates }));
     await this.prisma.$transaction(ops);
+    return skippedByEmployee;
+  }
+
+  /**
+   * The grant ids a generated `COMP_OFF_PAYOUT` input records in its own metadata. Defensive
+   * about the shape because `metadata` is free-form `Json`: anything that is not an array of
+   * strings claims nothing rather than throwing mid-run.
+   */
+  private compOffPayoutGrantIds(metadata: Prisma.JsonValue | null): string[] {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return [];
+    const grantIds = (metadata as Prisma.JsonObject).grantIds;
+    if (!Array.isArray(grantIds)) return [];
+    return grantIds.filter((grantId): grantId is string => typeof grantId === 'string');
   }
 
   /**
