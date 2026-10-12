@@ -63,6 +63,7 @@ import {
   RegularizeDto,
   UpdateAttendanceRecordDto,
   UpdateShiftAssignmentDto,
+  UpdateShiftDto,
   UpdateShiftWeeklyOffsDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
@@ -84,6 +85,16 @@ const LEAVE_RECONCILABLE_STATUSES: AttendanceStatus[] = [
 
 /** How long a comp-off stays available before it lapses, in days. */
 const COMP_OFF_VALIDITY_DAYS = 90;
+
+/**
+ * Roles whose comp-off ledger view is the whole tenant rather than their own grants.
+ *
+ * `Tenant Owner` is the primary workspace administrator and holds `attendance` in the role
+ * catalog, so it belongs here with the other administrators — without it the owner reaches
+ * the route through their `attendance:read` scope and is then shown only their own grants,
+ * or refused outright when their user has no employee profile linked.
+ */
+const COMP_OFF_LEDGER_ROLES = ['Super Admin', 'Tenant Owner', 'HR Admin', 'Manager'];
 
 /** Reject GPS fixes with a worse accuracy radius than this (meters). */
 const MAX_FIX_ACCURACY_M = 150;
@@ -2620,6 +2631,20 @@ export class AttendanceService {
     return this.prisma.shift.create({ data: { ...dto, tenantId, isDefault: !hasAnyShift } });
   }
 
+  /**
+   * Edits a shift's own configuration. Tenant-scoped by the same `findFirst` guard the
+   * other shift mutations use, so one tenant can never reach another's shift.
+   *
+   * Only the fields present in the payload are written. `weeklyOffDays` and `isDefault`
+   * are not reachable here at all (see {@link UpdateShiftDto}), so editing a shift can
+   * never disturb the weekly-off configuration or move the tenant default.
+   */
+  async updateShift(tenantId: string, id: string, dto: UpdateShiftDto) {
+    const shift = await this.prisma.shift.findFirst({ where: { id, tenantId }, select: { id: true } });
+    if (!shift) throw new NotFoundException('Shift not found');
+    return this.prisma.shift.update({ where: { id }, data: { ...dto } });
+  }
+
   async setDefaultShift(tenantId: string, id: string) {
     const shift = await this.prisma.shift.findFirst({ where: { id, tenantId } });
     if (!shift) throw new NotFoundException('Shift not found');
@@ -3094,9 +3119,10 @@ export class AttendanceService {
   async listCompOffs(user: AuthUser) {
     const where: Prisma.CompOffGrantWhereInput = {
       tenantId: user.tenantId,
-      ...(!user.roles.some((role) => ['Super Admin', 'HR Admin', 'Manager'].includes(role)) && {
-        employeeId: this.requireEmployee(user),
-      }),
+      ...(!user.isSuperAdmin &&
+        !user.roles.some((role) => COMP_OFF_LEDGER_ROLES.includes(role)) && {
+          employeeId: this.requireEmployee(user),
+        }),
     };
     return this.prisma.compOffGrant.findMany({
       where,

@@ -31,6 +31,7 @@ import {
   QrPunchDto,
   RegularizeDto,
   UpdateAttendanceRecordDto,
+  UpdateShiftDto,
   UpdateShiftWeeklyOffsDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
@@ -283,14 +284,24 @@ export class AttendanceController {
   }
 
   @Post('shifts')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   @Scopes('attendance:write')
   createShift(@CurrentUser() user: AuthUser, @Body() dto: CreateShiftDto) {
     return this.attendance.createShift(user.tenantId, dto);
   }
 
+  @Patch('shifts/:id')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
+  @Scopes('attendance:write')
+  @ApiOperation({
+    summary: "Edit a shift's configuration, including comp-off eligibility",
+  })
+  updateShift(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateShiftDto) {
+    return this.attendance.updateShift(user.tenantId, id, dto);
+  }
+
   @Patch('shifts/:id/weekly-offs')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   @Scopes('attendance:write')
   @ApiOperation({ summary: 'Update only the configured weekly off days for a shift' })
   updateShiftWeeklyOffs(
@@ -302,7 +313,7 @@ export class AttendanceController {
   }
 
   @Post('shifts/assign')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   @Scopes('attendance:write')
   assignShift(@CurrentUser() user: AuthUser, @Body() dto: AssignShiftDto) {
     return this.attendance.assignShift(user.tenantId, dto);
@@ -345,7 +356,7 @@ export class AttendanceController {
   }
 
   @Patch('shifts/:id/default')
-  @Roles('Super Admin', 'HR Admin')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin')
   @Scopes('attendance:write')
   @ApiOperation({ summary: 'Set this shift as the tenant default for unassigned employees' })
   setDefaultShift(@CurrentUser() user: AuthUser, @Param('id') id: string) {
@@ -387,7 +398,7 @@ export class AttendanceController {
   }
 
   @Post('comp-offs')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   @Scopes('attendance:write')
   @ApiOperation({ summary: 'Manually credit a comp-off for a worked weekly-off or holiday' })
   createCompOff(@CurrentUser() user: AuthUser, @Body() dto: CreateCompOffDto) {
@@ -395,7 +406,7 @@ export class AttendanceController {
   }
 
   @Patch('comp-offs/:id')
-  @Roles('Super Admin', 'HR Admin', 'Manager')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   @Scopes('attendance:write')
   @ApiOperation({ summary: 'Mark a comp-off used, cancelled or expired' })
   decideCompOff(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DecideCompOffDto) {

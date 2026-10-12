@@ -521,6 +521,45 @@ describe('AttendanceService', () => {
     });
   });
 
+  it('updates only the shift fields it was given', async () => {
+    const prisma = {
+      shift: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'shift-1' }),
+        update: jest.fn().mockResolvedValue({ id: 'shift-1', compOffEligible: true }),
+      },
+    };
+    const service = newAttendanceService(prisma);
+
+    await expect(
+      service.updateShift('tenant-1', 'shift-1', { compOffEligible: true }),
+    ).resolves.toEqual({ id: 'shift-1', compOffEligible: true });
+    expect(prisma.shift.findFirst).toHaveBeenCalledWith({
+      where: { id: 'shift-1', tenantId: 'tenant-1' },
+      select: { id: true },
+    });
+    // Nothing else is written, so weekly offs, the tenant default and every unrelated
+    // field keep whatever they already held.
+    expect(prisma.shift.update).toHaveBeenCalledWith({
+      where: { id: 'shift-1' },
+      data: { compOffEligible: true },
+    });
+  });
+
+  it('cannot update a shift belonging to another tenant', async () => {
+    const prisma = {
+      shift: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn(),
+      },
+    };
+    const service = newAttendanceService(prisma);
+
+    await expect(
+      service.updateShift('tenant-1', 'other-tenant-shift', { compOffEligible: true }),
+    ).rejects.toThrow('Shift not found');
+    expect(prisma.shift.update).not.toHaveBeenCalled();
+  });
+
   it('imports biometric punches by employee code and reports unknown codes', async () => {
     const prisma = {
       employee: {
@@ -4747,6 +4786,49 @@ describe('manual comp-off grants', () => {
     await expect(
       service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
     ).rejects.toThrow('already decided');
+  });
+});
+
+describe('listCompOffs visibility', () => {
+  function harness() {
+    const prisma = { compOffGrant: { findMany: jest.fn().mockResolvedValue([]) } };
+    return { prisma, service: newAttendanceService(prisma) };
+  }
+  const viewer = (roles: string[], overrides: Partial<AuthUser> = {}): AuthUser =>
+    ({
+      userId: 'user-1', tenantId: 'tenant-1', email: 'v@x.com', name: 'Viewer',
+      isSuperAdmin: false, employeeId: 'emp-self', roles, ...overrides,
+    }) as AuthUser;
+
+  it.each([['Tenant Owner'], ['HR Admin'], ['Manager']])(
+    'shows %s the whole tenant ledger',
+    async (role) => {
+      const { prisma, service } = harness();
+
+      await service.listCompOffs(viewer([role]));
+
+      expect(prisma.compOffGrant.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { tenantId: 'tenant-1' } }),
+      );
+    },
+  );
+
+  it('shows an ordinary employee only their own grants', async () => {
+    const { prisma, service } = harness();
+
+    await service.listCompOffs(viewer(['Employee']));
+
+    expect(prisma.compOffGrant.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { tenantId: 'tenant-1', employeeId: 'emp-self' } }),
+    );
+  });
+
+  it('does not need an employee profile for a Tenant Owner', async () => {
+    const { service } = harness();
+
+    await expect(
+      service.listCompOffs(viewer(['Tenant Owner'], { employeeId: null })),
+    ).resolves.toEqual([]);
   });
 });
 
