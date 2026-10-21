@@ -835,6 +835,8 @@ export class PayrollService {
             ],
           },
         }),
+        // Candidates only: ownership is settled by `claimPayrollExpenses` below, which is what
+        // decides whether a claim may be reimbursed by this run.
         this.prisma.expenseClaim.findMany({
           where: {
             tenantId,
@@ -880,7 +882,12 @@ export class PayrollService {
         }),
       ]);
     const inputsByEmployee = this.groupByEmployee(variableInputs);
-    const expensesByEmployee = this.groupByEmployee(payrollExpenses);
+    // Reimbursement is paid only for the claims this run actually owns. `payrollExpenses` is
+    // every approved payroll-method claim for these employees, including ones another run has
+    // already taken, so ownership is settled here - before any amount is computed from them.
+    const { ownedExpenses, skippedExpenses } = await this.claimPayrollExpenses(run.id, payrollExpenses);
+    const expensesByEmployee = this.groupByEmployee(ownedExpenses);
+    const skippedExpensesByEmployee = this.groupByEmployee(skippedExpenses);
     const pendingLeaveByEmployee = new Map(pendingLeave.map((row) => [row.employeeId, row._count]));
     const pendingExpenseByEmployee = new Map(pendingExpenses.map((row) => [row.employeeId, row._count]));
     const duplicateCodeSet = new Set(duplicateCodes.map((row) => row.employeeCode));
@@ -935,6 +942,14 @@ export class PayrollService {
       // errored: the run itself is correct, and the operator needs to know why an expected
       // payout is missing - and in which run it already sits.
       for (const skipped of compOffPayoutSkips.get(emp.id) ?? []) warnings.push(skipped);
+      // Same reasoning for a reimbursement another run owns. `ExpenseClaim` carries only the
+      // run id (there is no relation to read its status from), so the warning names the id.
+      for (const claim of skippedExpensesByEmployee.get(emp.id) ?? []) {
+        warnings.push(
+          `Reimbursement claim ${claim.id} is already assigned to payroll run ` +
+            `${claim.reimbursedInPayrollRunId}; it is not reimbursed here`,
+        );
+      }
       // The configured denominator drives monthly salary -> daily salary -> LOP alike: LOP is
       // capped at it so a full month of absence zeroes pay and never turns it negative. An
       // unusable denominator still reports the LOP it found, capped at the calendar month.
@@ -954,6 +969,13 @@ export class PayrollService {
       })).filter((loan) => loan.due > 0);
       const emi = dueLoans.reduce((s, l) => s + l.due, 0);
       if (!salary || denominator?.error) {
+        // This entry pays nothing at all, so any claim taken for the employee above would be
+        // held by a run that cannot reimburse it. Released back to unassigned rather than
+        // stranded, and only where this run is still the owner.
+        await this.releasePayrollExpenses(
+          run.id,
+          (expensesByEmployee.get(emp.id) ?? []).map((expense) => expense.id),
+        );
         await this.prisma.payrollRunEmployee.upsert({
           where: { payrollRunId_employeeId: { payrollRunId: run.id, employeeId: emp.id } },
           create: {
@@ -1095,12 +1117,6 @@ export class PayrollService {
       errorCount += errors.length;
       warningCount += warnings.length;
       processed++;
-    }
-    if (payrollExpenses.length) {
-      await this.prisma.expenseClaim.updateMany({
-        where: { id: { in: payrollExpenses.map((expense) => expense.id) } },
-        data: { reimbursedInPayrollRunId: run.id },
-      });
     }
     // A recompute replaces the run's results outright, so an employee who has dropped out of
     // scope since the last pass (exited, moved location) must not keep a stale entry behind -
@@ -1518,6 +1534,61 @@ export class PayrollService {
     const updated = await this.prisma.payrollVariableInput.update({ where: { id }, data: { status } });
     await this.audit(tenantId, actorId, `PAYROLL_INPUT_${status}`, 'PayrollVariableInput', id, input, updated);
     return updated;
+  }
+
+  /**
+   * Takes ownership of the payroll-method expense claims this run may reimburse, and reports
+   * the ones it may not.
+   *
+   * `ExpenseClaim.reimbursedInPayrollRunId` is the ownership record. The claim is conditional -
+   * it matches only rows that are unassigned or already this run's - so a claim another run
+   * holds is never silently stolen, and a reprocess of this run keeps the claims it already
+   * owns. The owned set is then read back rather than assumed from the update count, so only
+   * claims this run genuinely holds reach the reimbursement components.
+   *
+   * Two runs claiming simultaneously are serialized by the row lock `updateMany` takes, so the
+   * loser's read-back simply does not include the row.
+   */
+  private async claimPayrollExpenses<T extends { id: string; reimbursedInPayrollRunId: string | null }>(
+    payrollRunId: string,
+    candidates: T[],
+  ): Promise<{ ownedExpenses: T[]; skippedExpenses: T[] }> {
+    const skippedExpenses = candidates.filter(
+      (claim) => claim.reimbursedInPayrollRunId && claim.reimbursedInPayrollRunId !== payrollRunId,
+    );
+    const claimable = candidates.filter((claim) => !skippedExpenses.includes(claim));
+    if (!claimable.length) return { ownedExpenses: [], skippedExpenses };
+
+    const claimableIds = claimable.map((claim) => claim.id);
+    await this.prisma.expenseClaim.updateMany({
+      where: {
+        id: { in: claimableIds },
+        OR: [{ reimbursedInPayrollRunId: null }, { reimbursedInPayrollRunId: payrollRunId }],
+      },
+      data: { reimbursedInPayrollRunId: payrollRunId },
+    });
+    const owned = await this.prisma.expenseClaim.findMany({
+      where: { id: { in: claimableIds }, reimbursedInPayrollRunId: payrollRunId },
+      select: { id: true },
+    });
+    const ownedIds = new Set(owned.map((claim) => claim.id));
+    return {
+      ownedExpenses: claimable.filter((claim) => ownedIds.has(claim.id)),
+      skippedExpenses: [
+        ...skippedExpenses,
+        // Lost the race for a claim that read as unassigned a moment ago.
+        ...claimable.filter((claim) => !ownedIds.has(claim.id)),
+      ],
+    };
+  }
+
+  /** Hands claims back, and only the ones this run still owns. */
+  private async releasePayrollExpenses(payrollRunId: string, claimIds: string[]): Promise<void> {
+    if (!claimIds.length) return;
+    await this.prisma.expenseClaim.updateMany({
+      where: { id: { in: claimIds }, reimbursedInPayrollRunId: payrollRunId },
+      data: { reimbursedInPayrollRunId: null },
+    });
   }
 
   /**
@@ -2652,39 +2723,58 @@ export class PayrollService {
         if (amount <= 0) continue;
         const openingBalance = loan.outstanding;
         const closingBalance = round2(Math.max(0, openingBalance - amount));
-        await this.prisma.loanInstallment.upsert({
-          where: { loanId_month_year: { loanId: loan.id, month: run.month, year: run.year } },
-          create: {
-            tenantId: run.tenantId,
-            loanId: loan.id,
-            employeeId: loan.employeeId,
-            payrollRunId: run.id,
-            month: run.month,
-            year: run.year,
-            amount,
-            principalAmount: amount,
-            openingBalance,
-            closingBalance,
-            status: 'DEDUCTED',
-            deductedAt: new Date(),
-          },
-          update: {
-            payrollRunId: run.id,
-            amount,
-            principalAmount: amount,
-            openingBalance,
-            closingBalance,
-            status: 'DEDUCTED',
-            deductedAt: new Date(),
-          },
-        });
-        await this.prisma.loan.update({
-          where: { id: loan.id },
-          data: {
-            outstanding: closingBalance,
-            paidInstallments: { increment: closingBalance < openingBalance ? 1 : 0 },
-            ...(closingBalance <= 0 && { status: 'CLOSED' }),
-          },
+        const deduction = {
+          payrollRunId: run.id,
+          amount,
+          principalAmount: amount,
+          openingBalance,
+          closingBalance,
+          status: 'DEDUCTED',
+          deductedAt: new Date(),
+        };
+
+        // The month's installment row is the claim on that month: `(loanId, month, year)` is
+        // unique, so exactly one caller can move it out of SCHEDULED, and only that caller
+        // advances the balance. A row already DEDUCTED keeps its own balances, run id and
+        // timestamp - the record of the deduction that actually happened - and a WAIVED row is
+        // left waived rather than being turned into a deduction. Claim and advance share one
+        // interactive transaction, so a failure to advance rolls the claim back.
+        await this.prisma.$transaction(async (tx) => {
+          const claimed = await tx.loanInstallment.updateMany({
+            where: { loanId: loan.id, month: run.month, year: run.year, status: 'SCHEDULED' },
+            data: deduction,
+          });
+          // No SCHEDULED row: either this month was never scheduled (a loan predating the
+          // generated schedule, or a month past `totalInstallments` that is still due) and the
+          // row is created here, or the row exists in a terminal state and the unique key makes
+          // this insert a no-op - which is the already-deducted/waived case.
+          const owns =
+            claimed.count > 0 ||
+            (
+              await tx.loanInstallment.createMany({
+                data: [
+                  {
+                    tenantId: run.tenantId,
+                    loanId: loan.id,
+                    employeeId: loan.employeeId,
+                    month: run.month,
+                    year: run.year,
+                    ...deduction,
+                  },
+                ],
+                skipDuplicates: true,
+              })
+            ).count > 0;
+          if (!owns) return;
+
+          await tx.loan.update({
+            where: { id: loan.id },
+            data: {
+              outstanding: closingBalance,
+              paidInstallments: { increment: closingBalance < openingBalance ? 1 : 0 },
+              ...(closingBalance <= 0 && { status: 'CLOSED' }),
+            },
+          });
         });
       }
     }

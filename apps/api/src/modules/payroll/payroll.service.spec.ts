@@ -59,6 +59,8 @@ function buildProcessRunHarness(options: {
   }>;
   /** Pre-existing manual/attendance-sourced variable inputs (e.g. OVERTIME, BONUS), seeded into the same store `COMP_OFF_PAYOUT` writes land in. */
   variableInputs?: Array<Record<string, unknown>>;
+  /** Approved payroll-method expense claims, with whatever run (if any) already owns them. */
+  expenseClaims?: Array<Record<string, any>>;
 } = {}) {
   const run = {
     id: 'run-1',
@@ -78,6 +80,13 @@ function buildProcessRunHarness(options: {
   // a real database gives for free. Also seeded with any pre-existing manual/attendance
   // inputs (e.g. OVERTIME) a test supplies.
   let variableInputStore: Array<Record<string, unknown>> = [...(options.variableInputs ?? [])];
+  const expenseClaimStore: Array<Record<string, any>> = (options.expenseClaims ?? []).map((claim) => ({
+    tenantId: 'tenant-1',
+    status: 'APPROVED',
+    reimbursementMethod: 'PAYROLL',
+    reimbursedInPayrollRunId: null,
+    ...claim,
+  }));
   const prisma = {
     payrollRun: {
       findFirst: jest.fn().mockResolvedValue(run),
@@ -216,10 +225,56 @@ function buildProcessRunHarness(options: {
         return Promise.resolve({ count: data.length });
       }),
     },
+    // Backed by a real store with the ownership column, so the conditional claim is genuinely
+    // evaluated: the candidate read, the `OR: [null, this run]` claim and the read-back of what
+    // this run owns all go through the same rows a database would hold.
     expenseClaim: {
-      findMany: jest.fn().mockResolvedValue([]),
+      findMany: jest.fn(({ where }: { where: Record<string, any> }) =>
+        Promise.resolve(
+          expenseClaimStore.filter((claim) => {
+            if (where.id?.in !== undefined && !where.id.in.includes(claim.id)) return false;
+            if (where.tenantId !== undefined && claim.tenantId !== where.tenantId) return false;
+            if (where.employeeId?.in !== undefined && !where.employeeId.in.includes(claim.employeeId)) {
+              return false;
+            }
+            if (where.status !== undefined && claim.status !== where.status) return false;
+            if (
+              where.reimbursementMethod !== undefined &&
+              claim.reimbursementMethod !== where.reimbursementMethod
+            ) {
+              return false;
+            }
+            if (
+              where.reimbursedInPayrollRunId !== undefined &&
+              claim.reimbursedInPayrollRunId !== where.reimbursedInPayrollRunId
+            ) {
+              return false;
+            }
+            return true;
+          }),
+        ),
+      ),
       groupBy: jest.fn().mockResolvedValue([]),
-      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      updateMany: jest.fn(({ where, data }: { where: Record<string, any>; data: Record<string, any> }) => {
+        const matched = expenseClaimStore.filter((claim) => {
+          if (where.id?.in !== undefined && !where.id.in.includes(claim.id)) return false;
+          if (
+            where.reimbursedInPayrollRunId !== undefined &&
+            claim.reimbursedInPayrollRunId !== where.reimbursedInPayrollRunId
+          ) {
+            return false;
+          }
+          // The conditional claim: unassigned, or already this run's.
+          if (Array.isArray(where.OR)) {
+            return where.OR.some((clause: Record<string, any>) =>
+              Object.entries(clause).every(([key, value]) => claim[key] === value),
+            );
+          }
+          return true;
+        });
+        for (const claim of matched) Object.assign(claim, data);
+        return Promise.resolve({ count: matched.length });
+      }),
     },
     taxYear: { findFirst: jest.fn().mockResolvedValue(null) },
     payrollRunEmployee: {
@@ -318,7 +373,7 @@ function buildProcessRunHarness(options: {
       components: Array<{ code: string; type: string; monthly: number }>;
     };
   };
-  return { prisma, service, calculator, entryFor };
+  return { prisma, service, calculator, entryFor, expenseClaimStore };
 }
 
 /** Minimal prisma double for `assignSalary` / `deleteSalary`. */
@@ -1007,37 +1062,215 @@ describe('PayrollService', () => {
     );
   });
 
-  it('locks approved payroll and records loan installments', async () => {
-    const prisma = {
-      payrollRun: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED', month: 7, year: 2026 }),
-        update: jest.fn().mockResolvedValue({ id: 'run-1', status: 'LOCKED' }),
-      },
-      payrollRunEmployee: {
-        findMany: jest.fn().mockResolvedValue([
-          { employeeId: 'emp-1', components: [{ code: 'LOAN_EMI', monthly: 1000 }] },
-        ]),
-      },
-      loan: {
-        findMany: jest.fn().mockResolvedValue([
-          { id: 'loan-1', tenantId: 'tenant-1', employeeId: 'emp-1', emiAmount: 1000, outstanding: 2000, emiStartMonth: 1, emiStartYear: 2026 },
-        ]),
-        update: jest.fn().mockResolvedValue({}),
-      },
-      loanInstallment: {
-        upsert: jest.fn().mockResolvedValue({}),
-      },
-    };
-    const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
+  describe('loan installments at lock', () => {
+    /**
+     * In-memory `loan_installments` honouring the real `@@unique([loanId, month, year])` and the
+     * status gate the claim relies on, plus a `$transaction` double that restores the store if
+     * the callback throws - so "a failed balance update rolls back the claim" is actually
+     * exercised rather than assumed.
+     */
+    function loanHarness(options: { installments?: Array<Record<string, any>>; loan?: Record<string, any> } = {}) {
+      const loan = {
+        id: 'loan-1',
+        tenantId: 'tenant-1',
+        employeeId: 'emp-1',
+        emiAmount: 1000,
+        outstanding: 2000,
+        paidInstallments: 0,
+        status: 'ACTIVE',
+        emiStartMonth: 1,
+        emiStartYear: 2026,
+        ...options.loan,
+      };
+      let installments: Array<Record<string, any>> = (options.installments ?? []).map((row) => ({
+        loanId: 'loan-1',
+        tenantId: 'tenant-1',
+        employeeId: 'emp-1',
+        ...row,
+      }));
+      const key = (row: Record<string, any>) => `${row.loanId}|${row.month}|${row.year}`;
+      const loanUpdates: Array<Record<string, any>> = [];
 
-    await expect(service.lockRun('tenant-1', 'run-1', 'user-1')).resolves.toEqual({
-      id: 'run-1',
-      status: 'LOCKED',
+      const client = {
+        loanInstallment: {
+          updateMany: jest.fn(({ where, data }: { where: Record<string, any>; data: Record<string, any> }) => {
+            const matched = installments.filter(
+              (row) =>
+                row.loanId === where.loanId &&
+                row.month === where.month &&
+                row.year === where.year &&
+                (where.status === undefined || row.status === where.status),
+            );
+            for (const row of matched) Object.assign(row, data);
+            return Promise.resolve({ count: matched.length });
+          }),
+          // `skipDuplicates` against the unique key: an existing month is not overwritten.
+          createMany: jest.fn(({ data, skipDuplicates }: { data: Array<Record<string, any>>; skipDuplicates?: boolean }) => {
+            const existing = new Set(installments.map(key));
+            const fresh = data.filter((row) => !(skipDuplicates && existing.has(key(row))));
+            installments.push(...fresh.map((row) => ({ ...row })));
+            return Promise.resolve({ count: fresh.length });
+          }),
+        },
+        loan: {
+          findMany: jest.fn(() => Promise.resolve([{ ...loan }])),
+          update: jest.fn(({ data }: { data: Record<string, any> }) => {
+            if (options.loan?.failUpdate) return Promise.reject(new Error('balance update failed'));
+            loanUpdates.push(data);
+            if (typeof data.outstanding === 'number') loan.outstanding = data.outstanding;
+            if (data.paidInstallments?.increment) loan.paidInstallments += data.paidInstallments.increment;
+            if (data.status) loan.status = data.status;
+            return Promise.resolve({ ...loan });
+          }),
+        },
+      };
+
+      const prisma = {
+        payrollRun: {
+          findFirst: jest.fn().mockResolvedValue({ id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED', month: 7, year: 2026 }),
+          update: jest.fn().mockResolvedValue({ id: 'run-1', status: 'LOCKED' }),
+        },
+        payrollRunEmployee: {
+          findMany: jest.fn().mockResolvedValue([
+            { employeeId: 'emp-1', components: [{ code: 'LOAN_EMI', monthly: 1000 }] },
+          ]),
+        },
+        ...client,
+        // Interactive transaction with rollback: the store is snapshotted, and restored if the
+        // callback rejects, which is what a real transaction gives this code.
+        $transaction: jest.fn(async (fn: any) => {
+          const snapshot = installments.map((row) => ({ ...row }));
+          try {
+            return await fn(client);
+          } catch (error) {
+            installments = snapshot;
+            throw error;
+          }
+        }),
+        auditLog: { create: jest.fn().mockResolvedValue({}) },
+      };
+      const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
+      return { prisma, service, loan, loanUpdates, installmentFor: () => installments.find((row) => row.month === 7 && row.year === 2026) };
+    }
+
+    const scheduled = { month: 7, year: 2026, amount: 1000, principalAmount: 1000, openingBalance: 2000, closingBalance: 1000, status: 'SCHEDULED' };
+
+    it('deducts and advances the balance exactly once on the first lock', async () => {
+      const { service, loan, loanUpdates, installmentFor } = loanHarness({ installments: [scheduled] });
+
+      await expect(service.lockRun('tenant-1', 'run-1', 'user-1')).resolves.toEqual({
+        id: 'run-1',
+        status: 'LOCKED',
+      });
+
+      expect(loanUpdates).toHaveLength(1);
+      expect(loan.outstanding).toBe(1000);
+      expect(loan.paidInstallments).toBe(1);
+      expect(installmentFor()).toMatchObject({
+        status: 'DEDUCTED',
+        payrollRunId: 'run-1',
+        openingBalance: 2000,
+        closingBalance: 1000,
+        deductedAt: expect.any(Date),
+      });
     });
-    expect(prisma.loanInstallment.upsert).toHaveBeenCalled();
-    expect(prisma.loan.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ outstanding: 1000 }),
-    }));
+
+    it('transitions a SCHEDULED row to DEDUCTED with the run id and a timestamp', async () => {
+      const { service, installmentFor } = loanHarness({ installments: [scheduled] });
+
+      await service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      const row = installmentFor();
+      expect(row?.status).toBe('DEDUCTED');
+      expect(row?.payrollRunId).toBe('run-1');
+      expect(row?.deductedAt).toBeInstanceOf(Date);
+    });
+
+    it('leaves the loan and the installment audit untouched when the month is already deducted', async () => {
+      // What a second, overlapping run finds: the month was deducted by run-A at a higher
+      // opening balance. Nothing about that record may move, and the balance must not advance.
+      const original = {
+        ...scheduled,
+        status: 'DEDUCTED',
+        payrollRunId: 'run-A',
+        openingBalance: 2000,
+        closingBalance: 1000,
+        deductedAt: new Date('2026-07-31T00:00:00.000Z'),
+      };
+      const { service, loan, loanUpdates, installmentFor } = loanHarness({
+        installments: [original],
+        loan: { outstanding: 1000, paidInstallments: 1 },
+      });
+
+      await service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(loanUpdates).toHaveLength(0);
+      expect(loan.outstanding).toBe(1000);
+      expect(loan.paidInstallments).toBe(1);
+      // Every field of the original deduction is still exactly as run-A left it.
+      expect(installmentFor()).toMatchObject(original);
+    });
+
+    it('creates and claims the row exactly once when the month was never scheduled', async () => {
+      const { prisma, service, loan, loanUpdates, installmentFor } = loanHarness({ installments: [] });
+
+      await service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(installmentFor()).toMatchObject({ status: 'DEDUCTED', payrollRunId: 'run-1', amount: 1000 });
+      expect(loanUpdates).toHaveLength(1);
+      expect(loan.outstanding).toBe(1000);
+      expect(prisma.loanInstallment.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({ skipDuplicates: true }),
+      );
+    });
+
+    it('leaves a WAIVED installment waived and does not deduct that month', async () => {
+      const waived = { ...scheduled, status: 'WAIVED', payrollRunId: null };
+      const { service, loan, loanUpdates, installmentFor } = loanHarness({ installments: [waived] });
+
+      await service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(installmentFor()).toMatchObject(waived);
+      expect(loanUpdates).toHaveLength(0);
+      expect(loan.outstanding).toBe(2000);
+      expect(loan.paidInstallments).toBe(0);
+    });
+
+    it('rolls the claim back when the balance update fails', async () => {
+      const { service, installmentFor } = loanHarness({
+        installments: [scheduled],
+        loan: { failUpdate: true },
+      });
+
+      await expect(service.lockRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow('balance update failed');
+
+      // The installment is still SCHEDULED: the month was not consumed by a lock that failed.
+      expect(installmentFor()).toMatchObject({ status: 'SCHEDULED' });
+      expect(installmentFor()?.payrollRunId).toBeUndefined();
+    });
+
+    it('does not touch the loan when nothing could be claimed', async () => {
+      const { prisma, service, loanUpdates } = loanHarness({
+        installments: [{ ...scheduled, status: 'DEDUCTED', payrollRunId: 'run-A' }],
+      });
+
+      await service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(loanUpdates).toHaveLength(0);
+      expect(prisma.loan.update).not.toHaveBeenCalled();
+    });
+
+    it('skips a loan with nothing due, without claiming anything', async () => {
+      const { prisma, service, loanUpdates } = loanHarness({
+        installments: [scheduled],
+        loan: { outstanding: 0 },
+      });
+
+      await service.lockRun('tenant-1', 'run-1', 'user-1');
+
+      expect(loanUpdates).toHaveLength(0);
+      expect(prisma.loanInstallment.updateMany).not.toHaveBeenCalled();
+    });
   });
 
   it('uses versioned TDS during payroll processing and stores tax snapshots', async () => {
@@ -2700,15 +2933,147 @@ describe('PayrollService', () => {
     });
   });
 
+  describe('expense reimbursement ownership', () => {
+    const finalizedJuly = [
+      { tenantId: 'tenant-1', month: 7, year: 2026, locationId: null, status: 'FINALIZED' },
+    ];
+    /** A single BASIC earning, so gross is exactly 26000 plus whatever is reimbursed. */
+    const basicSalary = (monthly: number) => ({
+      employeeSalaries: [{ ctc: monthly * 12, components: [{ code: 'BASIC', name: 'Basic', type: 'EARNING', monthly }] }],
+    });
+    const claim = (overrides: Record<string, any> = {}) => ({
+      id: 'claim-1',
+      employeeId: 'emp-1',
+      category: 'TRAVEL',
+      amount: 1500,
+      ...overrides,
+    });
+    const harnessWith = (expenseClaims: Array<Record<string, any>>, run?: Record<string, unknown>) =>
+      buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        employeeOverrides: basicSalary(26000),
+        expenseClaims,
+        ...(run && { run }),
+      });
+
+    const reimbursementIn = (entry: { components?: unknown }) =>
+      ((entry.components as Array<Record<string, any>>) ?? []).filter((component) =>
+        String(component.code ?? component.name ?? '').includes('Expense') ||
+        component.type === 'EARNING' && String(component.name ?? '').startsWith('Expense'),
+      );
+
+    it("claims an unassigned claim and reimburses it in that employee's entry", async () => {
+      const { service, entryFor, expenseClaimStore } = harnessWith([claim()]);
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(expenseClaimStore[0].reimbursedInPayrollRunId).toBe('run-1');
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(27500, 2);
+      expect(reimbursementIn(entryFor('emp-1'))).toHaveLength(1);
+    });
+
+    it('excludes a claim another run owns, from both the entry and its amount', async () => {
+      const { service, entryFor, expenseClaimStore } = harnessWith([
+        claim({ reimbursedInPayrollRunId: 'run-A' }),
+      ]);
+
+      await service.processRun('tenant-1', 'run-1');
+
+      // Ownership untouched, nothing reimbursed, gross is the plain salary.
+      expect(expenseClaimStore[0].reimbursedInPayrollRunId).toBe('run-A');
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      expect(reimbursementIn(entryFor('emp-1'))).toHaveLength(0);
+    });
+
+    it('warns, naming the owning run, when a claim is skipped', async () => {
+      const { service, entryFor } = harnessWith([claim({ reimbursedInPayrollRunId: 'run-A' })]);
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').warnings).toContain(
+        'Reimbursement claim claim-1 is already assigned to payroll run run-A; it is not reimbursed here',
+      );
+    });
+
+    it('keeps reimbursing a claim it already owns when the run is reprocessed', async () => {
+      const { service, entryFor, expenseClaimStore } = harnessWith([
+        claim({ reimbursedInPayrollRunId: 'run-1' }),
+      ]);
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(expenseClaimStore[0].reimbursedInPayrollRunId).toBe('run-1');
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(27500, 2);
+    });
+
+    it('excludes the claim when the conditional claim does not take it', async () => {
+      // The row is taken between the candidate read and the claim: `updateMany` matches
+      // nothing, so the read-back does not return it and no amount may be based on it.
+      const { prisma, service, entryFor } = harnessWith([claim()]);
+      (prisma.expenseClaim.updateMany as jest.Mock).mockImplementation(() => Promise.resolve({ count: 0 }));
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      expect(reimbursementIn(entryFor('emp-1'))).toHaveLength(0);
+    });
+
+    it('releases a claim it took for an employee it then could not pay', async () => {
+      // No salary for the employee: the entry is written zeroed with an error, so the claim
+      // must not stay parked on this run.
+      const { service, entryFor, expenseClaimStore } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        employeeOverrides: { employeeSalaries: [] },
+        expenseClaims: [claim()],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').errors).toContain('Missing active salary structure or CTC for this payroll month');
+      expect(expenseClaimStore[0].reimbursedInPayrollRunId).toBeNull();
+    });
+
+    it('reimburses each employee only their own claims', async () => {
+      const { service, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        employeeOverrides: basicSalary(26000),
+        extraEmployees: [{ id: 'emp-1' }, { id: 'emp-2' }],
+        expenseClaims: [claim({ id: 'claim-2', employeeId: 'emp-2', amount: 900 })],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      expect(entryFor('emp-2').grossPay).toBeCloseTo(26900, 2);
+    });
+  });
+
   describe('payslip publication', () => {
-    function publishHarness(entries: Array<Record<string, unknown>>) {
+    function publishHarness(entries: Array<Record<string, unknown>>, expenseClaims: Array<Record<string, any>> = []) {
+      const expenseClaimStore: Array<Record<string, any>> = expenseClaims.map((claim) => ({
+        tenantId: 'tenant-1',
+        status: 'APPROVED',
+        reimbursementMethod: 'PAYROLL',
+        reimbursedInPayrollRunId: null,
+        ...claim,
+      }));
       const prisma = {
         payslip: { upsert: jest.fn().mockResolvedValue({}) },
         payrollRun: { update: jest.fn().mockResolvedValue({}) },
-        expenseClaim: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+        // Matched against the real `where`, so publication can only pay out the claims the
+        // publishing run actually owns.
+        expenseClaim: {
+          updateMany: jest.fn(({ where, data }: { where: Record<string, any>; data: Record<string, any> }) => {
+            const matched = expenseClaimStore.filter((claim) =>
+              Object.entries(where).every(([key, value]) => claim[key] === value),
+            );
+            for (const claim of matched) Object.assign(claim, data);
+            return Promise.resolve({ count: matched.length });
+          }),
+        },
       };
       const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
-      return { prisma, service, entries };
+      return { prisma, service, entries, expenseClaimStore };
     }
 
     it('creates the payslip with the processed values on first publication', async () => {
@@ -2776,6 +3141,32 @@ describe('PayrollService', () => {
           publishedAt: expect.any(Date),
         }),
       );
+    });
+
+    it('marks the claims the publishing run owns as paid', async () => {
+      const { service, expenseClaimStore } = publishHarness([], [
+        { id: 'claim-1', employeeId: 'emp-1', reimbursedInPayrollRunId: 'run-2' },
+      ]);
+      jest.spyOn(service, 'getRun').mockResolvedValue({
+        id: 'run-2', month: 7, year: 2026, status: 'LOCKED', entries: [],
+      } as any);
+
+      await service.publishRun('tenant-1', 'run-2', 'user-1');
+
+      expect(expenseClaimStore[0]).toMatchObject({ status: 'PAID', decidedAt: expect.any(Date) });
+    });
+
+    it("does not mark another run's claim as paid", async () => {
+      const { service, expenseClaimStore } = publishHarness([], [
+        { id: 'claim-1', employeeId: 'emp-1', reimbursedInPayrollRunId: 'run-A' },
+      ]);
+      jest.spyOn(service, 'getRun').mockResolvedValue({
+        id: 'run-2', month: 7, year: 2026, status: 'LOCKED', entries: [],
+      } as any);
+
+      await service.publishRun('tenant-1', 'run-2', 'user-1');
+
+      expect(expenseClaimStore[0]).toMatchObject({ status: 'APPROVED', reimbursedInPayrollRunId: 'run-A' });
     });
 
     it('upserts once per employee and period without touching other rows', async () => {
