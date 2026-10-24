@@ -1062,6 +1062,254 @@ describe('PayrollService', () => {
     );
   });
 
+  describe('createRun overlap detection', () => {
+    /**
+     * Applies the real `where` `createRun` issues to run fixtures: tenant, period, run type,
+     * the exact-key fields the non-monthly branch still uses, and the `AND` of `OR` scope
+     * dimensions the monthly branch builds. Modelled rather than stubbed, so dropping the
+     * scope clauses (every run would then match, and the disjoint cases would start failing) or
+     * adding `payGroup` as a scope discriminator (the pay-group case would start passing) both
+     * break these tests.
+     */
+    function matchesRunWhere(run: Record<string, any>, where: Record<string, any>): boolean {
+      if (run.tenantId !== where.tenantId) return false;
+      if (run.month !== where.month || run.year !== where.year) return false;
+      if (where.runType !== undefined && run.runType !== where.runType) return false;
+      for (const field of ['legalEntityId', 'locationId', 'payGroup'] as const) {
+        if (where[field] !== undefined && (run[field] ?? null) !== where[field]) return false;
+      }
+      if (where.status?.notIn?.includes(run.status)) return false;
+      const dimensions = (where.AND as Array<{ OR: Array<Record<string, unknown>> }>) ?? [];
+      return dimensions.every((dimension) =>
+        dimension.OR.some((option) =>
+          Object.entries(option).every(([key, value]) => (run[key] ?? null) === value),
+        ),
+      );
+    }
+
+    function createHarness(existingRuns: Array<Record<string, any>> = []) {
+      const runs = existingRuns.map((run, index) => ({
+        id: `run-${index + 1}`,
+        tenantId: 'tenant-1',
+        month: 7,
+        year: 2026,
+        runType: 'MONTHLY',
+        status: 'REVIEW',
+        legalEntityId: null,
+        locationId: null,
+        payGroup: null,
+        ...run,
+      }));
+      const prisma = {
+        payrollRun: {
+          findFirst: jest.fn(({ where }: { where: Record<string, any> }) =>
+            Promise.resolve(runs.find((run) => matchesRunWhere(run, where)) ?? null),
+          ),
+          create: jest.fn(({ data }: { data: Record<string, unknown> }) =>
+            Promise.resolve({ id: 'run-new', status: 'DRAFT', ...data }),
+          ),
+        },
+        auditLog: { create: jest.fn().mockResolvedValue({}) },
+      };
+      return {
+        prisma,
+        service: new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any),
+      };
+    }
+
+    const newRun = (overrides: Record<string, unknown> = {}) => ({ month: 7, year: 2026, ...overrides }) as never;
+
+    it('still rejects an identical monthly scope', async () => {
+      const { prisma, service } = createHarness([{}]);
+
+      await expect(service.createRun('tenant-1', newRun(), 'user-1')).rejects.toThrow(
+        'already covers these employees',
+      );
+      expect(prisma.payrollRun.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a location-scoped run when a tenant-wide run already exists', async () => {
+      const { prisma, service } = createHarness([{ locationId: null }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ locationId: 'loc-b' }), 'user-1'),
+      ).rejects.toThrow('already covers these employees (run run-1, tenant-wide, review)');
+      expect(prisma.payrollRun.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a tenant-wide run when a location-scoped run already exists', async () => {
+      const { prisma, service } = createHarness([{ locationId: 'loc-b' }]);
+
+      await expect(service.createRun('tenant-1', newRun(), 'user-1')).rejects.toThrow(
+        'location loc-b',
+      );
+      expect(prisma.payrollRun.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects an entity-scoped run when a tenant-wide run already exists', async () => {
+      const { service } = createHarness([{ legalEntityId: null }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ legalEntityId: 'entity-1' }), 'user-1'),
+      ).rejects.toThrow('tenant-wide');
+    });
+
+    it('rejects a tenant-wide run when an entity-scoped run already exists', async () => {
+      const { service } = createHarness([{ legalEntityId: 'entity-1' }]);
+
+      await expect(service.createRun('tenant-1', newRun(), 'user-1')).rejects.toThrow(
+        'legal entity entity-1',
+      );
+    });
+
+    it('rejects a run differing only by pay group: it covers the same employees', async () => {
+      const { prisma, service } = createHarness([{ payGroup: 'India Monthly A' }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ payGroup: 'India Monthly B' }), 'user-1'),
+      ).rejects.toThrow('already covers these employees');
+      expect(prisma.payrollRun.create).not.toHaveBeenCalled();
+    });
+
+    it('allows a different location under the same entity', async () => {
+      const { prisma, service } = createHarness([{ legalEntityId: 'entity-1', locationId: 'loc-a' }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ legalEntityId: 'entity-1', locationId: 'loc-b' }), 'user-1'),
+      ).resolves.toMatchObject({ id: 'run-new' });
+      expect(prisma.payrollRun.create).toHaveBeenCalled();
+    });
+
+    it('allows a different entity at the same location', async () => {
+      const { prisma, service } = createHarness([{ legalEntityId: 'entity-1', locationId: 'loc-a' }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ legalEntityId: 'entity-2', locationId: 'loc-a' }), 'user-1'),
+      ).resolves.toMatchObject({ id: 'run-new' });
+      expect(prisma.payrollRun.create).toHaveBeenCalled();
+    });
+
+    it('allows two disjoint locations with no entity scope', async () => {
+      const { service } = createHarness([{ locationId: 'loc-a' }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ locationId: 'loc-b' }), 'user-1'),
+      ).resolves.toMatchObject({ id: 'run-new' });
+    });
+
+    it('allows two disjoint entities with no location scope', async () => {
+      const { service } = createHarness([{ legalEntityId: 'entity-1' }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ legalEntityId: 'entity-2' }), 'user-1'),
+      ).resolves.toMatchObject({ id: 'run-new' });
+    });
+
+    it('rejects when the entity matches and the existing run is location-wide', async () => {
+      // Only one dimension differs, and the other is unscoped on the existing run - so the
+      // existing run does cover this entity at this location.
+      const { service } = createHarness([{ legalEntityId: 'entity-1', locationId: null }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ legalEntityId: 'entity-1', locationId: 'loc-b' }), 'user-1'),
+      ).rejects.toThrow('legal entity entity-1');
+    });
+
+    it('allows a scoped run when the entity dimension is disjoint even though the location matches', async () => {
+      const { service } = createHarness([{ legalEntityId: 'entity-1', locationId: null }]);
+
+      await expect(
+        service.createRun('tenant-1', newRun({ legalEntityId: 'entity-2', locationId: 'loc-b' }), 'user-1'),
+      ).resolves.toMatchObject({ id: 'run-new' });
+    });
+
+    it.each(['OFF_CYCLE', 'FULL_AND_FINAL'])(
+      'lets a %s run coexist with a monthly run for the same period',
+      async (runType) => {
+        const { prisma, service } = createHarness([{ runType: 'MONTHLY' }]);
+
+        await expect(
+          service.createRun('tenant-1', newRun({ runType }), 'user-1'),
+        ).resolves.toMatchObject({ id: 'run-new' });
+        expect(prisma.payrollRun.create).toHaveBeenCalled();
+      },
+    );
+
+    it.each(['OFF_CYCLE', 'FULL_AND_FINAL'])(
+      'still refuses a second %s run of identical scope that is not closed',
+      async (runType) => {
+        const { service } = createHarness([{ runType, status: 'REVIEW' }]);
+
+        await expect(service.createRun('tenant-1', newRun({ runType }), 'user-1')).rejects.toThrow(
+          'A matching payroll run already exists for this period',
+        );
+      },
+    );
+
+    it.each(['OFF_CYCLE', 'FULL_AND_FINAL'])(
+      'still allows a %s run once the previous one is closed, as before',
+      async (runType) => {
+        const { service } = createHarness([{ runType, status: 'CLOSED' }]);
+
+        await expect(
+          service.createRun('tenant-1', newRun({ runType }), 'user-1'),
+        ).resolves.toMatchObject({ id: 'run-new' });
+      },
+    );
+
+    it.each(['LOCKED', 'PUBLISHED', 'CLOSED'])(
+      'blocks a monthly run when the overlapping run is %s',
+      async (status) => {
+        const { prisma, service } = createHarness([{ status }]);
+
+        await expect(service.createRun('tenant-1', newRun(), 'user-1')).rejects.toThrow(
+          `already covers these employees (run run-1, tenant-wide, ${status.toLowerCase()})`,
+        );
+        expect(prisma.payrollRun.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not block on a monthly run for a different month', async () => {
+      const { service } = createHarness([{ month: 6 }]);
+
+      await expect(service.createRun('tenant-1', newRun(), 'user-1')).resolves.toMatchObject({
+        id: 'run-new',
+      });
+    });
+
+    it("never blocks on another tenant's run", async () => {
+      const { prisma, service } = createHarness([{ tenantId: 'tenant-2' }]);
+
+      await expect(service.createRun('tenant-1', newRun(), 'user-1')).resolves.toMatchObject({
+        id: 'run-new',
+      });
+      expect(prisma.payrollRun.create).toHaveBeenCalled();
+    });
+
+    it('creates the run with its scope and pay group stored unchanged', async () => {
+      const { prisma, service } = createHarness();
+
+      await service.createRun(
+        'tenant-1',
+        newRun({ legalEntityId: 'entity-1', locationId: 'loc-b', payGroup: 'India Monthly', notes: 'July' }),
+        'user-1',
+      );
+
+      expect(prisma.payrollRun.create).toHaveBeenCalledWith({
+        data: {
+          tenantId: 'tenant-1',
+          month: 7,
+          year: 2026,
+          runType: 'MONTHLY',
+          legalEntityId: 'entity-1',
+          locationId: 'loc-b',
+          payGroup: 'India Monthly',
+          notes: 'July',
+        },
+      });
+    });
+  });
+
   describe('loan installments at lock', () => {
     /**
      * In-memory `loan_installments` honouring the real `@@unique([loanId, month, year])` and the

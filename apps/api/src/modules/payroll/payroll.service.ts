@@ -652,21 +652,90 @@ export class PayrollService {
     return { csv: toCsv(rows), period };
   }
 
+  /**
+   * The runs whose employees a new MONTHLY run would also pay.
+   *
+   * Compared on the scope each run *declares*, not on `PayrollRunEmployee`: a DRAFT run has no
+   * entries yet - `executeRun` only writes them once it has claimed the run into PROCESSING -
+   * and two DRAFT runs are exactly how a duplicate is set up. Declared scope is a faithful
+   * stand-in because `executeRun` selects employees by `Employee.legalEntityId` and
+   * `Employee.locationId` alone, so an unset dimension means "every employee".
+   *
+   * A null dimension therefore intersects every value of it, equal values intersect, and two
+   * different non-null values are disjoint. The two dimensions are combined with AND: a run
+   * scoped to one entity at one location overlaps another only where both dimensions do.
+   *
+   * `payGroup` is deliberately absent. It exists only on `PayrollRun` (there is no such column
+   * on `Employee`) and filters nothing in `executeRun`, so two runs differing only by pay group
+   * cover identical employees and must not slip through as separate scopes.
+   */
+  private monthlyScopeOverlapWhere(scope: {
+    legalEntityId: string | null;
+    locationId: string | null;
+  }): Prisma.PayrollRunWhereInput {
+    const dimensions: Prisma.PayrollRunWhereInput[] = [];
+    if (scope.legalEntityId) {
+      dimensions.push({ OR: [{ legalEntityId: null }, { legalEntityId: scope.legalEntityId }] });
+    }
+    if (scope.locationId) {
+      dimensions.push({ OR: [{ locationId: null }, { locationId: scope.locationId }] });
+    }
+    return dimensions.length > 0 ? { AND: dimensions } : {};
+  }
+
+  /** How a run's own scope reads in an error message. */
+  private describeRunScope(run: { legalEntityId: string | null; locationId: string | null }): string {
+    const parts = [
+      run.legalEntityId ? `legal entity ${run.legalEntityId}` : null,
+      run.locationId ? `location ${run.locationId}` : null,
+    ].filter(Boolean);
+    return parts.length ? parts.join(', ') : 'tenant-wide';
+  }
+
   async createRun(tenantId: string, dto: CreateRunDto, actorId?: string) {
     const runType = dto.runType ?? 'MONTHLY';
-    const existing = await this.prisma.payrollRun.findFirst({
-      where: {
-        tenantId,
-        month: dto.month,
-        year: dto.year,
-        runType,
-        legalEntityId: dto.legalEntityId ?? null,
-        locationId: dto.locationId ?? null,
-        payGroup: dto.payGroup ?? null,
-        status: { notIn: ['CLOSED'] },
-      },
-    });
-    if (existing) throw new BadRequestException('A matching payroll run already exists for this period');
+    const legalEntityId = dto.legalEntityId ?? null;
+    const locationId = dto.locationId ?? null;
+
+    if (runType === 'MONTHLY') {
+      // Any monthly run already covering these employees, `CLOSED` ones included: a closed run
+      // has already paid them, so repeating the month is the most expensive duplicate of all.
+      // Identical scope is the trivial case of an overlap, so this subsumes the old exact-key
+      // check for monthly runs.
+      const overlapping = await this.prisma.payrollRun.findFirst({
+        where: {
+          tenantId,
+          month: dto.month,
+          year: dto.year,
+          runType: 'MONTHLY',
+          ...this.monthlyScopeOverlapWhere({ legalEntityId, locationId }),
+        },
+      });
+      if (overlapping) {
+        throw new BadRequestException(
+          `A monthly payroll run for ${dto.year}-${String(dto.month).padStart(2, '0')} already covers ` +
+            `these employees (run ${overlapping.id}, ${this.describeRunScope(overlapping)}, ` +
+            `${overlapping.status.toLowerCase()}). Overlapping monthly runs would pay them twice.`,
+        );
+      }
+    } else {
+      // Off-cycle and full-and-final runs keep the behaviour they have always had: only an
+      // identical, still-open scope is refused. Their employee selection and calculation are
+      // unchanged, so overlap with a monthly run stays allowed.
+      const existing = await this.prisma.payrollRun.findFirst({
+        where: {
+          tenantId,
+          month: dto.month,
+          year: dto.year,
+          runType,
+          legalEntityId,
+          locationId,
+          payGroup: dto.payGroup ?? null,
+          status: { notIn: ['CLOSED'] },
+        },
+      });
+      if (existing) throw new BadRequestException('A matching payroll run already exists for this period');
+    }
     const created = await this.prisma.payrollRun.create({
       data: {
         tenantId,
