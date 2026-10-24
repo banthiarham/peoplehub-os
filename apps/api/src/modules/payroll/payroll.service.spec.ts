@@ -56,6 +56,8 @@ function buildProcessRunHarness(options: {
     days?: number;
     status?: string;
     tenantId?: string;
+    /** Set to mark the grant as already paid by a locked run, the way a claim records it. */
+    paidInPayrollRunId?: string | null;
   }>;
   /** Pre-existing manual/attendance-sourced variable inputs (e.g. OVERTIME, BONUS), seeded into the same store `COMP_OFF_PAYOUT` writes land in. */
   variableInputs?: Array<Record<string, unknown>>;
@@ -93,6 +95,8 @@ function buildProcessRunHarness(options: {
       update: jest.fn().mockResolvedValue(run),
       // The claim on the run's current status; count 1 means it was still in that status.
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      // `lockRun` reads the run back inside its transaction once the status has moved.
+      findFirstOrThrow: jest.fn().mockResolvedValue({ ...run, status: 'LOCKED' }),
     },
     employee: {
       findMany: jest.fn().mockResolvedValue(
@@ -304,18 +308,43 @@ function buildProcessRunHarness(options: {
     compOffGrant: {
       findMany: jest.fn(({ where }: { where: Record<string, any> }) => {
         if (where.status === 'AVAILABLE') {
-          return Promise.resolve(
-            (options.availableCompOffGrants ?? [])
-              .filter((grant) => (grant.tenantId ?? 'tenant-1') === where.tenantId)
-              .filter((grant) => (where.employeeId?.in ?? []).includes(grant.employeeId))
-              .filter((grant) => (grant.status ?? 'AVAILABLE') === where.status)
-              .map((grant, index) => ({
+          // `paidInPayrollRunId` is modelled, not ignored: `applyUnusedCompOffPayouts` reads
+          // this table twice with opposite senses of it - `null` for the grants it may pay,
+          // `{ not: null }` for the ones a locked run already owns and it must warn about.
+          // A fixture answering both reads identically would hide the filter entirely.
+          const ownedOnly = where.paidInPayrollRunId?.not === null;
+          // Keyed off the clause the query actually carries, never off which read this is.
+          // Answering as though the filter were always present would make the filter itself
+          // untestable: deleting it from production would leave every test still green.
+          const matchesOwnership = (grant: { paidInPayrollRunId?: string | null }) => {
+            if (!('paidInPayrollRunId' in where)) return true;
+            if (where.paidInPayrollRunId === null) return !grant.paidInPayrollRunId;
+            if (ownedOnly) return Boolean(grant.paidInPayrollRunId);
+            return true;
+          };
+          const matching = (options.availableCompOffGrants ?? [])
+            .filter((grant) => (grant.tenantId ?? 'tenant-1') === where.tenantId)
+            .filter((grant) => (where.employeeId?.in ?? []).includes(grant.employeeId))
+            .filter((grant) => (grant.status ?? 'AVAILABLE') === where.status)
+            .filter(matchesOwnership);
+
+          if (ownedOnly) {
+            return Promise.resolve(
+              matching.map((grant, index) => ({
                 id: grant.id ?? `grant-${index}`,
                 employeeId: grant.employeeId,
-                earnedDate: grant.earnedDate,
-                expiresAt: grant.expiresAt ?? null,
-                days: grant.days ?? 1,
+                paidInPayrollRunId: grant.paidInPayrollRunId ?? null,
               })),
+            );
+          }
+          return Promise.resolve(
+            matching.map((grant, index) => ({
+              id: grant.id ?? `grant-${index}`,
+              employeeId: grant.employeeId,
+              earnedDate: grant.earnedDate,
+              expiresAt: grant.expiresAt ?? null,
+              days: grant.days ?? 1,
+            })),
           );
         }
         return Promise.resolve(
@@ -328,7 +357,13 @@ function buildProcessRunHarness(options: {
         );
       }),
     },
-    $transaction: jest.fn((ops: Array<Promise<unknown>>) => Promise.all(ops)),
+    // Both forms: the batch array `applyUnusedCompOffPayouts` uses, and the interactive
+    // callback `lockRun` wraps its comp-off claim and status transition in. The callback is
+    // handed this same client, so a claim it writes is visible to the rest of the harness -
+    // there is no rollback here, which is the one thing this double cannot model.
+    $transaction: jest.fn((arg: any): Promise<any> =>
+      typeof arg === 'function' ? arg(prisma as any) : Promise.all(arg),
+    ),
   };
   const calculator = {
     calculateMonth: jest.fn().mockReturnValue({
@@ -1012,6 +1047,7 @@ describe('PayrollService', () => {
       payrollRunEmployee: {
         findMany: jest.fn().mockResolvedValue([{ errors: ['Missing active salary structure or CTC'] }]),
       },
+      payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
     };
     const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
@@ -1033,6 +1069,7 @@ describe('PayrollService', () => {
       payrollRunEmployee: {
         findMany: jest.fn().mockResolvedValue([{ errors: [] }]),
       },
+      payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
     };
     const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
@@ -1054,6 +1091,7 @@ describe('PayrollService', () => {
       payrollRunEmployee: {
         findMany: jest.fn().mockResolvedValue([{ errors: [], warnings: ['PAN missing'] }]),
       },
+      payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
     };
     const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
@@ -1373,6 +1411,22 @@ describe('PayrollService', () => {
         },
       };
 
+      // `lockRun` also runs its comp-off claim and its status transition inside a transaction,
+      // so the transaction client has to answer those too. This harness carries no comp-off
+      // payout, which is the ordinary case: the claim finds no grant ids and returns early.
+      const runTables = {
+        payrollRun: {
+          findFirst: jest.fn().mockResolvedValue({ status: 'APPROVED' }),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+          findFirstOrThrow: jest.fn().mockResolvedValue({ id: 'run-1', status: 'LOCKED' }),
+        },
+        payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
+        compOffGrant: {
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+          findMany: jest.fn().mockResolvedValue([]),
+        },
+      };
+
       const prisma = {
         payrollRun: {
           findFirst: jest.fn().mockResolvedValue({ id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED', month: 7, year: 2026 }),
@@ -1383,13 +1437,14 @@ describe('PayrollService', () => {
             { employeeId: 'emp-1', components: [{ code: 'LOAN_EMI', monthly: 1000 }] },
           ]),
         },
+        payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
         ...client,
         // Interactive transaction with rollback: the store is snapshotted, and restored if the
         // callback rejects, which is what a real transaction gives this code.
         $transaction: jest.fn(async (fn: any) => {
           const snapshot = installments.map((row) => ({ ...row }));
           try {
-            return await fn(client);
+            return await fn({ ...client, ...runTables });
           } catch (error) {
             installments = snapshot;
             throw error;
@@ -1717,6 +1772,7 @@ describe('PayrollService', () => {
             },
           ]),
         },
+        payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
       };
       const service = new PayrollService(prisma as any, {} as any, {} as any, stubDenominators() as any, {} as any);
 
@@ -2922,6 +2978,114 @@ describe('PayrollService', () => {
         expect(lastCreateCall[0].data).toHaveLength(1);
         expect(lastCreateCall[0].data[0]).toMatchObject({
           metadata: { grantIds: ['grant-annual'], days: 1 },
+        });
+      });
+
+      it('15h-bis. reprocessing after the grant was decided drops the payout and leaves no claim', async () => {
+        // The release path the approval gate points at. `applyUnusedCompOffPayouts` deletes
+        // every payout it owns before re-deciding eligibility, so a grant that left AVAILABLE
+        // between the two runs takes its payout with it rather than stranding a claim that
+        // would go on blocking the grant - and the gross drops back to the plain month.
+        const grant = {
+          id: 'grant-annual',
+          employeeId: 'emp-1',
+          earnedDate: EARNED_FEB_2024,
+          expiresAt: DEFAULT_90_DAY_EXPIRY,
+          days: 1,
+        };
+        const base = {
+          run: { month: 12, year: 2024 },
+          finalizations: finalized(12, 2024),
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+        };
+
+        const paid = buildProcessRunHarness({ ...base, availableCompOffGrants: [grant] });
+        await paid.service.processRun('tenant-1', 'run-1');
+        expect(payoutCreates(paid.prisma)).toHaveLength(1);
+        expect(paid.entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
+
+        // The same run reprocessed once the grant is USED: the query filters on AVAILABLE, so
+        // it no longer comes back at all.
+        const decided = buildProcessRunHarness({
+          ...base,
+          run: { ...base.run, status: 'REVIEW' },
+          availableCompOffGrants: [{ ...grant, status: 'USED' }],
+        });
+        await decided.service.reprocessRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(decided.prisma)).toHaveLength(0);
+        expect(decided.prisma.payrollVariableInput.deleteMany).toHaveBeenCalledWith({
+          where: { tenantId: 'tenant-1', payrollRunId: 'run-1', type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
+        });
+        expect(decided.entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      });
+
+      /**
+       * The ownership column, on the generation side.
+       *
+       * `lockRun` writes `paidInPayrollRunId` when a run finalizes, and every later run filters
+       * on it. That filter is the only thing standing between a locked run's grant and a second
+       * payout, so it needs its own coverage - and so does the warning, which the filter would
+       * otherwise swallow by removing the grant before the loop that produces it.
+       */
+      describe('a grant a locked run already owns', () => {
+        const ownedBase = {
+          run: { month: 12, year: 2024 },
+          finalizations: finalized(12, 2024),
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+        };
+        const ownedGrant = {
+          id: 'grant-owned',
+          employeeId: 'emp-1',
+          earnedDate: EARNED_FEB_2024,
+          expiresAt: DEFAULT_90_DAY_EXPIRY,
+          days: 1,
+        };
+
+        it('15j. is not paid again, and the run reports no payout at all', async () => {
+          const { service, prisma, entryFor } = buildProcessRunHarness({
+            ...ownedBase,
+            availableCompOffGrants: [{ ...ownedGrant, paidInPayrollRunId: 'run-locked' }],
+          });
+
+          await service.processRun('tenant-1', 'run-1');
+
+          expect(payoutCreates(prisma)).toHaveLength(0);
+          // Plain month: no second COMP_OFF_PAYOUT reached gross pay.
+          expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+        });
+
+        it('15k. still tells the operator which run paid it', async () => {
+          const { service, entryFor } = buildProcessRunHarness({
+            ...ownedBase,
+            availableCompOffGrants: [{ ...ownedGrant, paidInPayrollRunId: 'run-locked' }],
+          });
+
+          await service.processRun('tenant-1', 'run-1');
+
+          expect(entryFor('emp-1').warnings).toContainEqual(
+            expect.stringContaining('Unused comp-off grant-owned was already paid out in payroll run run-locked'),
+          );
+        });
+
+        it('15l. an unowned grant beside it is still paid normally', async () => {
+          // The filter must remove exactly the owned grant, not the employee's whole balance.
+          const { service, prisma, entryFor } = buildProcessRunHarness({
+            ...ownedBase,
+            availableCompOffGrants: [
+              { ...ownedGrant, paidInPayrollRunId: 'run-locked' },
+              { ...ownedGrant, id: 'grant-free', paidInPayrollRunId: null },
+            ],
+          });
+
+          await service.processRun('tenant-1', 'run-1');
+
+          const creates = payoutCreates(prisma);
+          expect(creates).toHaveLength(1);
+          expect(creates[0]).toMatchObject({ metadata: { grantIds: ['grant-free'], days: 1 } });
+          expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
         });
       });
 
@@ -4902,8 +5066,10 @@ describe('payroll reprocess and policy staleness', () => {
 
       await h.service.lockRun('tenant-1', 'run-1', 'user-1');
 
-      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({
-        where: { id: 'run-1' },
+      // Gated on the prior status rather than a bare update by id: the transition is what
+      // makes the comp-off claim taken alongside it all-or-nothing.
+      expect(h.prisma.payrollRun.updateMany).toHaveBeenCalledWith({
+        where: { id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED' },
         data: expect.objectContaining({ status: 'LOCKED', lockedById: 'user-1' }),
       });
     });
@@ -4919,8 +5085,8 @@ describe('payroll reprocess and policy staleness', () => {
 
       await h.service.lockRun('tenant-1', 'run-1', 'user-1');
 
-      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({
-        where: { id: 'run-1' },
+      expect(h.prisma.payrollRun.updateMany).toHaveBeenCalledWith({
+        where: { id: 'run-1', tenantId: 'tenant-1', status: 'APPROVED' },
         data: expect.objectContaining({ status: 'LOCKED' }),
       });
     });
@@ -4997,8 +5163,8 @@ describe('payroll reprocess and policy staleness', () => {
       (h.prisma.payrollRunEmployee.findMany as jest.Mock).mockResolvedValue([]);
       (h.prisma.payrollRun.findFirst as jest.Mock).mockResolvedValue(legacyRun('APPROVED'));
       await h.service.lockRun('tenant-1', 'run-legacy', 'user-1');
-      expect(h.prisma.payrollRun.update).toHaveBeenCalledWith({
-        where: { id: 'run-legacy' },
+      expect(h.prisma.payrollRun.updateMany).toHaveBeenCalledWith({
+        where: { id: 'run-legacy', tenantId: 'tenant-1', status: 'APPROVED' },
         data: expect.objectContaining({ status: 'LOCKED' }),
       });
     });

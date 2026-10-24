@@ -1331,6 +1331,17 @@ model CompOffGrant {
   /// `status: USED`; null for every other status.
   usedOnDate               DateTime?     @db.Date
   status                   CompOffStatus @default(AVAILABLE)
+  /// The payroll run that actually paid this grant out as unused comp-off, set when that run
+  /// is locked and never before. It is the database-enforced half of the "a grant is either
+  /// used or paid, never both" rule: `decideCompOff` claims the grant only while this is null,
+  /// and `lockRun` claims it only while the grant is still AVAILABLE, so the two race on one
+  /// row and exactly one wins. A generated `COMP_OFF_PAYOUT` input still records which grants
+  /// a run *intends* to pay (`metadata.grantIds`); this records which run actually did.
+  ///
+  /// Deliberately a plain column with no relation, exactly like
+  /// `ExpenseClaim.reimbursedInPayrollRunId`: a finalized payout claim must not be silently
+  /// released by anything that happens to the run row afterwards.
+  paidInPayrollRunId       String?
   notes                    String?
   createdAt                DateTime      @default(now())
   updatedAt                DateTime      @updatedAt
@@ -1341,6 +1352,7 @@ model CompOffGrant {
 
   @@index([tenantId])
   @@index([employeeId])
+  @@index([paidInPayrollRunId])
   @@map("comp_off_grants")
 }
 

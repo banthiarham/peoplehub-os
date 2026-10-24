@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AgeCategory, CompOffUsagePeriod, Prisma } from '@prisma/client';
+import { AgeCategory, CompOffStatus, CompOffUsagePeriod, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
@@ -1245,6 +1245,7 @@ export class PayrollService {
     if (!run) throw new NotFoundException('Payroll run not found');
     if (run.status !== 'REVIEW') throw new BadRequestException('Run must be in REVIEW to approve');
     if (await this.isPolicyStale(tenantId, run)) throw new BadRequestException(POLICY_STALE_MESSAGE);
+    await this.assertCompOffPayoutsCurrent(tenantId, run);
     const entries = await this.prisma.payrollRunEmployee.findMany({
       where: { payrollRunId: id },
       select: { errors: true, warnings: true },
@@ -1268,6 +1269,61 @@ export class PayrollService {
     });
     await this.audit(tenantId, userId, 'PAYROLL_RUN_APPROVED', 'PayrollRun', id, run, updated);
     return updated;
+  }
+
+  /**
+   * Refuses to advance a run whose Comp-Off payouts no longer match the grants they were
+   * computed from.
+   *
+   * `applyUnusedCompOffPayouts` pays a grant that was still `AVAILABLE` at its closure month.
+   * `AttendanceService.decideCompOff` deliberately lets that grant still be marked `USED`,
+   * `CANCELLED` or `EXPIRED` while the run can be reprocessed - that is how a late correction
+   * ("the employee did take that day after all") is meant to reach payroll, and blocking it
+   * outright would strand the grant: reprocessing re-reads a grant that is still `AVAILABLE`
+   * and recreates the very same payout, so a decision-time block would have no release path.
+   *
+   * What was missing is the other half of that bargain. Nothing forced the reprocess, so a
+   * run could be approved and locked still carrying a payout for a grant since marked `USED` -
+   * paying the grant *and* offsetting the LOP of the day it was spent on, the one outcome the
+   * whole design exists to prevent. Locking is the point of no return (`lockRun` records loan
+   * installments and `PAYROLL_PERIOD_LOCK_STATUSES` freezes attendance from there on), so the
+   * mismatch has to be caught before it, not after.
+   *
+   * Same shape as {@link isPolicyStale}, deliberately: nothing is recalculated here and no
+   * decision is reversed - the run simply refuses to advance until it is reprocessed, which
+   * drops the payout for a grant that is no longer eligible. A grant that is still `AVAILABLE`
+   * is still payable and passes, so an untouched run advances exactly as before.
+   */
+  private async assertCompOffPayoutsCurrent(
+    tenantId: string,
+    run: { id: string },
+  ): Promise<void> {
+    const payouts = await this.prisma.payrollVariableInput.findMany({
+      where: { tenantId, payrollRunId: run.id, type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
+      select: { metadata: true },
+    });
+    const claimedIds = [...new Set(payouts.flatMap((payout) => this.compOffPayoutGrantIds(payout.metadata)))];
+    if (!claimedIds.length) return;
+
+    // Tenant-scoped like every other grant read here, so a payout naming an id from another
+    // tenant resolves to nothing rather than to that tenant's grant.
+    const grants = await this.prisma.compOffGrant.findMany({
+      where: { tenantId, id: { in: claimedIds } },
+      select: { id: true, status: true },
+    });
+    const statusById = new Map(grants.map((grant) => [grant.id, grant.status]));
+    const stale = claimedIds
+      // A claimed id with no grant behind it counts as stale too: whatever it was, this run
+      // can no longer show that it is paying an unused grant.
+      .map((id) => ({ id, status: statusById.get(id) ?? 'MISSING' }))
+      .filter((grant) => grant.status !== CompOffStatus.AVAILABLE);
+    if (!stale.length) return;
+
+    const described = stale.map((grant) => `${grant.id} (${grant.status.toLowerCase()})`).join(', ');
+    throw new BadRequestException(
+      `This run pays unused comp-off for ${stale.length} grant(s) that changed since it was ` +
+        `processed: ${described}. Reprocess the run so the payout matches, then try again.`,
+    );
   }
 
   /**
@@ -1308,6 +1364,75 @@ export class PayrollService {
     return updated;
   }
 
+  /**
+   * Takes finalized ownership of every grant this run's `COMP_OFF_PAYOUT` inputs name, and
+   * refuses the lock unless it gets all of them.
+   *
+   * This is the enforcement the surrounding checks cannot provide. {@link
+   * assertCompOffPayoutsCurrent} reads the grants and then the caller writes, in separate
+   * statements under Read Committed, so a `decideCompOff` committing in between left the run
+   * locked while paying a grant that had just been consumed. Here the check *is* the write:
+   * one conditional `updateMany` matching only grants that are still `AVAILABLE` and still
+   * unclaimed, which takes a row lock on each. A concurrent `decideCompOff` - whose own update
+   * is equally conditional on `paidInPayrollRunId: null` - either commits first and makes this
+   * claim match fewer rows, or blocks on the lock and then matches nothing. Either way exactly
+   * one of the two wins, and the loser is told so.
+   *
+   * All-or-nothing by row count: a short count aborts the enclosing transaction, so a run
+   * never ends up owning half the grants it was going to pay. `grantIds` is de-duplicated
+   * first, because the expected count is a count of distinct rows - a grant repeated inside
+   * one payout's metadata (or named by two of this run's own inputs) must not inflate it.
+   *
+   * Scoped to the run's own tenant, so a payout naming a grant id from another tenant claims
+   * nothing and is reported as missing rather than reaching across the boundary.
+   */
+  private async claimCompOffGrantsForRun(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    run: { id: string },
+  ): Promise<void> {
+    const payouts = await tx.payrollVariableInput.findMany({
+      where: { tenantId, payrollRunId: run.id, type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF' },
+      select: { metadata: true },
+    });
+    const grantIds = [...new Set(payouts.flatMap((payout) => this.compOffPayoutGrantIds(payout.metadata)))];
+    if (!grantIds.length) return;
+
+    // Ordered, so every run claims overlapping grants in the same sequence and two runs
+    // racing for the same pair cannot each hold one row while waiting for the other.
+    grantIds.sort();
+
+    const claimed = await tx.compOffGrant.updateMany({
+      where: {
+        id: { in: grantIds },
+        tenantId,
+        status: CompOffStatus.AVAILABLE,
+        paidInPayrollRunId: null,
+      },
+      data: { paidInPayrollRunId: run.id },
+    });
+    if (claimed.count === grantIds.length) return;
+
+    // Read back only to name what went wrong; the count above is what decided it.
+    const blocking = await tx.compOffGrant.findMany({
+      where: { tenantId, id: { in: grantIds }, paidInPayrollRunId: { not: run.id } },
+      select: { id: true, status: true, paidInPayrollRunId: true },
+    });
+    const found = new Set(blocking.map((grant) => grant.id));
+    const described = [
+      ...blocking.map((grant) =>
+        grant.paidInPayrollRunId
+          ? `${grant.id} (already paid by run ${grant.paidInPayrollRunId})`
+          : `${grant.id} (${grant.status.toLowerCase()})`,
+      ),
+      ...grantIds.filter((grantId) => !found.has(grantId)).map((grantId) => `${grantId} (missing)`),
+    ];
+    throw new ConflictException(
+      `This run can no longer pay unused comp-off for ${described.length} grant(s): ` +
+        `${described.join(', ')}. Reprocess the run so the payout matches, then lock it again.`,
+    );
+  }
+
   async lockRun(tenantId: string, id: string, userId: string) {
     const run = await this.prisma.payrollRun.findFirst({ where: { id, tenantId } });
     if (!run) throw new NotFoundException('Payroll run not found');
@@ -1316,11 +1441,46 @@ export class PayrollService {
     // records loan installments, which cannot be undone by reprocessing afterwards.
     if (await this.isPolicyStale(tenantId, run)) throw new BadRequestException(POLICY_STALE_MESSAGE);
     if (run.status !== 'APPROVED') throw new BadRequestException('Run must be APPROVED before locking');
+    // Re-checked here and not only at approval: a grant can be decided in the window between
+    // the two, and locking is what makes the payout unrecoverable. Advisory - it reports the
+    // mismatch in the operator's language - while the claim below is what actually enforces it.
+    await this.assertCompOffPayoutsCurrent(tenantId, run);
+
+    // Deliberately outside the transaction below, and deliberately before it. Each loan takes
+    // its own interactive transaction, which cannot nest inside another, and a run with many
+    // borrowers would otherwise hold the comp-off row locks for the whole loop. Running it
+    // first keeps the ordering this method has always had: a failure here leaves the run
+    // APPROVED with some installments recorded, which is safe because `(loanId, month, year)`
+    // makes every one of them idempotent on the retry - the same tolerance locking already
+    // relied on. Nothing it writes depends on the comp-off claim, and nothing in the claim
+    // depends on it.
     await this.recordLoanInstallmentsForRun(run);
-    const updated = await this.prisma.payrollRun.update({
-      where: { id },
-      data: { status: 'LOCKED', lockedAt: new Date(), lockedById: userId },
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Re-read inside the transaction rather than trusting the row fetched above: the status
+      // that matters is the one holding when the claim is taken, not when the request arrived.
+      const current = await tx.payrollRun.findFirst({ where: { id, tenantId }, select: { status: true } });
+      if (!current) throw new NotFoundException('Payroll run not found');
+      if (current.status !== 'APPROVED') {
+        throw new ConflictException(
+          `Payroll run is ${current.status.toLowerCase()}; reload it to see where it stands.`,
+        );
+      }
+
+      await this.claimCompOffGrantsForRun(tx, tenantId, { id });
+
+      // Conditional on the status the claim was taken against, so two simultaneous locks
+      // cannot both move the run - and the loser's claims roll back with its transaction.
+      const moved = await tx.payrollRun.updateMany({
+        where: { id, tenantId, status: 'APPROVED' },
+        data: { status: 'LOCKED', lockedAt: new Date(), lockedById: userId },
+      });
+      if (moved.count === 0) {
+        throw new ConflictException('Payroll run changed while it was being locked; reload and try again');
+      }
+      return tx.payrollRun.findFirstOrThrow({ where: { id } });
     });
+
     await this.audit(tenantId, userId, 'PAYROLL_RUN_LOCKED', 'PayrollRun', id, run, updated);
     return updated;
   }
@@ -1908,9 +2068,36 @@ export class PayrollService {
       return skippedByEmployee;
     }
 
+    // `paidInPayrollRunId` excludes a grant some locked run already owns. That ownership is a
+    // committed column rather than a value read out of another run's JSON, so unlike the
+    // `metadata.grantIds` check below it cannot be raced: the claim is only ever taken at
+    // lock time, and once taken it is visible to every later read. The JSON check still runs,
+    // because it also covers runs that have generated a payout but not yet locked - those
+    // hold no claim at all, which is what keeps a REVIEW run from stranding a grant.
     const grants = await this.prisma.compOffGrant.findMany({
-      where: { tenantId, employeeId: { in: employeeIds }, status: 'AVAILABLE' },
+      where: {
+        tenantId,
+        employeeId: { in: employeeIds },
+        status: 'AVAILABLE',
+        paidInPayrollRunId: null,
+      },
       select: { id: true, employeeId: true, earnedDate: true, expiresAt: true, days: true },
+    });
+
+    // The grants the filter above just removed, fetched once for the whole run rather than
+    // probed per grant. Excluding them from payout is the point; letting them disappear in
+    // silence is not. The operator needs the same "this was already paid, here is where"
+    // warning the `metadata.grantIds` check below produces for an unfinalized run - and needs
+    // it most in exactly this case, where the money has actually gone out. Tenant-scoped, so
+    // nothing here can name another tenant's grant or run.
+    const ownedGrants = await this.prisma.compOffGrant.findMany({
+      where: {
+        tenantId,
+        employeeId: { in: employeeIds },
+        status: 'AVAILABLE',
+        paidInPayrollRunId: { not: null },
+      },
+      select: { id: true, employeeId: true, paidInPayrollRunId: true },
     });
 
     // Payouts other runs hold for these employees. This run's own rows are excluded, so the
@@ -1948,6 +2135,26 @@ export class PayrollService {
       return policy;
     };
 
+    const warnSkipped = (employeeId: string, grantId: string, owner: string) => {
+      skippedByEmployee.set(employeeId, [
+        ...(skippedByEmployee.get(employeeId) ?? []),
+        `Unused comp-off ${grantId} was already paid out in ${owner}; it is not paid again here`,
+      ]);
+    };
+
+    // Warned from the owning column, not from the loop below, because these grants were
+    // already filtered out of `grants`. The run's status comes from the payout input that
+    // caused the claim, which is normally still there - and when it is not, the run id alone
+    // still tells the operator where to look.
+    for (const owned of ownedGrants) {
+      const status = claimedGrants.get(owned.id)?.status;
+      warnSkipped(
+        owned.employeeId,
+        owned.id,
+        `payroll run ${owned.paidInPayrollRunId}${status ? ` (${status.toLowerCase()})` : ''}`,
+      );
+    }
+
     const eligibleByEmployee = new Map<string, { days: number; grantIds: string[] }>();
     for (const grant of grants) {
       const claim = claimedGrants.get(grant.id);
@@ -1955,10 +2162,7 @@ export class PayrollService {
         const owner = claim.runId
           ? `payroll run ${claim.runId}${claim.status ? ` (${claim.status.toLowerCase()})` : ''}`
           : 'another payroll run';
-        skippedByEmployee.set(grant.employeeId, [
-          ...(skippedByEmployee.get(grant.employeeId) ?? []),
-          `Unused comp-off ${grant.id} was already paid out in ${owner}; it is not paid again here`,
-        ]);
+        warnSkipped(grant.employeeId, grant.id, owner);
         continue;
       }
       const policy = await resolvePolicy(grant.employeeId);

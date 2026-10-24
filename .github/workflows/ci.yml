@@ -69,6 +69,11 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://peoplehub:peoplehub_secret@localhost:5432/peoplehub_os_test
+      # Opt-in switch for the suites that run against a real PostgreSQL rather than a Prisma
+      # mock. They skip themselves unless this names the dedicated peoplehub_os_test database,
+      # so an ordinary local `npm test` can never write fixtures into a developer's own
+      # database - only this job, whose database is created and migrated from scratch above.
+      TEST_DATABASE_URL: postgresql://peoplehub:peoplehub_secret@localhost:5432/peoplehub_os_test
       REDIS_URL: redis://localhost:6379
       NEXTAUTH_SECRET: ci-test-secret-at-least-32-characters-long
       NODE_ENV: test

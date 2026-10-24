@@ -3428,8 +3428,14 @@ export class AttendanceService {
       `it can no longer be marked ${dto.status.toLowerCase()}`,
     );
 
+    // `paidInPayrollRunId: null` is the other half of the claim `PayrollService.lockRun` takes
+    // on the same row. Everything above - including `assertCompOffPayoutNotFrozen` - reads and
+    // then writes in separate statements, so under Read Committed a run locking in between
+    // would still have been able to pay a grant this call then consumed. Adding the condition
+    // here makes the two contend for one row: whichever conditional update commits first wins,
+    // and the other matches nothing. A grant no run has locked is unaffected.
     const { count } = await this.prisma.compOffGrant.updateMany({
-      where: { id, status: CompOffStatus.AVAILABLE },
+      where: { id, status: CompOffStatus.AVAILABLE, paidInPayrollRunId: null },
       data: {
         status: dto.status,
         ...(usedOnDate && { usedOnDate }),
@@ -3437,6 +3443,18 @@ export class AttendanceService {
       },
     });
     if (count === 0) {
+      // Re-read to say which of the two it was, rather than reporting every loss as a
+      // double decision.
+      const current = await this.prisma.compOffGrant.findFirst({
+        where: { id, tenantId: user.tenantId },
+        select: { paidInPayrollRunId: true },
+      });
+      if (current?.paidInPayrollRunId) {
+        throw new ConflictException(
+          `This comp-off was paid out by payroll run ${current.paidInPayrollRunId} while this ` +
+            `decision was in flight; it can no longer be marked ${dto.status.toLowerCase()}`,
+        );
+      }
       throw new ConflictException('This comp-off was already decided. Reload it to see where it stands.');
     }
     return this.prisma.compOffGrant.findFirstOrThrow({ where: { id } });

@@ -4700,8 +4700,10 @@ describe('manual comp-off grants', () => {
       usedOnDate: '2026-08-17',
     });
 
+    // `paidInPayrollRunId: null` is part of the condition, not incidental: it is what makes
+    // this update race safely against the claim `PayrollService.lockRun` takes on the same row.
     expect(prisma.compOffGrant.updateMany).toHaveBeenCalledWith({
-      where: { id: 'grant-1', status: 'AVAILABLE' },
+      where: { id: 'grant-1', status: 'AVAILABLE', paidInPayrollRunId: null },
       data: { status: 'USED', usedOnDate: new Date(Date.UTC(2026, 7, 17)) },
     });
     expect(result).toMatchObject({ status: 'USED', usedOnDate: new Date(Date.UTC(2026, 7, 17)) });
