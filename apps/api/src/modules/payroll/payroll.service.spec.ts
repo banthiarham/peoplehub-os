@@ -2604,8 +2604,9 @@ describe('PayrollService', () => {
     });
 
     it('14. carry-forward defers a closed-period grant to the run containing its own expiresAt', async () => {
-      // Dated safely past "today" (unlike expiresAt in test 15, which must be dated safely
-      // before it) so this stays valid for years regardless of when the suite actually runs.
+      // Dated in the future, which is no longer load-bearing: payout eligibility stopped
+      // reading the wall clock in Phase 4D. Test 15e covers this same rule on past dates,
+      // where the old `expiresAt < now` gate used to swallow the payout.
       const grantExpiresInAugust = new Date(Date.UTC(2035, 7, 15));
       const base = {
         payrollPolicies: policy({ compOffCarryForwardEnabled: true }),
@@ -2651,20 +2652,323 @@ describe('PayrollService', () => {
       expect(payoutCreates(december.prisma)).toHaveLength(1);
     });
 
-    it('15. expiresAt already passed at processing time excludes the grant even if its period closed this month', async () => {
-      const { service, prisma } = buildProcessRunHarness({
-        finalizations: finalizedJuly,
-        payrollPolicies: policy(),
-        employeeOverrides: basicSalary(26000),
-        // Period end (end of July) falls in this run, but expiresAt is already behind "today".
-        availableCompOffGrants: [
-          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: new Date(Date.UTC(2026, 7, 1)), days: 1 },
-        ],
+    /**
+     * A passed `expiresAt` never forfeits an unused grant (Phase 4D).
+     *
+     * `validateCompOffUsage` does not consult `expiresAt` for a usage inside the earned
+     * period, so a grant stays genuinely usable to the close of its usage window -
+     * `compOffClosureDate` - whatever `expiresAt` says. A grant still AVAILABLE at that
+     * close went unused through a window it was entitled to, which is exactly what the
+     * unused payout exists to settle.
+     *
+     * `applyUnusedCompOffPayouts` used to additionally skip any grant with
+     * `expiresAt < new Date()`. That fired in the ordinary case rather than an exotic one:
+     * the closure month's payroll runs at or after the end of that month, so any `expiresAt`
+     * at or before the window's close is already in the past by then. Under `ANNUAL` with
+     * the default 90-day auto-expiry it swallowed every payout.
+     *
+     * Every date below is fixed and historical, and the production path no longer reads the
+     * wall clock, so none of these outcomes depends on when the suite runs - which is what
+     * let the defect sit behind tests 13, 14 and 14b, all of which date their grants into
+     * the future.
+     */
+    describe('a passed expiresAt does not forfeit an unused grant', () => {
+      const finalized = (month: number, year: number) => [
+        { tenantId: 'tenant-1', month, year, locationId: null, status: 'FINALIZED' },
+      ];
+
+      // Earned 12 Feb 2024, auto-expiring 90 days later on 12 May 2024 - the default
+      // `COMP_OFF_VALIDITY_DAYS` window attendance actually writes.
+      const EARNED_FEB_2024 = new Date(Date.UTC(2024, 1, 12));
+      const DEFAULT_90_DAY_EXPIRY = new Date(Date.UTC(2024, 4, 12));
+
+      it('15. MONTHLY: pays in the closure month even though expiresAt has passed', async () => {
+        // The pre-4D expectation here was zero: period end (31 Jul) falls in this run, but
+        // expiresAt (1 Aug 2024) is behind "today". Usage was permitted through 31 Jul
+        // regardless of that date, the grant went unused, so July owes the payout.
+        const { service, prisma, entryFor } = buildProcessRunHarness({
+          run: { month: 7, year: 2024 },
+          finalizations: finalized(7, 2024),
+          payrollPolicies: policy(),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-monthly',
+              employeeId: 'emp-1',
+              earnedDate: new Date(Date.UTC(2024, 6, 5)),
+              expiresAt: new Date(Date.UTC(2024, 7, 1)),
+              days: 1,
+            },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        const creates = payoutCreates(prisma);
+        expect(creates).toHaveLength(1);
+        expect(creates[0]).toMatchObject({
+          tenantId: 'tenant-1',
+          employeeId: 'emp-1',
+          payrollRunId: 'run-1',
+          month: 7,
+          year: 2024,
+          type: 'COMP_OFF_PAYOUT',
+          source: 'COMP_OFF',
+          status: 'APPROVED',
+          taxable: true,
+          metadata: { grantIds: ['grant-monthly'], days: 1, dailyRate: 838.71 },
+        });
+        // 26 000 / 31 days = 838.71 for the one unused day, on top of the plain month.
+        expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
       });
 
-      await service.processRun('tenant-1', 'run-1');
+      it('15b. ANNUAL: pays at the December closure despite the default 90-day expiry', async () => {
+        // The headline defect: usable all through 2024 under ANNUAL, unused, and previously
+        // dropped by the December run because 12 May 2024 is long past by then.
+        const { service, prisma, entryFor } = buildProcessRunHarness({
+          run: { month: 12, year: 2024 },
+          finalizations: finalized(12, 2024),
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-annual',
+              employeeId: 'emp-1',
+              earnedDate: EARNED_FEB_2024,
+              expiresAt: DEFAULT_90_DAY_EXPIRY,
+              days: 1,
+            },
+          ],
+        });
 
-      expect(payoutCreates(prisma)).toHaveLength(0);
+        await service.processRun('tenant-1', 'run-1');
+
+        const creates = payoutCreates(prisma);
+        expect(creates).toHaveLength(1);
+        expect(creates[0]).toMatchObject({
+          employeeId: 'emp-1',
+          payrollRunId: 'run-1',
+          month: 12,
+          year: 2024,
+          type: 'COMP_OFF_PAYOUT',
+          source: 'COMP_OFF',
+          metadata: { grantIds: ['grant-annual'], days: 1, dailyRate: 838.71 },
+        });
+        expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
+      });
+
+      it('15c. ANNUAL: that same grant is still not paid by a run before the closure month', async () => {
+        // The closure-month rule is what keeps the payout to one run. Dropping the expiry
+        // gate must not turn "expired" into "payable by whichever run looks next".
+        const { service, prisma } = buildProcessRunHarness({
+          run: { month: 11, year: 2024 },
+          finalizations: finalized(11, 2024),
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-annual',
+              employeeId: 'emp-1',
+              earnedDate: EARNED_FEB_2024,
+              expiresAt: DEFAULT_90_DAY_EXPIRY,
+              days: 1,
+            },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(prisma)).toHaveLength(0);
+      });
+
+      it('15d. ANNUAL: an expiresAt after the annual close still closes at the period end', async () => {
+        // Unchanged behaviour: without carry-forward the window ends at the period end, so a
+        // longer expiresAt neither defers the payout nor splits it across two runs.
+        const base = {
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-long-expiry',
+              employeeId: 'emp-1',
+              earnedDate: EARNED_FEB_2024,
+              expiresAt: new Date(Date.UTC(2025, 5, 30)),
+              days: 1,
+            },
+          ],
+        };
+
+        const december2024 = buildProcessRunHarness({ run: { month: 12, year: 2024 }, finalizations: finalized(12, 2024), ...base });
+        await december2024.service.processRun('tenant-1', 'run-1');
+        expect(payoutCreates(december2024.prisma)).toHaveLength(1);
+        expect(payoutCreates(december2024.prisma)[0]).toMatchObject({
+          metadata: { grantIds: ['grant-long-expiry'], days: 1 },
+        });
+
+        const june2025 = buildProcessRunHarness({ run: { month: 6, year: 2025 }, finalizations: finalized(6, 2025), ...base });
+        await june2025.service.processRun('tenant-1', 'run-1');
+        expect(payoutCreates(june2025.prisma)).toHaveLength(0);
+      });
+
+      it('15e. carry-forward: defers to the expiresAt month and pays there, on historical dates', async () => {
+        // Test 14's rule on dates that are actually in the past. Pre-4D the August run paid
+        // nothing here, because the very expiresAt that set the closure month had passed.
+        const base = {
+          payrollPolicies: policy({ compOffCarryForwardEnabled: true }),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-carried',
+              employeeId: 'emp-1',
+              earnedDate: new Date(Date.UTC(2024, 5, 15)),
+              expiresAt: new Date(Date.UTC(2024, 7, 15)),
+              days: 1,
+            },
+          ],
+        };
+
+        const july = buildProcessRunHarness({ run: { month: 7, year: 2024 }, finalizations: finalized(7, 2024), ...base });
+        await july.service.processRun('tenant-1', 'run-1');
+        expect(payoutCreates(july.prisma)).toHaveLength(0);
+
+        const august = buildProcessRunHarness({ run: { month: 8, year: 2024 }, finalizations: finalized(8, 2024), ...base });
+        await august.service.processRun('tenant-1', 'run-1');
+        expect(payoutCreates(august.prisma)).toHaveLength(1);
+        expect(payoutCreates(august.prisma)[0]).toMatchObject({
+          month: 8,
+          year: 2024,
+          metadata: { grantIds: ['grant-carried'], days: 1 },
+        });
+      });
+
+      it('15f. MONTHLY: a grant whose month already closed is not swept up by a later run', async () => {
+        // Test 12's rule with a past expiry, so the closure guard is what rejects it rather
+        // than the expiry gate that used to sit in front of everything.
+        const { service, prisma } = buildProcessRunHarness({
+          run: { month: 9, year: 2024 },
+          finalizations: finalized(9, 2024),
+          payrollPolicies: policy(),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-stale',
+              employeeId: 'emp-1',
+              earnedDate: new Date(Date.UTC(2024, 6, 5)),
+              expiresAt: new Date(Date.UTC(2024, 7, 1)),
+              days: 1,
+            },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(prisma)).toHaveLength(0);
+      });
+
+      it.each(['USED', 'EXPIRED', 'CANCELLED'])(
+        '15g. a %s grant with a passed expiresAt is still not paid',
+        async (status) => {
+          // Terminal grants are excluded by the `status: AVAILABLE` filter on the query
+          // itself, which the harness mirrors - dropping the expiry gate must not resurrect
+          // them. An EXPIRED grant matters most: expiry is now irrelevant to an AVAILABLE
+          // grant, but the status still is.
+          const { service, prisma } = buildProcessRunHarness({
+            run: { month: 12, year: 2024 },
+            finalizations: finalized(12, 2024),
+            payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+            employeeOverrides: basicSalary(26000),
+            availableCompOffGrants: [
+              {
+                id: 'grant-terminal',
+                employeeId: 'emp-1',
+                earnedDate: EARNED_FEB_2024,
+                expiresAt: DEFAULT_90_DAY_EXPIRY,
+                days: 1,
+                status,
+              },
+            ],
+          });
+
+          await service.processRun('tenant-1', 'run-1');
+
+          expect(payoutCreates(prisma)).toHaveLength(0);
+        },
+      );
+
+      it('15h. reprocessing the same run does not duplicate the now-payable payout', async () => {
+        const { service, prisma, entryFor } = buildProcessRunHarness({
+          run: { month: 12, year: 2024 },
+          finalizations: finalized(12, 2024),
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-annual',
+              employeeId: 'emp-1',
+              earnedDate: EARNED_FEB_2024,
+              expiresAt: DEFAULT_90_DAY_EXPIRY,
+              days: 1,
+            },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+        const first = entryFor('emp-1').grossPay;
+        await service.processRun('tenant-1', 'run-1');
+        const second = entryFor('emp-1').grossPay;
+
+        expect(second).toBe(first);
+        const lastCreateCall = (prisma.payrollVariableInput.createMany as jest.Mock).mock.calls.at(-1);
+        expect(lastCreateCall[0].data).toHaveLength(1);
+        expect(lastCreateCall[0].data[0]).toMatchObject({
+          metadata: { grantIds: ['grant-annual'], days: 1 },
+        });
+      });
+
+      it('15i. a grant another run already paid is still skipped and warned, not re-paid', async () => {
+        // Pre-4D the expiry gate short-circuited before the cross-run claim check, so this
+        // grant never reached it. Now that it does, the claim check must still hold.
+        const { service, prisma, entryFor } = buildProcessRunHarness({
+          run: { month: 12, year: 2024 },
+          finalizations: finalized(12, 2024),
+          payrollPolicies: policy({ compOffUsagePeriod: 'ANNUAL' }),
+          employeeOverrides: basicSalary(26000),
+          availableCompOffGrants: [
+            {
+              id: 'grant-annual',
+              employeeId: 'emp-1',
+              earnedDate: EARNED_FEB_2024,
+              expiresAt: DEFAULT_90_DAY_EXPIRY,
+              days: 1,
+            },
+          ],
+          variableInputs: [
+            {
+              tenantId: 'tenant-1',
+              employeeId: 'emp-1',
+              payrollRunId: 'run-A',
+              month: 12,
+              year: 2024,
+              type: 'COMP_OFF_PAYOUT',
+              label: 'Unused comp-off payout (1 day)',
+              amount: 838.71,
+              taxable: true,
+              status: 'APPROVED',
+              source: 'COMP_OFF',
+              metadata: { grantIds: ['grant-annual'], days: 1, dailyRate: 838.71 },
+              payrollRun: { status: 'PUBLISHED' },
+            },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(payoutCreates(prisma)).toHaveLength(0);
+        expect(entryFor('emp-1').warnings).toContain(
+          'Unused comp-off grant-annual was already paid out in payroll run run-A (published); it is not paid again here',
+        );
+        expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+      });
     });
 
     it('16. multiple employees remain isolated', async () => {

@@ -1853,8 +1853,18 @@ export class PayrollService {
    * the later of that period end and its own `expiresAt` (unchanged from Phase 4, never
    * invented here). Tying eligibility to that one closing month, rather than "any AVAILABLE
    * grant whose period has already ended", is what keeps a rerun of a later month from paying
-   * the same grant again without needing to mutate its status. A grant already past its own
-   * `expiresAt` at processing time is excluded outright, independent of that closure date.
+   * the same grant again without needing to mutate its status.
+   *
+   * `expiresAt` is deliberately *not* a separate disqualifier, and nothing here reads the wall
+   * clock. {@link compOffClosureDate} already folds `expiresAt` into the end of the usage window
+   * exactly where the usage rule gives it effect, so a grant whose `expiresAt` has passed is not
+   * a grant that was forfeited - it is a grant that stayed usable to the close of its window
+   * (`validateCompOffUsage` never consults `expiresAt` for a usage inside the earned period) and
+   * went unused, which is precisely what this payout is for. Excluding it on `expiresAt < now`
+   * instead silently dropped the payout in the ordinary case, because the closure month's
+   * payroll is run at or after the end of that month - by which time any `expiresAt` at or
+   * before the window's close is already in the past. Under `ANNUAL` with the default 90-day
+   * auto-expiry that meant no grant was ever paid out at all.
    *
    * Idempotent the same way attendance finalization keeps its own OVERTIME/SHIFT_ALLOWANCE
    * inputs in sync: every `COMP_OFF_PAYOUT` input already recorded against this run is deleted
@@ -1926,7 +1936,6 @@ export class PayrollService {
       }
     }
 
-    const processingNow = new Date();
     const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
     const policyCache = new Map<string, Awaited<ReturnType<PayrollPolicyService['resolve']>>>();
     const resolvePolicy = async (employeeId: string) => {
@@ -1941,7 +1950,6 @@ export class PayrollService {
 
     const eligibleByEmployee = new Map<string, { days: number; grantIds: string[] }>();
     for (const grant of grants) {
-      if (grant.expiresAt && grant.expiresAt < processingNow) continue;
       const claim = claimedGrants.get(grant.id);
       if (claim) {
         const owner = claim.runId
