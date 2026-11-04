@@ -49,6 +49,14 @@ describe('AttendanceService.rangeLedger', () => {
     assignments?: Array<Record<string, unknown>>;
     fallbackShift?: Record<string, unknown> | null;
     rules?: Array<Record<string, unknown>>;
+    /** Comp-Off grants the ledger reports as earned/used per day; none by default. */
+    compOffGrants?: Array<{
+      employeeId: string;
+      earnedDate: string;
+      usedOnDate?: string;
+      days?: number;
+      status?: string;
+    }>;
   }) {
     return {
       employee: { findFirst: jest.fn().mockResolvedValue({ locationId: 'loc-1' }) },
@@ -75,6 +83,17 @@ describe('AttendanceService.rangeLedger', () => {
           .mockResolvedValue(options && 'fallbackShift' in options ? options.fallbackShift : shift),
       },
       attendanceRule: { findMany: jest.fn().mockResolvedValue(options?.rules ?? []) },
+      compOffGrant: {
+        findMany: jest.fn().mockResolvedValue(
+          (options?.compOffGrants ?? []).map((grant) => ({
+            employeeId: grant.employeeId,
+            earnedDate: day(grant.earnedDate),
+            usedOnDate: grant.usedOnDate ? day(grant.usedOnDate) : null,
+            days: grant.days ?? 1,
+            status: grant.status ?? (grant.usedOnDate ? 'USED' : 'AVAILABLE'),
+          })),
+        ),
+      },
     };
   }
 
@@ -275,5 +294,138 @@ describe('AttendanceService.rangeLedger', () => {
 
     expect(ledger.size).toBe(0);
     expect(prisma.attendanceRecord.findMany).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Comp-Off earned and used, reported as attendance facts.
+   *
+   * Both are read from `CompOffGrant` rather than inferred from the day's status, which is the
+   * only way they can be right: a worked weekly off earns a grant only where the shift is
+   * eligible, the policy enables it and no grant exists yet, and a manual credit has no
+   * qualifying status behind it at all. The two never land on the same day - a grant is earned
+   * on a rest day and spent on a scheduled working day.
+   */
+  describe('comp-off earned and used', () => {
+    const compOff = (days: Array<{ date: Date; compOffEarnedDays: number; compOffUsedDays: number }>) =>
+      Object.fromEntries(
+        days
+          .filter((d) => d.compOffEarnedDays || d.compOffUsedDays)
+          .map((d) => [
+            d.date.toISOString().slice(0, 10),
+            { earned: d.compOffEarnedDays, used: d.compOffUsedDays },
+          ]),
+      );
+
+    it('reports zero on every day when the employee holds no grants', async () => {
+      const prisma = ledgerPrisma();
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(ledger.get('emp-1')!.every((d) => d.compOffEarnedDays === 0)).toBe(true);
+      expect(ledger.get('emp-1')!.every((d) => d.compOffUsedDays === 0)).toBe(true);
+    });
+
+    it('reports a full day earned on the rest day that was worked', async () => {
+      // 2026-06-06 is a Saturday.
+      const prisma = ledgerPrisma({
+        compOffGrants: [{ employeeId: 'emp-1', earnedDate: '2026-06-06', days: 1 }],
+      });
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(compOff(ledger.get('emp-1')!)).toEqual({
+        '2026-06-06': { earned: 1, used: 0 },
+      });
+    });
+
+    it('reports half a day earned for a half-day grant', async () => {
+      const prisma = ledgerPrisma({
+        compOffGrants: [{ employeeId: 'emp-1', earnedDate: '2026-06-06', days: 0.5 }],
+      });
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(compOff(ledger.get('emp-1')!)).toEqual({
+        '2026-06-06': { earned: 0.5, used: 0 },
+      });
+    });
+
+    it('reports earned and used on their own separate days', async () => {
+      const prisma = ledgerPrisma({
+        compOffGrants: [
+          {
+            employeeId: 'emp-1',
+            earnedDate: '2026-06-06',
+            usedOnDate: '2026-06-03',
+            days: 1,
+            status: 'USED',
+          },
+        ],
+      });
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(compOff(ledger.get('emp-1')!)).toEqual({
+        '2026-06-03': { earned: 0, used: 1 },
+        '2026-06-06': { earned: 1, used: 0 },
+      });
+    });
+
+    it('sums two grants earned on the same day', async () => {
+      const prisma = ledgerPrisma({
+        compOffGrants: [
+          { employeeId: 'emp-1', earnedDate: '2026-06-06', days: 0.5 },
+          { employeeId: 'emp-1', earnedDate: '2026-06-06', days: 0.5 },
+        ],
+      });
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(compOff(ledger.get('emp-1')!)).toEqual({
+        '2026-06-06': { earned: 1, used: 0 },
+      });
+    });
+
+    it('keeps one employee’s grants off another’s days', async () => {
+      const prisma = ledgerPrisma({
+        compOffGrants: [{ employeeId: 'emp-1', earnedDate: '2026-06-06', days: 1 }],
+      });
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(compOff(ledger.get('emp-2')!)).toEqual({});
+    });
+
+    it('does not change the status of the day it reports against', async () => {
+      // A worked weekly off that earned a grant is still a WEEKEND day in the ledger: the
+      // comp-off column is extra information, not a reclassification.
+      const prisma = ledgerPrisma({
+        compOffGrants: [{ employeeId: 'emp-1', earnedDate: '2026-06-06', days: 1 }],
+      });
+
+      const ledger = await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      expect(statuses(ledger.get('emp-1')!)['2026-06-06']).toBe('WEEKEND');
+    });
+
+    it('queries only the window and the employees being reported', async () => {
+      const prisma = ledgerPrisma();
+
+      await newService(prisma).rangeLedger('tenant-1', employees, start, end);
+
+      const { where } = prisma.compOffGrant.findMany.mock.calls[0][0];
+      expect(where).toMatchObject({
+        tenantId: 'tenant-1',
+        employeeId: { in: ['emp-1', 'emp-2'] },
+      });
+    });
+
+    it('asks for no grants at all when there are no employees', async () => {
+      const prisma = ledgerPrisma();
+
+      await newService(prisma).rangeLedger('tenant-1', [], start, end);
+
+      expect(prisma.compOffGrant.findMany).not.toHaveBeenCalled();
+    });
   });
 });

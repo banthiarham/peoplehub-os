@@ -38,6 +38,8 @@ function ledgerDay(date: string, overrides: Partial<RangeLedgerDay> = {}): Range
     punchSource: 'BIOMETRIC',
     isFinalized: true,
     remarks: null,
+    compOffEarnedDays: 0,
+    compOffUsedDays: 0,
     ...overrides,
   };
 }
@@ -272,12 +274,82 @@ describe('attendance summary rows', () => {
     expect(row.avgHoursPerDay).toBeNull();
   });
 
-  it('carries no payroll figure: this phase computes none', () => {
+  // Comp-Off earned and used are attendance facts - a grant's own `earnedDate`/`usedOnDate`,
+  // totalled - so they now belong here alongside the status counts. Everything that needs a
+  // payroll *decision* to compute is still out: how much LOP a usage offset, what an unused
+  // grant was paid, what a remaining balance is worth. Those depend on the salary denominator
+  // and the unused-treatment policy, which is the line this report still draws.
+  it('carries no payroll figure: this report computes none', () => {
     const keys = SUMMARY_COLUMNS.map((column) => column.key.toLowerCase());
 
-    for (const forbidden of ['lop', 'payable', 'denominator', 'compoff', 'lwp']) {
+    for (const forbidden of ['lop', 'payable', 'denominator', 'lwp', 'paid', 'payout', 'amount']) {
       expect(keys.some((key) => key.includes(forbidden))).toBe(false);
     }
+  });
+
+  it('reports comp-off earned and used as plain day totals', () => {
+    const ledger = new Map<string, RangeLedgerDay[]>([
+      [
+        'emp-1',
+        [
+          ledgerDay('2026-09-05', { status: 'WEEKEND', compOffEarnedDays: 0.5 }),
+          ledgerDay('2026-09-12', { status: 'WEEKEND', compOffEarnedDays: 1 }),
+          ledgerDay('2026-09-14', { status: 'ABSENT', compOffUsedDays: 1 }),
+        ],
+      ],
+    ]);
+
+    const [row] = buildSummaryRows([employees[1]], ledger);
+
+    expect(row).toMatchObject({ compOffEarnedDays: 1.5, compOffUsedDays: 1 });
+  });
+
+  it('keeps earned and used separate from each other and from the status counts', () => {
+    // A worked weekly off that earned a grant is still a WEEKEND day; a day a grant was spent
+    // on is still ABSENT. Neither column restates the other, and neither changes the status.
+    const ledger = new Map<string, RangeLedgerDay[]>([
+      [
+        'emp-1',
+        [
+          ledgerDay('2026-09-05', { status: 'WEEKEND', compOffEarnedDays: 1 }),
+          ledgerDay('2026-09-14', { status: 'ABSENT', compOffUsedDays: 1 }),
+        ],
+      ],
+    ]);
+
+    const [row] = buildSummaryRows([employees[1]], ledger);
+
+    expect(row).toMatchObject({
+      weeklyOff: 1,
+      absent: 1,
+      compOffEarnedDays: 1,
+      compOffUsedDays: 1,
+    });
+  });
+
+  it('totals three half-day grants without floating-point noise', () => {
+    const ledger = new Map<string, RangeLedgerDay[]>([
+      [
+        'emp-1',
+        ['2026-09-05', '2026-09-12', '2026-09-19'].map((date) =>
+          ledgerDay(date, { status: 'WEEKEND', compOffEarnedDays: 0.5 }),
+        ),
+      ],
+    ]);
+
+    const [row] = buildSummaryRows([employees[1]], ledger);
+
+    expect(row.compOffEarnedDays).toBe(1.5);
+  });
+
+  it('reports zero rather than blank for a month with no comp-off at all', () => {
+    const ledger = new Map<string, RangeLedgerDay[]>([
+      ['emp-1', [ledgerDay('2026-09-14', { status: 'PRESENT' })]],
+    ]);
+
+    const [row] = buildSummaryRows([employees[1]], ledger);
+
+    expect(row).toMatchObject({ compOffEarnedDays: 0, compOffUsedDays: 0 });
   });
 });
 

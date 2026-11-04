@@ -9,6 +9,7 @@ import {
 import {
   AttendanceCaptureMode,
   AttendanceStatus,
+  CompOffExpiryTreatment,
   CompOffStatus,
   CompOffUsagePeriod,
   Prisma,
@@ -24,13 +25,23 @@ import {
   SUPPORTED_ATTENDANCE_DATE_FORMATS,
 } from '../../common/utils/attendance-date';
 import { toCsv } from '../../common/utils/csv';
+import {
+  assertPayrollPeriodOpen,
+  formatPayrollPeriod,
+  PAYROLL_PERIOD_LOCK_STATUSES,
+  frozenPayrollPeriodsFor,
+  payrollPeriodKey,
+  payrollPeriodOf,
+  type PayrollPeriod,
+} from '../../common/utils/payroll-period-lock';
 import { NON_WORKING_ATTENDANCE_STATUSES } from '../../common/utils/employment-status';
 import { PayrollPolicyService } from '../payroll/payroll-policy.service';
 import { AttendanceQrService } from './attendance-qr.service';
 import { DeviceBindingService } from './device-binding.service';
 import { haversineMeters } from './geo-distance';
 import { ASSIGNMENT_PRECEDENCE, ShiftResolutionService } from './shift-resolution.service';
-import { workedDayStatus } from './attendance-status';
+import { compOffDaysForStatus, workedDayStatus } from './attendance-status';
+import { absenceDayKey, absenceDaysOn, buildAbsenceContributions, roundDays } from './absence-duration';
 import {
   nextPunchDirection,
   summarisePunchEvents,
@@ -47,6 +58,7 @@ import {
   AssignShiftDto,
   CheckInDto,
   CheckOutDto,
+  COMP_OFF_GRANT_DAYS,
   CreateCompOffDto,
   CreateShiftSwapDto,
   CreateShiftDto,
@@ -63,6 +75,7 @@ import {
   RegularizeDto,
   UpdateAttendanceRecordDto,
   UpdateShiftAssignmentDto,
+  UpdateShiftDto,
   UpdateShiftWeeklyOffsDto,
   UpsertCaptureSettingDto,
   UpsertAttendanceRuleDto,
@@ -83,7 +96,62 @@ const LEAVE_RECONCILABLE_STATUSES: AttendanceStatus[] = [
 ];
 
 /** How long a comp-off stays available before it lapses, in days. */
+/**
+ * The validity window grant creation has always stamped, used when a tenant's payroll policy
+ * sets no `compOffExpiryDays` of its own. Kept as the fallback rather than removed so an
+ * unconfigured tenant keeps stamping exactly the dates it always did.
+ */
 const COMP_OFF_VALIDITY_DAYS = 90;
+
+/**
+ * Half/full-day vocabulary for the comp-off messages and labels.
+ *
+ * Kept together, and kept as the only place these phrases are written, because the same
+ * wording has to appear in a validation error, a ledger label and a payslip line without
+ * drifting between them. `0.5` and `1` are the only durations the product now creates, so an
+ * anything-else branch is still provided rather than assumed unreachable - a historical grant
+ * credited at `0.75` before the manual form was narrowed must still describe itself.
+ */
+function describeCompOffDuration(days: number): string {
+  if (days === 0.5) return 'This is a half-day comp-off (0.5 day)';
+  if (days === 1) return 'This is a full-day comp-off (1 day)';
+  return `This comp-off is worth ${days} day(s)`;
+}
+
+/** What a grant of `days` is allowed to be spent against. */
+function expectedAbsenceWording(days: number): string {
+  if (days === 0.5) return 'a half-day absence (0.5 day)';
+  if (days === 1) return 'a full-day absence (1 day)';
+  return `an absence of exactly ${days} day(s)`;
+}
+
+/** How a resolved absence contribution reads in an error. */
+function describeAbsenceDuration(days: number): string {
+  if (days === 0.5) return 'a half-day absence (0.5 day)';
+  if (days === 1) return 'a full-day absence (1 day)';
+  return `an absence of ${days} day(s)`;
+}
+
+/** A date as it appears inside a comp-off validation message. */
+function formatAbsenceDay(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/** `earnedDate` plus the configured validity window, in whole UTC days. */
+function compOffExpiryFor(earnedDate: Date, expiryDays: number | null | undefined): Date {
+  const days = expiryDays ?? COMP_OFF_VALIDITY_DAYS;
+  return new Date(earnedDate.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+/**
+ * Roles whose comp-off ledger view is the whole tenant rather than their own grants.
+ *
+ * `Tenant Owner` is the primary workspace administrator and holds `attendance` in the role
+ * catalog, so it belongs here with the other administrators — without it the owner reaches
+ * the route through their `attendance:read` scope and is then shown only their own grants,
+ * or refused outright when their user has no employee profile linked.
+ */
+const COMP_OFF_LEDGER_ROLES = ['Super Admin', 'Tenant Owner', 'HR Admin', 'Manager'];
 
 /** Reject GPS fixes with a worse accuracy radius than this (meters). */
 const MAX_FIX_ACCURACY_M = 150;
@@ -219,6 +287,26 @@ export type RangeLedgerDay = {
   punchSource: string | null;
   isFinalized: boolean;
   remarks: string | null;
+  /**
+   * Comp-Off credited *for* this day, in days: 0.5 for a half day worked, 1 for a full one, 0
+   * for a day that earned none.
+   *
+   * Read from `CompOffGrant.earnedDate`, never inferred from `status`. A worked weekly off
+   * earns a grant only where the shift is comp-off eligible, the tenant's policy enables it
+   * and no grant already exists for the day, so the status alone cannot say whether one was
+   * actually credited - and a manual credit has no qualifying status behind it at all.
+   * Cancelled and expired grants are excluded: nothing was ultimately credited.
+   */
+  compOffEarnedDays: number;
+  /**
+   * Comp-Off spent *on* this day, in days - that is, this date was somebody's `usedOnDate`.
+   *
+   * Deliberately separate from `compOffEarnedDays`, which is about the day that was worked.
+   * The two never describe the same day: a grant is earned on a rest day and spent on a
+   * scheduled working day. Reported here only as an attendance fact; whether it reduced LOP,
+   * and by how much, is payroll's answer and is not restated here.
+   */
+  compOffUsedDays: number;
 };
 
 /** The employee identity {@link AttendanceService.rangeLedger} needs per row. */
@@ -1427,6 +1515,18 @@ export class AttendanceService {
       select: { id: true, employeeCode: true, locationId: true },
     });
     const employeeByCode = new Map(employees.map((employee) => [employee.employeeCode, employee]));
+    // Which of these employees already have frozen payroll for a month this upload touches,
+    // resolved in one query for the whole file rather than once per row. Rows whose date does
+    // not parse are left out here and keep their own row-level validation error below, rather
+    // than having a payroll period guessed for them.
+    const frozenPeriods = await frozenPayrollPeriodsFor(this.prisma, {
+      tenantId,
+      employeeIds: employees.map((employee) => employee.id),
+      periods: dto.rows
+        .map((row) => parseAttendanceDate(row.date))
+        .filter((date): date is Date => date !== null)
+        .map(payrollPeriodOf),
+    });
     let imported = 0;
     const unknownEmployeeCodes = new Set<string>();
     const errors: Array<{ row: number; employeeCode: string; date: string; error: string }> = [];
@@ -1468,6 +1568,20 @@ export class AttendanceService {
         continue;
       }
       const date = parsedDate.date;
+      // Skipped rather than failing the whole upload, so the rest of the file still imports:
+      // the same row-level error contract an unknown code or a malformed date reports.
+      const frozenStatus = frozenPeriods.get(payrollPeriodKey(employee.id, payrollPeriodOf(date)));
+      if (frozenStatus) {
+        errors.push({
+          row: index + 1,
+          employeeCode: row.employeeCode,
+          date: String(row.date ?? ''),
+          error:
+            `Payroll for ${formatPayrollPeriod(payrollPeriodOf(date))} is already ` +
+            `${frozenStatus.toLowerCase()}; this day can no longer be imported`,
+        });
+        continue;
+      }
       // One resolve per row covers both the shift and the location: capture
       // rules follow wherever the employee actually works that date, which a
       // date-effective assignment may override away from their base location.
@@ -1736,6 +1850,70 @@ export class AttendanceService {
     return overtimeAfterShiftEnd({ punchIn, punchOut, shift });
   }
 
+  /**
+   * Comp-Off earned and used per employee-day, as `${employeeId}:YYYY-MM-DD` keys.
+   *
+   * Two maps rather than one, because they answer different questions about different days:
+   * `earned` is keyed on `earnedDate` (the rest day that was worked) and `used` on `usedOnDate`
+   * (the scheduled working day it was spent on). A grant contributes to both only in the sense
+   * that it appears once in each, never on the same date.
+   *
+   * Durations are summed rather than counted, so a day carrying a 0.5 grant reports 0.5. Two
+   * grants on one date sum, which is the shape historical half-day usage takes.
+   *
+   * `CANCELLED` and `EXPIRED` grants are excluded from `earned`: the point of the column is
+   * what the employee actually holds for that day, and a cancelled grant credited nothing in
+   * the end. `used` is `USED`-only by definition. Paid-out grants stay in `earned` - they were
+   * genuinely credited, and the payout is payroll's side of the story, not attendance's.
+   */
+  private async compOffDaysByDay(
+    tenantId: string,
+    employeeIds: string[],
+    start: Date,
+    endInclusive: Date,
+  ): Promise<{ earned: Map<string, number>; used: Map<string, number> }> {
+    const earned = new Map<string, number>();
+    const used = new Map<string, number>();
+    if (!employeeIds.length) return { earned, used };
+
+    const grants = await this.prisma.compOffGrant.findMany({
+      where: {
+        tenantId,
+        employeeId: { in: employeeIds },
+        OR: [
+          {
+            earnedDate: { gte: start, lte: endInclusive },
+            status: { in: [CompOffStatus.AVAILABLE, CompOffStatus.USED] },
+          },
+          { usedOnDate: { gte: start, lte: endInclusive }, status: CompOffStatus.USED },
+        ],
+      },
+      select: { employeeId: true, earnedDate: true, usedOnDate: true, days: true, status: true },
+    });
+
+    const add = (target: Map<string, number>, employeeId: string, date: Date, days: number) => {
+      const key = `${employeeId}:${absenceDayKey(date)}`;
+      target.set(key, roundDays((target.get(key) ?? 0) + days));
+    };
+    for (const grant of grants) {
+      // The OR above can match a grant on either date, so each is re-checked against the
+      // window before it is counted - a grant earned in June and used in July must contribute
+      // to July's `used` alone.
+      if (grant.earnedDate >= start && grant.earnedDate <= endInclusive) {
+        add(earned, grant.employeeId, grant.earnedDate, grant.days);
+      }
+      if (
+        grant.status === CompOffStatus.USED &&
+        grant.usedOnDate &&
+        grant.usedOnDate >= start &&
+        grant.usedOnDate <= endInclusive
+      ) {
+        add(used, grant.employeeId, grant.usedOnDate, grant.days);
+      }
+    }
+    return { earned, used };
+  }
+
   private async holidayDateSet(tenantId: string, start: Date, endInclusive: Date) {
     const holidays = await this.prisma.holiday.findMany({
       where: { holidayCalendar: { tenantId }, date: { gte: start, lte: endInclusive } },
@@ -1888,7 +2066,7 @@ export class AttendanceService {
     if (start > windowEnd) return byEmployee;
 
     const employeeIds = employees.map((employee) => employee.id);
-    const [records, holidaySet, leaveTypeByDay, resolveShift, ruleAt] = await Promise.all([
+    const [records, holidaySet, leaveTypeByDay, resolveShift, ruleAt, compOff] = await Promise.all([
       this.prisma.attendanceRecord.findMany({
         where: { tenantId, employeeId: { in: employeeIds }, date: { gte: start, lte: windowEnd } },
         include: { shift: { select: { name: true, startTime: true, endTime: true } } },
@@ -1902,6 +2080,7 @@ export class AttendanceService {
         start,
         windowEnd,
       ),
+      this.compOffDaysByDay(tenantId, employeeIds, start, windowEnd),
     ]);
 
     const recordByKey = new Map(
@@ -1970,6 +2149,8 @@ export class AttendanceService {
           punchSource: record?.punchSource ?? null,
           isFinalized: record?.isFinalized ?? false,
           remarks: record?.remarks ?? null,
+          compOffEarnedDays: compOff.earned.get(`${employee.id}:${key}`) ?? 0,
+          compOffUsedDays: compOff.used.get(`${employee.id}:${key}`) ?? 0,
         });
       }
     }
@@ -2322,6 +2503,16 @@ export class AttendanceService {
     employeeId: string,
     input: { date: Date; punchIn?: Date; punchOut?: Date; reason: string },
   ) {
+    // Before the record upsert and the punch events it mirrors: a regularization asserts the
+    // day was worked, which removes the LOP a frozen run has already paid for it. Deliberately
+    // keyed on the payroll lock rather than on `isFinalized` - a correction to a finalized
+    // month whose run is still in REVIEW is exactly what reprocessing exists for.
+    await this.assertPayrollPeriodOpen(
+      tenantId,
+      payrollPeriodOf(input.date),
+      [employeeId],
+      'this day can no longer be regularized',
+    );
     const workingMinutes =
       input.punchIn && input.punchOut
         ? Math.max(0, Math.round((input.punchOut.getTime() - input.punchIn.getTime()) / 60000))
@@ -2618,6 +2809,20 @@ export class AttendanceService {
     // deterministic instead of an undefined fallback.
     const hasAnyShift = await this.prisma.shift.findFirst({ where: { tenantId }, select: { id: true } });
     return this.prisma.shift.create({ data: { ...dto, tenantId, isDefault: !hasAnyShift } });
+  }
+
+  /**
+   * Edits a shift's own configuration. Tenant-scoped by the same `findFirst` guard the
+   * other shift mutations use, so one tenant can never reach another's shift.
+   *
+   * Only the fields present in the payload are written. `weeklyOffDays` and `isDefault`
+   * are not reachable here at all (see {@link UpdateShiftDto}), so editing a shift can
+   * never disturb the weekly-off configuration or move the tenant default.
+   */
+  async updateShift(tenantId: string, id: string, dto: UpdateShiftDto) {
+    const shift = await this.prisma.shift.findFirst({ where: { id, tenantId }, select: { id: true } });
+    if (!shift) throw new NotFoundException('Shift not found');
+    return this.prisma.shift.update({ where: { id }, data: { ...dto } });
   }
 
   async setDefaultShift(tenantId: string, id: string) {
@@ -2926,6 +3131,26 @@ export class AttendanceService {
 
   async finalizeMonth(tenantId: string, finalizedById: string | undefined, dto: FinalizeAttendanceDto) {
     const { start, endExclusive, endInclusive, year, monthNumber } = monthParts(dto.month);
+    // The employees this finalization would rewrite, read before anything is written so the
+    // payroll-period guard below can be asked about exactly them.
+    const employees = await this.prisma.employee.findMany({
+      where: {
+        tenantId,
+        status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
+        ...(dto.locationId && { locationId: dto.locationId }),
+      },
+      select: { id: true, employeeCode: true, locationId: true },
+    });
+    // Ahead of every write below: finalizing rewrites attendance statuses and replaces this
+    // month's attendance-generated payroll inputs, which a frozen run has already been paid
+    // from. A frozen run for another location or entity blocks nothing unless its entries
+    // actually cover one of these employees.
+    await this.assertPayrollPeriodOpen(
+      tenantId,
+      { month: monthNumber, year },
+      employees.map((employee) => employee.id),
+      'attendance for this month can no longer be finalized',
+    );
     const preview = await this.finalizationPreview(tenantId, dto);
     const finalization = await this.prisma.attendanceFinalization.create({
       data: {
@@ -2939,14 +3164,6 @@ export class AttendanceService {
       },
     });
 
-    const employees = await this.prisma.employee.findMany({
-      where: {
-        tenantId,
-        status: { notIn: [...NON_WORKING_ATTENDANCE_STATUSES] },
-        ...(dto.locationId && { locationId: dto.locationId }),
-      },
-      select: { id: true, employeeCode: true, locationId: true },
-    });
     const existing = await this.prisma.attendanceRecord.findMany({
       where: {
         tenantId,
@@ -3037,7 +3254,7 @@ export class AttendanceService {
       });
     }
     const locationByEmployee = new Map(employees.map((employee) => [employee.id, employee.locationId]));
-    const compOffPolicyCache = new Map<string, boolean>();
+    const compOffPolicyCache = new Map<string, { enabled: boolean; expiryDays: number | null }>();
     const byEmployee = new Map<string, { overtimeMinutes: number; allowance: number }>();
     for (const record of records) {
       const current = byEmployee.get(record.employeeId) ?? { overtimeMinutes: 0, allowance: 0 };
@@ -3091,19 +3308,124 @@ export class AttendanceService {
     return this.finalizationPreview(tenantId, dto);
   }
 
+  /**
+   * Refuses an operation that would change what an already-frozen payroll run was computed
+   * from. A run at `LOCKED` or later cannot be reprocessed, so letting attendance or comp-off
+   * data move underneath it leaves the payslips it produced unexplainable by the data behind
+   * them - silently, because nothing recalculates.
+   *
+   * `employeeIds` are the employees the operation would affect, and a run blocks it only when
+   * the run's own `PayrollRunEmployee` entries contain one of them. Membership is never
+   * inferred from the employees' current location or legal entity: the run's entries are what
+   * it actually paid, and they stay right after someone transfers.
+   */
+  private assertPayrollPeriodOpen(
+    tenantId: string,
+    period: PayrollPeriod,
+    employeeIds: string[],
+    consequence: string,
+  ): Promise<void> {
+    return assertPayrollPeriodOpen(this.prisma, { tenantId, period, employeeIds }, consequence);
+  }
+
+  /**
+   * Refuses a comp-off decision when an unused-comp-off payout for this exact grant was
+   * already paid by a frozen run.
+   *
+   * Matched against the payout input `applyUnusedCompOffPayouts` writes - `type:
+   * COMP_OFF_PAYOUT`, `source: COMP_OFF`, the grant's id inside `metadata.grantIds` - rather
+   * than by recomputing the grant's closure month here. The input is the record of what was
+   * actually paid: a tenant whose policy never pays out has none, a grant credited after its
+   * closure month was processed has none, and a payout still attached to a `REVIEW` run is
+   * left alone because reprocessing that run reconciles it. Only a payout inside a run that
+   * can no longer be recomputed is a decision this service must refuse.
+   */
+  private async assertCompOffPayoutNotFrozen(
+    tenantId: string,
+    grant: { id: string; employeeId: string },
+    consequence: string,
+  ): Promise<void> {
+    const paid = await this.prisma.payrollVariableInput.findFirst({
+      where: {
+        tenantId,
+        employeeId: grant.employeeId,
+        type: 'COMP_OFF_PAYOUT',
+        source: 'COMP_OFF',
+        metadata: { path: ['grantIds'], array_contains: grant.id },
+        payrollRun: { status: { in: PAYROLL_PERIOD_LOCK_STATUSES } },
+      },
+      select: { payrollRun: { select: { month: true, year: true, status: true } } },
+    });
+    const run = paid?.payrollRun;
+    if (run) {
+      throw new BadRequestException(
+        `This comp-off was already paid out in ${run.year}-${String(run.month).padStart(2, '0')} ` +
+          `payroll, which is ${run.status.toLowerCase()}; ${consequence}`,
+      );
+    }
+  }
+
+  /**
+   * The comp-off ledger: the whole tenant's grants for a ledger role, the caller's own
+   * otherwise.
+   *
+   * Each row carries `expiryEnforced` — whether this grant's `expiresAt` is a real deadline —
+   * resolved from the payroll policy that applies at *that grant's employee's location*, via
+   * the same {@link PayrollPolicyService.resolve} precedence usage validation applies.
+   *
+   * Resolved here rather than in the client because only the server can do it correctly. The
+   * treatment is per location, and `expiresAt` alone cannot say whether it binds: under
+   * `NOT_ENFORCED` a lapsed date is advisory and the grant stays usable, while under `FORFEIT`
+   * or `PAY_OUT` the same date makes it unusable. A client reading the tenant default would
+   * misreport every grant at a location that overrides it, in whichever direction the override
+   * went — and it has no way to even see the location, which is not on the row.
+   *
+   * Policies are resolved once per distinct location, not per grant, so a hundred grants across
+   * three locations cost three lookups. Nothing is written and no stored status or date is
+   * touched: this is a derived field for display, which is why it is computed on read.
+   */
   async listCompOffs(user: AuthUser) {
     const where: Prisma.CompOffGrantWhereInput = {
       tenantId: user.tenantId,
-      ...(!user.roles.some((role) => ['Super Admin', 'HR Admin', 'Manager'].includes(role)) && {
-        employeeId: this.requireEmployee(user),
-      }),
+      ...(!user.isSuperAdmin &&
+        !user.roles.some((role) => COMP_OFF_LEDGER_ROLES.includes(role)) && {
+          employeeId: this.requireEmployee(user),
+        }),
     };
-    return this.prisma.compOffGrant.findMany({
+    const grants = await this.prisma.compOffGrant.findMany({
       where,
-      include: { employee: { select: { firstName: true, lastName: true, employeeCode: true } } },
+      // `locationId` is selected to resolve the policy, and deliberately not returned: it is
+      // not the ledger's business to publish where an employee sits, and the derived
+      // `expiryEnforced` is the only thing the UI needs from it.
+      include: {
+        employee: {
+          select: { firstName: true, lastName: true, employeeCode: true, locationId: true },
+        },
+      },
       orderBy: { earnedDate: 'desc' },
       take: 100,
     });
+
+    const enforcedByLocation = new Map<string, boolean>();
+    for (const grant of grants) {
+      const key = grant.employee.locationId ?? '';
+      if (enforcedByLocation.has(key)) continue;
+      const policy = await this.payrollPolicies.resolve(user.tenantId, grant.employee.locationId);
+      enforcedByLocation.set(
+        key,
+        policy.compOffExpiryTreatment !== CompOffExpiryTreatment.NOT_ENFORCED,
+      );
+    }
+
+    return grants.map(({ employee, ...grant }) => ({
+      ...grant,
+      employee: {
+        firstName: employee.firstName,
+        lastName: employee.lastName,
+        employeeCode: employee.employeeCode,
+      },
+      expiryEnforced: enforcedByLocation.get(employee.locationId ?? '') ?? false,
+    }));
   }
 
   /**
@@ -3114,8 +3436,13 @@ export class AttendanceService {
    * from the shift and the holiday calendar, independently of `record.status`. A day the
    * employee actually punched is classified `PRESENT`/`LATE`/`HALF_DAY` by worked-minutes
    * alone (see `classifyAttendanceStatus`) and never becomes `WEEKEND`/`HOLIDAY` — those
-   * statuses are written only for days with no punches at all — so gating on the final
-   * status would never grant anything for a day that was actually worked.
+   * statuses are written only for days with no punches at all — so asking the status
+   * *whether the day was a rest day* would never grant anything for a day actually worked.
+   *
+   * The status does decide the other half of the question: *how much* was worked, and so how
+   * much the grant is worth. `compOffDaysForStatus` maps it, and returning `null` there is
+   * what excludes an unworked day. The two reads are not in tension — calendar shape comes
+   * from the roster, earned duration comes from the record.
    *
    * Idempotent by construction: a comp-off already linked to this attendance record (via
    * `sourceAttendanceRecordId`) is left alone, so re-finalizing the same month never grants
@@ -3129,7 +3456,7 @@ export class AttendanceService {
     context: {
       holidaySet: Set<string>;
       locationByEmployee: Map<string, string | null>;
-      compOffPolicyCache: Map<string, boolean>;
+      compOffPolicyCache: Map<string, { enabled: boolean; expiryDays: number | null }>;
     },
   ): Promise<void> {
     const shift = record.shift;
@@ -3141,18 +3468,29 @@ export class AttendanceService {
     const isHoliday = context.holidaySet.has(dayKey);
     if (!isWeeklyOff && !isHoliday) return;
 
-    const qualifyingMinutes = Math.min(shift.halfDayAfterMinutes, shift.minWorkingMinutes);
-    if ((record.workingMinutes ?? 0) < qualifyingMinutes) return;
+    // Earned duration comes from the day's own status, not from a minutes threshold of its
+    // own. The previous gate compared `workingMinutes` against
+    // `min(halfDayAfterMinutes, minWorkingMinutes)` - two shift fields status derivation
+    // deliberately does not read (see `attendance-status.ts`) - so for a 540-minute shift it
+    // disagreed with the record in both directions: a 200-minute day was stored HALF_DAY yet
+    // earned nothing, and a 300-minute day was stored HALF_DAY yet earned a *whole* day,
+    // which under `compOffUnusedTreatment: PAY` is a full day's cash for half a day worked.
+    // Reading the stored status instead makes the grant agree with the attendance by
+    // construction, and `null` covers every status that describes an unworked day.
+    const earnedDays = compOffDaysForStatus(record.status);
+    if (earnedDays === null) return;
 
     const locationId = context.locationByEmployee.get(record.employeeId) ?? null;
     const locationKey = locationId ?? '';
-    let compOffEnabled = context.compOffPolicyCache.get(locationKey);
-    if (compOffEnabled === undefined) {
+    // Caches the expiry window alongside the enabled flag: both come from the same resolved
+    // policy, and the window is now needed on every grant this loop writes.
+    let compOffPolicy = context.compOffPolicyCache.get(locationKey);
+    if (compOffPolicy === undefined) {
       const policy = await this.payrollPolicies.resolve(tenantId, locationId);
-      compOffEnabled = policy.compOffEnabled;
-      context.compOffPolicyCache.set(locationKey, compOffEnabled);
+      compOffPolicy = { enabled: policy.compOffEnabled, expiryDays: policy.compOffExpiryDays };
+      context.compOffPolicyCache.set(locationKey, compOffPolicy);
     }
-    if (!compOffEnabled) return;
+    if (!compOffPolicy.enabled) return;
 
     // Matched by attendance record first — the stable idempotency key across re-finalizations
     // of this exact day — and, as a fallback, by the same (employeeId, earnedDate, AVAILABLE|
@@ -3178,8 +3516,8 @@ export class AttendanceService {
         employeeId: record.employeeId,
         sourceAttendanceRecordId: record.id,
         earnedDate: record.date,
-        days: 1,
-        expiresAt: new Date(record.date.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+        days: earnedDays,
+        expiresAt: compOffExpiryFor(record.date, compOffPolicy.expiryDays),
         notes: isHoliday ? 'Generated from finalized holiday work' : 'Generated from finalized weekly-off work',
       },
     });
@@ -3197,7 +3535,7 @@ export class AttendanceService {
   async createCompOff(tenantId: string, dto: CreateCompOffDto) {
     const employee = await this.prisma.employee.findFirst({
       where: { id: dto.employeeId, tenantId },
-      select: { id: true },
+      select: { id: true, locationId: true },
     });
     if (!employee) throw new NotFoundException('Employee not found');
 
@@ -3215,6 +3553,17 @@ export class AttendanceService {
       throw new BadRequestException('This employee already has a comp-off credited for that date');
     }
 
+    // Re-checked here and not only at the DTO, because the service is the one path every
+    // caller shares. A grant worth anything other than half a day or a whole day can never be
+    // used - usage requires an absence of exactly its duration - so accepting one would credit
+    // a balance the employee could only ever be paid out for, never take as leave.
+    const days = dto.days ?? 1;
+    if (!(COMP_OFF_GRANT_DAYS as readonly number[]).includes(days)) {
+      throw new BadRequestException(
+        `A comp-off can only be credited as 0.5 (half day) or 1 (full day); received ${days}`,
+      );
+    }
+
     const record = await this.prisma.attendanceRecord.findUnique({
       where: { employeeId_date: { employeeId: employee.id, date: earnedDate } },
       select: { id: true },
@@ -3226,10 +3575,12 @@ export class AttendanceService {
         employeeId: employee.id,
         sourceAttendanceRecordId: record?.id,
         earnedDate,
-        days: dto.days ?? 1,
+        days,
+        // An explicit date still wins: this path exists for the correction the policy cannot
+        // express. Only the fallback follows the tenant's configured window.
         expiresAt: dto.expiresAt
           ? requireAttendanceDate(dto.expiresAt, 'expiresAt')
-          : new Date(earnedDate.getTime() + COMP_OFF_VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+          : compOffExpiryFor(earnedDate, (await this.payrollPolicies.resolve(tenantId, employee.locationId)).compOffExpiryDays),
         notes: dto.notes ?? 'Manually credited',
       },
       include: { employee: { select: { firstName: true, lastName: true, employeeCode: true } } },
@@ -3267,8 +3618,35 @@ export class AttendanceService {
         ? await this.validateCompOffUsage(user.tenantId, grant, dto.usedOnDate)
         : undefined;
 
+    // Checked after the existing validation, so a malformed or ineligible date still reports
+    // its own error first, and before the transition, so a refusal writes nothing.
+    if (usedOnDate) {
+      // The LOP offset is read only by the run whose month contains `usedOnDate` (see
+      // `PayrollService.lopContributionsByDate`), so that month - not the earned month - is
+      // the period this decision would change.
+      await this.assertPayrollPeriodOpen(
+        user.tenantId,
+        payrollPeriodOf(usedOnDate),
+        [grant.employeeId],
+        'a comp-off can no longer be used against a date in it',
+      );
+    }
+    // Applies to every decision, not only USED: moving a grant out of AVAILABLE is what
+    // removes it from unused-payout eligibility, whichever terminal status it moves to.
+    await this.assertCompOffPayoutNotFrozen(
+      user.tenantId,
+      grant,
+      `it can no longer be marked ${dto.status.toLowerCase()}`,
+    );
+
+    // `paidInPayrollRunId: null` is the other half of the claim `PayrollService.lockRun` takes
+    // on the same row. Everything above - including `assertCompOffPayoutNotFrozen` - reads and
+    // then writes in separate statements, so under Read Committed a run locking in between
+    // would still have been able to pay a grant this call then consumed. Adding the condition
+    // here makes the two contend for one row: whichever conditional update commits first wins,
+    // and the other matches nothing. A grant no run has locked is unaffected.
     const { count } = await this.prisma.compOffGrant.updateMany({
-      where: { id, status: CompOffStatus.AVAILABLE },
+      where: { id, status: CompOffStatus.AVAILABLE, paidInPayrollRunId: null },
       data: {
         status: dto.status,
         ...(usedOnDate && { usedOnDate }),
@@ -3276,9 +3654,168 @@ export class AttendanceService {
       },
     });
     if (count === 0) {
+      // Re-read to say which of the two it was, rather than reporting every loss as a
+      // double decision.
+      const current = await this.prisma.compOffGrant.findFirst({
+        where: { id, tenantId: user.tenantId },
+        select: { paidInPayrollRunId: true },
+      });
+      if (current?.paidInPayrollRunId) {
+        throw new ConflictException(
+          `This comp-off was paid out by payroll run ${current.paidInPayrollRunId} while this ` +
+            `decision was in flight; it can no longer be marked ${dto.status.toLowerCase()}`,
+        );
+      }
       throw new ConflictException('This comp-off was already decided. Reload it to see where it stands.');
     }
     return this.prisma.compOffGrant.findFirstOrThrow({ where: { id } });
+  }
+
+  /**
+   * The dates one grant could actually be spent on: finalized absences inside its usable
+   * window worth exactly what the grant is worth, minus the ones already spoken for.
+   *
+   * Purely a convenience for the "mark used" dialog, which until now offered a free date field
+   * defaulted to today - a date that on an ordinary working day carries no absence at all, so
+   * the common case was a guess that earned a 400. Nothing here is a security boundary or a
+   * substitute for validation: {@link validateCompOffUsage} re-checks every one of these rules
+   * when the usage is actually submitted, and it is the only thing that decides. A date this
+   * returns can still be refused, if the month is reopened or another grant claims it first.
+   *
+   * The duration comes from the same `absence-duration` resolver usage validation and payroll's
+   * LOP use, so a date offered here matches by the same arithmetic that will accept it.
+   *
+   * Scoped to the caller's tenant through the grant lookup, and to the grant's own employee.
+   * Authorization is the controller's `COMP_OFF_LEDGER_ROLES` guard plus the same
+   * `assertCanDecideApproval` the decision itself applies, so this cannot be used to enumerate
+   * another team's absences.
+   */
+  async compOffEligibleDates(user: AuthUser, grantId: string) {
+    const grant = await this.prisma.compOffGrant.findFirst({
+      where: { id: grantId, tenantId: user.tenantId },
+      include: { employee: { select: { managerId: true, locationId: true } } },
+    });
+    if (!grant) throw new NotFoundException('Comp-off not found');
+    assertCanDecideApproval(user, grant.employeeId, grant.employee.managerId);
+
+    if (grant.status !== CompOffStatus.AVAILABLE || grant.paidInPayrollRunId) {
+      // Not an error: the dialog asks before it knows, and an empty list with a reason is more
+      // use to it than a 400 it has to special-case.
+      return { grantId, days: grant.days, dates: [], unavailableReason: 'This comp-off is no longer available' };
+    }
+
+    const policy = await this.payrollPolicies.resolve(user.tenantId, grant.employee.locationId);
+    const { start, end } = this.compOffUsableWindow(policy, grant);
+    if (end < start) {
+      return { grantId, days: grant.days, dates: [], unavailableReason: 'This comp-off has expired' };
+    }
+
+    const [attendanceRecords, unpaidLeave, usedGrants] = await Promise.all([
+      this.prisma.attendanceRecord.findMany({
+        where: {
+          tenantId: user.tenantId,
+          employeeId: grant.employeeId,
+          date: { gte: start, lte: end },
+          isFinalized: true,
+          status: { in: [AttendanceStatus.ABSENT, AttendanceStatus.HALF_DAY] },
+        },
+        select: { employeeId: true, date: true, status: true },
+      }),
+      this.prisma.leaveRequest.findMany({
+        where: {
+          tenantId: user.tenantId,
+          employeeId: grant.employeeId,
+          status: 'APPROVED',
+          leaveType: { isPaid: false },
+          fromDate: { lte: end },
+          toDate: { gte: start },
+        },
+        select: { employeeId: true, days: true, fromDate: true, toDate: true },
+      }),
+      this.prisma.compOffGrant.findMany({
+        where: {
+          tenantId: user.tenantId,
+          employeeId: grant.employeeId,
+          id: { not: grant.id },
+          status: CompOffStatus.USED,
+          usedOnDate: { gte: start, lte: end },
+        },
+        select: { usedOnDate: true },
+      }),
+    ]);
+
+    const { byDate } = buildAbsenceContributions({
+      attendanceRecords,
+      unpaidLeave,
+      windowStart: start,
+      windowEnd: end,
+    });
+    const covered = new Set(
+      usedGrants
+        .map((used) => used.usedOnDate)
+        .filter((date): date is Date => date !== null)
+        .map((date) => absenceDayKey(date)),
+    );
+
+    // Only dates that already matched the duration are checked against the calendar and the
+    // finalization table - there are at most a handful, where the window is a whole month.
+    const matching = [...(byDate.get(grant.employeeId) ?? new Map<string, number>())]
+      .filter(([dayKey, days]) => days === grant.days && !covered.has(dayKey))
+      .map(([dayKey]) => dayKey)
+      .sort();
+
+    const holidays = await this.holidayDateSet(user.tenantId, start, end);
+    const dates: Array<{ date: string; days: number }> = [];
+    for (const dayKey of matching) {
+      if (holidays.has(dayKey)) continue;
+      const date = new Date(`${dayKey}T00:00:00.000Z`);
+      const { isWeeklyOff } = await this.weeklyOffAt(user.tenantId, grant.employeeId, date);
+      if (isWeeklyOff) continue;
+      if (!(await this.isMonthFinalizedFor(user.tenantId, grant.employee.locationId, date))) continue;
+      dates.push({ date: dayKey, days: grant.days });
+    }
+
+    return { grantId, days: grant.days, dates };
+  }
+
+  /**
+   * The date range a grant may still be used in, per the policy that already governs usage.
+   *
+   * Mirrors {@link validateCompOffUsage}'s rules rather than inventing its own: the usage
+   * period bounds it (`MONTHLY` the earned month, `ANNUAL` the earned year), carry-forward is
+   * what lets it run past that boundary to `expiresAt`, and an enforced expiry clamps it
+   * wherever that date falls. Under `NOT_ENFORCED` without carry-forward the date is advisory
+   * and plays no part, exactly as the validator treats it.
+   */
+  private compOffUsableWindow(
+    policy: {
+      compOffUsagePeriod: CompOffUsagePeriod;
+      compOffCarryForwardEnabled: boolean;
+      compOffExpiryTreatment: CompOffExpiryTreatment;
+    },
+    grant: { earnedDate: Date; expiresAt: Date | null },
+  ): { start: Date; end: Date } {
+    const year = grant.earnedDate.getUTCFullYear();
+    const month = grant.earnedDate.getUTCMonth();
+    const annual = policy.compOffUsagePeriod === CompOffUsagePeriod.ANNUAL;
+    const start = new Date(Date.UTC(year, annual ? 0 : month, 1));
+    let end = annual
+      ? new Date(Date.UTC(year, 11, 31))
+      : new Date(Date.UTC(year, month + 1, 0));
+
+    // Carry-forward is the only thing that can push the window past its period.
+    if (policy.compOffCarryForwardEnabled && grant.expiresAt && grant.expiresAt > end) {
+      end = grant.expiresAt;
+    }
+    // An enforced expiry is a deadline everywhere, including inside the earned period.
+    if (
+      policy.compOffExpiryTreatment !== CompOffExpiryTreatment.NOT_ENFORCED &&
+      grant.expiresAt &&
+      grant.expiresAt < end
+    ) {
+      end = grant.expiresAt;
+    }
+    return { start, end };
   }
 
   /**
@@ -3295,9 +3832,11 @@ export class AttendanceService {
   private async validateCompOffUsage(
     tenantId: string,
     grant: {
+      id: string;
       employeeId: string;
       earnedDate: Date;
       expiresAt: Date | null;
+      days: number;
       employee: { locationId: string | null };
     },
     usedOnDateInput?: string,
@@ -3308,6 +3847,20 @@ export class AttendanceService {
     const usedOnDate = requireAttendanceDate(usedOnDateInput, 'usedOnDate');
 
     const policy = await this.payrollPolicies.resolve(tenantId, grant.employee.locationId);
+
+    // Enforced expiry is a deadline everywhere, including inside the earned period - which is
+    // the whole difference from NOT_ENFORCED, where the date only ever mattered once
+    // carry-forward carried a grant out of its own period. Checked before the period rules so
+    // an expired grant reports expiry rather than a period mismatch. Inclusive: the grant is
+    // usable *on* `expiresAt`, matching the carry-forward comparison below.
+    if (
+      policy.compOffExpiryTreatment !== CompOffExpiryTreatment.NOT_ENFORCED &&
+      grant.expiresAt &&
+      usedOnDate > grant.expiresAt
+    ) {
+      throw new BadRequestException('This comp-off has expired and can no longer be used');
+    }
+
     const samePeriod = this.compOffUsagePeriodMatches(
       policy.compOffUsagePeriod,
       grant.earnedDate,
@@ -3335,7 +3888,156 @@ export class AttendanceService {
       throw new BadRequestException('A comp-off cannot be used on a holiday');
     }
 
+    await this.assertCompOffExactDurationMatch(tenantId, grant, usedOnDate);
+
     return usedOnDate;
+  }
+
+  /**
+   * Refuses a usage whose target date is not an absence of exactly the grant's own duration.
+   *
+   * A comp-off is indivisible: the grant row carries one `days`, one `status` and one
+   * `usedOnDate`, so spending it is all-or-nothing. That makes an inexact match a silent loss
+   * - a 1-day grant on a half day cleared only the 0.5 that day contributed and the remaining
+   * half was never carried anywhere, and a 0.5-day grant on a full absence left half a day
+   * payable as LOP while consuming the whole grant. Both were accepted before this check, with
+   * no message at decision time. Neither ever *overpaid*, because
+   * `PayrollService.applyCompOffOffsets` caps every grant at what its date actually
+   * contributed; the loss fell on the employee's balance instead.
+   *
+   * The duration is resolved through the same `absence-duration` module payroll's LOP uses, so
+   * the number this check accepts is by construction the number payroll will later offset.
+   * Resolving it any other way would reintroduce exactly the divergence the shared module
+   * exists to prevent.
+   *
+   * Finalization is required first, and not merely because the resolver reads
+   * `isFinalized: true` records: an unfinalized month's statuses are still provisional, and
+   * matching against a provisional absence would accept a usage that finalization could then
+   * invalidate. Month-level rather than record-level, because an absence can also come from
+   * approved unpaid leave, which has no attendance record of its own to carry a flag.
+   *
+   * Two half-day grants against one full-day absence are refused as a consequence of exact
+   * matching rather than by a rule of their own: neither grant matches 1.0, so the first is
+   * already rejected. The `USED` check below covers the other shape of the same problem - a
+   * half-day absence legitimately cleared by one 0.5 grant, then named again by a second.
+   */
+  private async assertCompOffExactDurationMatch(
+    tenantId: string,
+    grant: { id: string; employeeId: string; days: number; employee: { locationId: string | null } },
+    usedOnDate: Date,
+  ): Promise<void> {
+    if (!(await this.isMonthFinalizedFor(tenantId, grant.employee.locationId, usedOnDate))) {
+      throw new BadRequestException(
+        `Attendance must be finalized before this comp-off can be used. ` +
+          `${formatAbsenceDay(usedOnDate)} is in a month that has not been finalized yet.`,
+      );
+    }
+
+    // Checked before the duration, so a date whose absence is already spoken for reports that
+    // rather than a mismatch against a contribution another grant has effectively claimed.
+    const alreadyCovered = await this.prisma.compOffGrant.findFirst({
+      where: {
+        tenantId,
+        employeeId: grant.employeeId,
+        id: { not: grant.id },
+        status: CompOffStatus.USED,
+        usedOnDate,
+      },
+      select: { id: true },
+    });
+    if (alreadyCovered) {
+      throw new BadRequestException(
+        `The absence on ${formatAbsenceDay(usedOnDate)} is already covered by another comp-off ` +
+          `(${alreadyCovered.id}). A single absence cannot be offset twice.`,
+      );
+    }
+
+    const absenceDays = await this.resolveAbsenceDaysOn(tenantId, grant.employeeId, usedOnDate);
+    if (absenceDays <= 0) {
+      throw new BadRequestException(
+        `No qualifying absence was found on ${formatAbsenceDay(usedOnDate)}. A comp-off can ` +
+          `only be used against a finalized unpaid absence.`,
+      );
+    }
+    if (absenceDays === grant.days) return;
+
+    throw new BadRequestException(
+      `${describeCompOffDuration(grant.days)}. It can only be used against ` +
+        `${expectedAbsenceWording(grant.days)}, but ${formatAbsenceDay(usedOnDate)} is ` +
+        `${describeAbsenceDuration(absenceDays)}.`,
+    );
+  }
+
+  /**
+   * The unpaid-absence days one employee carries on one date, scored by the shared resolver.
+   *
+   * Queries the same two sources `PayrollService.lopContributionsByDate` queries - finalized
+   * `ABSENT`/`HALF_DAY` attendance and approved unpaid leave - narrowed to a single employee
+   * and a single day, and hands them to the same pure function. A leave request is matched by
+   * overlap rather than containment so a multi-day request still contributes to this date, and
+   * the resolver spreads it across the request's own span, giving the identical per-day amount
+   * payroll would compute for the whole month.
+   */
+  private async resolveAbsenceDaysOn(
+    tenantId: string,
+    employeeId: string,
+    date: Date,
+  ): Promise<number> {
+    const [attendanceRecords, unpaidLeave] = await Promise.all([
+      this.prisma.attendanceRecord.findMany({
+        where: {
+          tenantId,
+          employeeId,
+          date,
+          isFinalized: true,
+          status: { in: [AttendanceStatus.ABSENT, AttendanceStatus.HALF_DAY] },
+        },
+        select: { employeeId: true, date: true, status: true },
+      }),
+      this.prisma.leaveRequest.findMany({
+        where: {
+          tenantId,
+          employeeId,
+          status: 'APPROVED',
+          leaveType: { isPaid: false },
+          fromDate: { lte: date },
+          toDate: { gte: date },
+        },
+        select: { employeeId: true, days: true, fromDate: true, toDate: true },
+      }),
+    ]);
+
+    const { byDate } = buildAbsenceContributions({
+      attendanceRecords,
+      unpaidLeave,
+      windowStart: date,
+      windowEnd: date,
+    });
+    return absenceDaysOn(byDate, employeeId, date);
+  }
+
+  /**
+   * Whether the month containing `date` is finalized for an employee at `locationId`.
+   *
+   * Mirrors `PayrollService.hasMonthlyAttendanceFinalization`: a tenant-wide finalization
+   * (`locationId: null`) covers everyone, and a location-scoped one covers only that location.
+   */
+  private async isMonthFinalizedFor(
+    tenantId: string,
+    locationId: string | null,
+    date: Date,
+  ): Promise<boolean> {
+    const finalization = await this.prisma.attendanceFinalization.findFirst({
+      where: {
+        tenantId,
+        month: date.getUTCMonth() + 1,
+        year: date.getUTCFullYear(),
+        status: 'FINALIZED',
+        ...(locationId ? { OR: [{ locationId: null }, { locationId }] } : { locationId: null }),
+      },
+      select: { id: true },
+    });
+    return Boolean(finalization);
   }
 
   /**

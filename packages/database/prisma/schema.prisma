@@ -164,6 +164,24 @@ enum CompOffUsagePeriod {
   ANNUAL
 }
 
+/// What `CompOffGrant.expiresAt` actually does for a tenant.
+///
+/// `NOT_ENFORCED` is the behaviour every grant was created under before expiry was
+/// configurable: `expiresAt` is advisory, consulted only where carry-forward already made it
+/// the ceiling, and a grant stays usable to the end of its usage period whatever date it
+/// carries. It is the default so that enabling this feature changes nothing for an existing
+/// tenant - every historical grant carries a 90-day date nobody chose, and enforcing those
+/// retroactively would delete balances the employees were promised.
+///
+/// The other two make `expiresAt` a real deadline, and differ only in what happens to a grant
+/// that reaches it unused: `FORFEIT` pays nothing, `PAY_OUT` still settles it through payroll
+/// under the usual closure rules.
+enum CompOffExpiryTreatment {
+  NOT_ENFORCED
+  FORFEIT
+  PAY_OUT
+}
+
 enum ApprovalStatus {
   PENDING
   APPROVED
@@ -1331,6 +1349,17 @@ model CompOffGrant {
   /// `status: USED`; null for every other status.
   usedOnDate               DateTime?     @db.Date
   status                   CompOffStatus @default(AVAILABLE)
+  /// The payroll run that actually paid this grant out as unused comp-off, set when that run
+  /// is locked and never before. It is the database-enforced half of the "a grant is either
+  /// used or paid, never both" rule: `decideCompOff` claims the grant only while this is null,
+  /// and `lockRun` claims it only while the grant is still AVAILABLE, so the two race on one
+  /// row and exactly one wins. A generated `COMP_OFF_PAYOUT` input still records which grants
+  /// a run *intends* to pay (`metadata.grantIds`); this records which run actually did.
+  ///
+  /// Deliberately a plain column with no relation, exactly like
+  /// `ExpenseClaim.reimbursedInPayrollRunId`: a finalized payout claim must not be silently
+  /// released by anything that happens to the run row afterwards.
+  paidInPayrollRunId       String?
   notes                    String?
   createdAt                DateTime      @default(now())
   updatedAt                DateTime      @updatedAt
@@ -1341,6 +1370,7 @@ model CompOffGrant {
 
   @@index([tenantId])
   @@index([employeeId])
+  @@index([paidInPayrollRunId])
   @@map("comp_off_grants")
 }
 
@@ -1357,6 +1387,11 @@ model PayrollPolicy {
   compOffUnusedTreatment     CompOffUnusedTreatment  @default(UNPAID)
   compOffUsagePeriod         CompOffUsagePeriod      @default(MONTHLY)
   compOffCarryForwardEnabled Boolean                 @default(false)
+  /// How long a new grant stays valid, in days from the day it was earned. Null keeps the
+  /// 90 days grant creation has always stamped. Read only when a grant is created, so
+  /// changing it never re-dates a grant that already exists.
+  compOffExpiryDays          Int?
+  compOffExpiryTreatment     CompOffExpiryTreatment  @default(NOT_ENFORCED)
   isDefault                  Boolean                 @default(false)
   createdAt                  DateTime                @default(now())
   updatedAt                  DateTime                @updatedAt

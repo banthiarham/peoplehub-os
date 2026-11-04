@@ -1,7 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { CompOffUnusedTreatment, CompOffUsagePeriod, SalaryBasis } from '@prisma/client';
+import { CompOffExpiryTreatment, CompOffUnusedTreatment, CompOffUsagePeriod, SalaryBasis } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
-import { UpsertPayrollPolicyDto } from './dto/payroll-policy.dto';
+import {
+  MAX_COMP_OFF_EXPIRY_DAYS,
+  MIN_COMP_OFF_EXPIRY_DAYS,
+  UpsertPayrollPolicyDto,
+} from './dto/payroll-policy.dto';
 import {
   buildPolicySnapshot,
   hashPolicySnapshot,
@@ -13,6 +17,9 @@ import {
 
 /** Upper bound for `fixedDays`: a payable-day count is a day count within one month. */
 export const MAX_FIXED_DAYS = 31;
+
+/** The validity window grant creation has always stamped, kept for a policy that sets none. */
+export const DEFAULT_COMP_OFF_EXPIRY_DAYS = 90;
 
 /**
  * In-code fallback applied when a tenant has configured no payroll policy at all.
@@ -27,6 +34,8 @@ const FALLBACK_POLICY = {
   compOffUnusedTreatment: CompOffUnusedTreatment.UNPAID,
   compOffUsagePeriod: CompOffUsagePeriod.MONTHLY,
   compOffCarryForwardEnabled: false,
+  compOffExpiryDays: null as number | null,
+  compOffExpiryTreatment: CompOffExpiryTreatment.NOT_ENFORCED,
   isDefault: true,
 };
 
@@ -39,6 +48,8 @@ type PolicySettings = {
   compOffUnusedTreatment?: CompOffUnusedTreatment;
   compOffUsagePeriod?: CompOffUsagePeriod;
   compOffCarryForwardEnabled?: boolean;
+  compOffExpiryDays?: number | null;
+  compOffExpiryTreatment?: CompOffExpiryTreatment;
 };
 
 @Injectable()
@@ -102,6 +113,8 @@ export class PayrollPolicyService {
       compOffUnusedTreatment: dto.compOffUnusedTreatment ?? policy.compOffUnusedTreatment,
       compOffUsagePeriod: dto.compOffUsagePeriod ?? policy.compOffUsagePeriod,
       compOffCarryForwardEnabled: dto.compOffCarryForwardEnabled ?? policy.compOffCarryForwardEnabled,
+      compOffExpiryDays: dto.compOffExpiryDays ?? policy.compOffExpiryDays,
+      compOffExpiryTreatment: dto.compOffExpiryTreatment ?? policy.compOffExpiryTreatment,
     };
 
     return this.prisma.payrollPolicy.update({
@@ -205,6 +218,21 @@ export class PayrollPolicyService {
       throw new BadRequestException('fixedDays may only be set when salaryBasis is FIXED_DAYS');
     }
 
+    // Re-checked here and not only at the DTO, because `update` merges a stored value in and
+    // the service is the one path every caller shares.
+    const expiryDays = settings.compOffExpiryDays;
+    if (expiryDays !== undefined && expiryDays !== null) {
+      if (
+        !Number.isInteger(expiryDays) ||
+        expiryDays < MIN_COMP_OFF_EXPIRY_DAYS ||
+        expiryDays > MAX_COMP_OFF_EXPIRY_DAYS
+      ) {
+        throw new BadRequestException(
+          `compOffExpiryDays must be an integer between ${MIN_COMP_OFF_EXPIRY_DAYS} and ${MAX_COMP_OFF_EXPIRY_DAYS}`,
+        );
+      }
+    }
+
     return {
       salaryBasis,
       fixedDays: salaryBasis === SalaryBasis.FIXED_DAYS ? (fixedDays as number) : null,
@@ -213,6 +241,8 @@ export class PayrollPolicyService {
       compOffUnusedTreatment: settings.compOffUnusedTreatment ?? CompOffUnusedTreatment.UNPAID,
       compOffUsagePeriod: settings.compOffUsagePeriod ?? CompOffUsagePeriod.MONTHLY,
       compOffCarryForwardEnabled: settings.compOffCarryForwardEnabled ?? false,
+      compOffExpiryDays: settings.compOffExpiryDays ?? null,
+      compOffExpiryTreatment: settings.compOffExpiryTreatment ?? CompOffExpiryTreatment.NOT_ENFORCED,
       isDefault: locationId === null,
     };
   }

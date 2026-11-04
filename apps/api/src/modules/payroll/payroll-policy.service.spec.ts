@@ -1,5 +1,5 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { CompOffUnusedTreatment, CompOffUsagePeriod, SalaryBasis } from '@prisma/client';
+import { CompOffExpiryTreatment, CompOffUnusedTreatment, CompOffUsagePeriod, SalaryBasis } from '@prisma/client';
 import { PayrollPolicyService } from './payroll-policy.service';
 
 /**
@@ -247,6 +247,10 @@ describe('PayrollPolicyService.resolve precedence', () => {
       compOffUnusedTreatment: CompOffUnusedTreatment.UNPAID,
       compOffUsagePeriod: CompOffUsagePeriod.MONTHLY,
       compOffCarryForwardEnabled: false,
+      // The legacy expiry behaviour an unconfigured tenant must keep: a 90-day stamp that
+      // does nothing. Anything else here would silently expire existing balances.
+      compOffExpiryDays: null,
+      compOffExpiryTreatment: CompOffExpiryTreatment.NOT_ENFORCED,
       inherited: true,
     });
   });
@@ -262,5 +266,58 @@ describe('PayrollPolicyService.resolve precedence', () => {
     const prisma = buildPrisma({ policies: [locationPolicy] });
     const resolved = await newService(prisma).resolve('tenant-1', 'loc-2');
     expect(resolved.id).toBe('default:tenant-1');
+  });
+
+  describe('comp-off expiry settings', () => {
+    it('persists a configured window and treatment', async () => {
+      const prisma = buildPrisma({ policies: [] });
+      const created = await newService(prisma).create('tenant-1', {
+        compOffExpiryDays: 45,
+        compOffExpiryTreatment: CompOffExpiryTreatment.PAY_OUT,
+      });
+
+      expect(created).toMatchObject({
+        compOffExpiryDays: 45,
+        compOffExpiryTreatment: CompOffExpiryTreatment.PAY_OUT,
+      });
+    });
+
+    it('defaults a new policy that sets neither to the legacy behaviour', async () => {
+      const prisma = buildPrisma({ policies: [] });
+      const created = await newService(prisma).create('tenant-1', {});
+
+      expect(created).toMatchObject({
+        compOffExpiryDays: null,
+        compOffExpiryTreatment: CompOffExpiryTreatment.NOT_ENFORCED,
+      });
+    });
+
+    it.each([0, -5, 1096, 12.5])('rejects %p as a validity window', async (days) => {
+      // Re-checked in the service and not only at the DTO, because `update` merges a stored
+      // value in and the service is the one path every caller shares.
+      const prisma = buildPrisma({ policies: [] });
+      await expect(
+        newService(prisma).create('tenant-1', { compOffExpiryDays: days as number }),
+      ).rejects.toThrow('compOffExpiryDays must be an integer between 1 and 1095');
+    });
+
+    it('keeps the stored settings when an unrelated field is updated', async () => {
+      const stored = {
+        ...tenantDefault,
+        compOffExpiryDays: 30,
+        compOffExpiryTreatment: CompOffExpiryTreatment.FORFEIT,
+      };
+      const prisma = buildPrisma({ policies: [stored] });
+
+      const updated = await newService(prisma).update('tenant-1', stored.id, {
+        overtimePaymentEnabled: true,
+      });
+
+      expect(updated).toMatchObject({
+        overtimePaymentEnabled: true,
+        compOffExpiryDays: 30,
+        compOffExpiryTreatment: CompOffExpiryTreatment.FORFEIT,
+      });
+    });
   });
 });

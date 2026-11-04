@@ -3,6 +3,10 @@ import { Cron } from '@nestjs/schedule';
 import { ApprovalStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import {
+  assertPayrollPeriodOpen,
+  payrollPeriodOf,
+} from '../../common/utils/payroll-period-lock';
 import { syncSystemPunchEvents } from '../attendance/punch-events';
 import { CreateWorkflowDto, RaiseApprovalDto, UpdateWorkflowDto, WorkflowStepDto } from './dto/workflows.dto';
 
@@ -642,6 +646,19 @@ export class WorkflowsService {
     const punchIn = typeof data.punchIn === 'string' ? new Date(data.punchIn) : undefined;
     const punchOut = typeof data.punchOut === 'string' ? new Date(data.punchOut) : undefined;
     const reason = typeof data.reason === 'string' ? data.reason : 'Approved regularization';
+    // Applied on the approval transaction's own client, before any attendance write: a period
+    // can be locked while a request sits pending, and an approved regularization removes LOP
+    // a frozen run has already paid. Throwing here rolls the whole approval back, so the
+    // request stays pending rather than being half-applied or auto-rejected.
+    await assertPayrollPeriodOpen(
+      tx,
+      {
+        tenantId: request.tenantId,
+        period: payrollPeriodOf(date),
+        employeeIds: [employeeId],
+      },
+      'this regularization can no longer be applied',
+    );
     const workingMinutes =
       punchIn && punchOut ? Math.max(0, Math.round((punchOut.getTime() - punchIn.getTime()) / 60000)) : undefined;
 

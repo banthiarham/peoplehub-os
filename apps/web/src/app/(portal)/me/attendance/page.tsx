@@ -10,6 +10,24 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Skeleton } from '@/components/ui/skeleton';
+import {
+  compOffDisplayState,
+  compOffDurationLabel,
+  compOffStateLabel,
+} from '@/lib/comp-off';
+
+/** One of the caller's own Comp-Off grants, as `GET /attendance/comp-offs` returns it. */
+interface MyCompOffRow {
+  id: string;
+  earnedDate: string;
+  days: number;
+  expiresAt: string | null;
+  usedOnDate: string | null;
+  status: string;
+  paidInPayrollRunId: string | null;
+  /** Whether this grant's expiry date binds, per the policy at its own employee's location. */
+  expiryEnforced: boolean;
+}
 
 interface RecordRow {
   id: string;
@@ -113,7 +131,77 @@ export default function MyAttendancePage() {
           description="Nothing recorded for this month."
         />
       )}
+
+      <MyCompOffs />
     </div>
+  );
+}
+
+/**
+ * The employee's own Comp-Off credits, read-only.
+ *
+ * `GET /attendance/comp-offs` already scopes to the caller's own grants for anyone without a
+ * ledger role, so this needs no new endpoint and no new authorization: the same request an
+ * administrator makes returns only this employee's rows here. Added to the existing attendance
+ * page rather than a route of its own - it is attendance information, the page already carries
+ * the `attendance:read` scope the endpoint wants, and a new tab would need a nav entry nobody
+ * asked for.
+ *
+ * Deliberately read-only. Crediting, using and cancelling all run through checks (eligible
+ * shift, finalized absence of matching duration, payroll period open) that belong to the
+ * administrative ledger; an employee-facing request workflow is a larger change than showing a
+ * balance, and is not part of this work.
+ *
+ * Not shown month by month: a grant earned in one month is often spent or paid in another, so
+ * filtering to the selected month would hide exactly the rows an employee is looking for.
+ */
+function MyCompOffs() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['attendance', 'my-comp-offs'],
+    queryFn: () => api.get('/attendance/comp-offs').then((r) => r.data as MyCompOffRow[]),
+  });
+  if (isLoading) return <Skeleton className="h-24" />;
+  if (!data?.length) return null;
+
+  // `expiryEnforced` arrives per grant, resolved by the API from the policy at that grant's own
+  // location. That also means this view no longer asks for payroll policy at all - which an
+  // employee has no business reading, and which could only ever have given the tenant default.
+  const states = data.map((grant) => ({
+    grant,
+    state: compOffDisplayState(grant, { expiryEnforced: grant.expiryEnforced }),
+  }));
+  const available = states.filter((row) => row.state === 'AVAILABLE');
+  const remaining = available.reduce((sum, row) => sum + row.grant.days, 0);
+
+  return (
+    <section className="space-y-2">
+      <div className="flex items-baseline justify-between">
+        <h2 className="text-base font-semibold tracking-tight">My Comp-Off</h2>
+        <p className="text-xs text-ink-muted">
+          {/* Rounded because fractional days accumulate: three halves is 1.5, not 1.4999…. */}
+          {Math.round(remaining * 100) / 100} day(s) available
+        </p>
+      </div>
+      <div className="space-y-2">
+        {states.map(({ grant, state }) => (
+          <Card key={grant.id} className="flex items-center justify-between p-3.5">
+            <div>
+              <p className="text-sm font-medium">{compOffDurationLabel(grant.days)}</p>
+              <p className="mt-0.5 text-xs text-ink-muted">
+                Earned {formatDate(grant.earnedDate)}
+                {grant.usedOnDate && ` · used on ${formatDate(grant.usedOnDate)}`}
+                {state === 'AVAILABLE' &&
+                  grant.expiresAt &&
+                  ` · expires ${formatDate(grant.expiresAt)}`}
+              </p>
+            </div>
+            <Badge variant={statusVariant(state === 'PAID' ? 'APPROVED' : state)}>
+              {compOffStateLabel(state)}
+            </Badge>
+          </Card>
+        ))}
+      </div>
+    </section>
   );
 }
 

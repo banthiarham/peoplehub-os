@@ -1,13 +1,17 @@
 import { createHash } from 'crypto';
 
 /** Bump when the shape of a snapshot changes; it is part of the hash, so old runs read as stale. */
-export const POLICY_SNAPSHOT_VERSION = 1;
+export const POLICY_SNAPSHOT_VERSION = 2;
 
 /**
  * The `PayrollPolicy` fields that directly drive what a payroll run computes: the salary
  * denominator, whether approved overtime pays out, and when/if unused comp-off is paid.
  * `compOffEnabled` is deliberately absent - it only gates grant creation in attendance, so
- * flipping it cannot change a run that has already been processed.
+ * flipping it cannot change a run that has already been processed. `compOffExpiryDays` is
+ * absent for the same reason: it is read only when a grant is stamped, never when a run is
+ * computed. `compOffExpiryTreatment` is present precisely because it is not like those two -
+ * it decides whether an expired grant is paid at all and when its usage window closes, so a
+ * run processed under one treatment would pay differently under another.
  */
 export interface PayrollPolicyInputs {
   salaryBasis: string;
@@ -16,6 +20,7 @@ export interface PayrollPolicyInputs {
   compOffUnusedTreatment: string;
   compOffUsagePeriod: string;
   compOffCarryForwardEnabled: boolean;
+  compOffExpiryTreatment: string;
 }
 
 /** Resolved inputs per employee location; the key is the location id, or '' for no location. */
@@ -33,6 +38,7 @@ export function pickPolicyInputs(policy: PayrollPolicyInputs): PayrollPolicyInpu
     compOffUnusedTreatment: policy.compOffUnusedTreatment,
     compOffUsagePeriod: policy.compOffUsagePeriod,
     compOffCarryForwardEnabled: policy.compOffCarryForwardEnabled,
+    compOffExpiryTreatment: policy.compOffExpiryTreatment,
   };
 }
 
