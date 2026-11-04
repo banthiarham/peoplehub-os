@@ -397,6 +397,19 @@ export class AttendanceController {
     return this.attendance.listCompOffs(user);
   }
 
+  @Get('comp-offs/:id/eligible-dates')
+  @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
+  @Scopes('attendance:read')
+  @ApiOperation({
+    summary: 'Dates one comp-off can be used on: finalized absences of exactly its duration',
+    description:
+      'A convenience for the usage dialog, not a security boundary - PATCH comp-offs/:id ' +
+      'revalidates every rule when the usage is submitted.',
+  })
+  compOffEligibleDates(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.attendance.compOffEligibleDates(user, id);
+  }
+
   @Post('comp-offs')
   @Roles('Super Admin', 'Tenant Owner', 'HR Admin', 'Manager')
   @Scopes('attendance:write')

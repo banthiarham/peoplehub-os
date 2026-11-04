@@ -40,7 +40,14 @@ import {
   toAttendanceImportPayload,
   type AttendanceImportRow,
 } from '@/lib/attendance-import';
-import { compOffDecisionPayload, type CompOffDecision } from '@/lib/comp-off';
+import {
+  compOffDecisionPayload,
+  compOffDisplayState,
+  compOffDurationLabel,
+  compOffIsActionable,
+  compOffStateLabel,
+  type CompOffDecision,
+} from '@/lib/comp-off';
 import { captureFreshFix } from '@/lib/geo';
 import { cn, formatDate, formatTime } from '@/lib/utils';
 import { Avatar } from '@/components/ui/avatar';
@@ -156,7 +163,34 @@ interface CompOffRow {
   /** The scheduled working day a USED grant was spent against. */
   usedOnDate: string | null;
   status: string;
+  /**
+   * The payroll run that paid this grant out as unused comp-off, set when that run locked.
+   *
+   * Already returned by `GET /attendance/comp-offs` - the endpoint selects no subset of
+   * scalars - so reading it here needs no API change. It matters because payroll never writes
+   * `status`: a grant whose money has gone out still reads `AVAILABLE`, and without this the
+   * ledger offered actions on it that the API would refuse.
+   */
+  paidInPayrollRunId: string | null;
+  /**
+   * Whether this grant's `expiresAt` is a real deadline, resolved by the API from the payroll
+   * policy at *this grant's* employee's location.
+   *
+   * Per grant rather than per tenant because the expiry treatment is a per-location setting:
+   * a grant at a location that overrides the tenant default would otherwise be shown under the
+   * wrong rule, in whichever direction the override went. The row carries no location, so the
+   * client could not resolve this itself even if it wanted to.
+   */
+  expiryEnforced: boolean;
   employee: { firstName: string; lastName: string };
+}
+
+/** An absence a grant can be spent on, from `GET comp-offs/:id/eligible-dates`. */
+interface CompOffEligibleDates {
+  grantId: string;
+  days: number;
+  dates: Array<{ date: string; days: number }>;
+  unavailableReason?: string;
 }
 
 interface HolidayRow {
@@ -2551,7 +2585,25 @@ function CompOffTab() {
 
   // A grant is spent against one named scheduled working day, so USED is collected in a
   // dialog rather than fired from the row. Cancellation needs no date and stays one click.
-  const [markingUsed, setMarkingUsed] = useState<{ id: string; usedOnDate: string } | null>(null);
+  // `days` is carried so the dialog can say what the credit is worth without re-finding the row.
+  const [markingUsed, setMarkingUsed] = useState<{
+    id: string;
+    days: number;
+    usedOnDate: string;
+  } | null>(null);
+
+  // The dates this grant could actually be spent on. Fetched only while the dialog is open,
+  // and per grant, because eligibility depends on the grant's own duration and window. Purely
+  // a convenience: the PATCH re-validates every rule, so a stale list costs a clear 400 rather
+  // than a wrong write.
+  const eligible = useQuery({
+    queryKey: ['attendance', 'comp-offs', markingUsed?.id, 'eligible-dates'],
+    enabled: markingUsed !== null,
+    queryFn: () =>
+      api
+        .get(`/attendance/comp-offs/${markingUsed?.id}/eligible-dates`)
+        .then((r) => r.data as CompOffEligibleDates),
+  });
 
   const decide = useMutation({
     mutationFn: ({ id, status, usedOnDate }: { id: string; status: CompOffDecision; usedOnDate?: string }) => {
@@ -2612,7 +2664,7 @@ function CompOffTab() {
             </Select>
           </label>
           <label className="block text-xs text-ink-muted">
-            Expires on (optional — defaults to 90 days)
+            Expires on (optional — defaults to your payroll policy)
             <Input
               type="date"
               value={form.expiresAt}
@@ -2643,28 +2695,38 @@ function CompOffTab() {
             </TR>
           </THead>
           <TBody>
-            {data?.map((c) => (
+            {data?.map((c) => {
+              const state = compOffDisplayState(c, { expiryEnforced: c.expiryEnforced });
+              return (
               <TR key={c.id}>
                 <TD>
                   {c.employee.firstName} {c.employee.lastName}
                 </TD>
                 <TD>{formatDate(c.earnedDate)}</TD>
-                <TD>{c.days}</TD>
+                <TD>{compOffDurationLabel(c.days)}</TD>
                 <TD>{c.usedOnDate ? formatDate(c.usedOnDate) : '—'}</TD>
                 <TD>{c.expiresAt ? formatDate(c.expiresAt) : '—'}</TD>
                 <TD>
-                  <Badge variant={statusVariant(c.status)}>{c.status}</Badge>
+                  <Badge variant={statusVariant(state === 'PAID' ? 'APPROVED' : state)}>
+                    {compOffStateLabel(state)}
+                  </Badge>
+                  {state === 'PAID' && (
+                    // Named so an administrator can reconcile the payslip line against the run
+                    // that produced it, rather than wondering why the grant looks untouched.
+                    <span className="ml-2 text-xs text-ink-faint">run {c.paidInPayrollRunId}</span>
+                  )}
                 </TD>
                 <TD className="space-x-1">
-                  {c.status === 'AVAILABLE' ? (
+                  {compOffIsActionable(state) ? (
                     <>
                       <Button
                         size="sm"
                         variant="outline"
                         disabled={decide.isPending}
-                        onClick={() =>
-                          setMarkingUsed({ id: c.id, usedOnDate: new Date().toISOString().slice(0, 10) })
-                        }
+                        // No date is pre-filled. The old default of "today" was almost always
+                        // wrong - an ordinary working day carries no absence to offset - so the
+                        // dialog now requires an explicit pick from the eligible dates.
+                        onClick={() => setMarkingUsed({ id: c.id, days: c.days, usedOnDate: '' })}
                       >
                         Mark used
                       </Button>
@@ -2676,13 +2738,24 @@ function CompOffTab() {
                       >
                         Cancel
                       </Button>
+                      {/* The API has always accepted EXPIRED; until now nothing could send it,
+                          so the status was unreachable from the product. */}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: c.id, status: 'EXPIRED' })}
+                      >
+                        Mark expired
+                      </Button>
                     </>
                   ) : (
                     <span className="text-xs text-ink-faint">—</span>
                   )}
                 </TD>
               </TR>
-            ))}
+              );
+            })}
           </TBody>
         </Table>
       </Card>
@@ -2691,22 +2764,43 @@ function CompOffTab() {
           <DialogHeader>
             <DialogTitle>Mark comp-off used</DialogTitle>
             <DialogDescription>
-              Pick the scheduled working day this comp-off is taken on. It has to be a day the
-              employee was rostered to work — not a weekly off or a holiday — and within the
-              usage period your payroll policy allows.
+              {markingUsed ? compOffDurationLabel(markingUsed.days) : ''} — this credit can only
+              be used against an absence of the same length, on a finalized day the employee was
+              rostered to work. Only those dates are listed.
             </DialogDescription>
           </DialogHeader>
           <label className="block py-2 text-sm">
             <span className="text-ink-muted">Used on</span>
-            <Input
-              className="mt-1"
-              type="date"
-              required
-              value={markingUsed?.usedOnDate ?? ''}
-              onChange={(e) =>
-                setMarkingUsed((current) => current && { ...current, usedOnDate: e.target.value })
-              }
-            />
+            {eligible.isPending ? (
+              <p className="mt-1 text-xs text-ink-faint">Finding eligible dates…</p>
+            ) : eligible.isError ? (
+              <p className="mt-1 text-xs text-danger">{apiError(eligible.error)}</p>
+            ) : eligible.data?.dates.length ? (
+              <Select
+                className="mt-1 w-full"
+                required
+                value={markingUsed?.usedOnDate ?? ''}
+                onChange={(e) =>
+                  setMarkingUsed((current) => current && { ...current, usedOnDate: e.target.value })
+                }
+              >
+                <option value="">Select a date</option>
+                {eligible.data.dates.map((option) => (
+                  <option key={option.date} value={option.date}>
+                    {formatDate(option.date)} — {compOffDurationLabel(option.days)} absence
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <p className="mt-1 text-xs text-ink-muted">
+                {eligible.data?.unavailableReason ??
+                  `No matching absence: this is a ${
+                    markingUsed?.days === 0.5 ? 'half-day' : 'full-day'
+                  } credit, and no finalized ${
+                    markingUsed?.days === 0.5 ? 'half-day' : 'full-day'
+                  } absence is available in its usage period.`}
+              </p>
+            )}
           </label>
           <DialogFooter>
             <Button variant="outline" onClick={() => setMarkingUsed(null)}>

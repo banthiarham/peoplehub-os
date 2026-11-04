@@ -247,6 +247,67 @@ function frozenRunListLookup(runs: FrozenRunFixture[]) {
  * queries: the generated payout's own type/source, the grant id inside `metadata.grantIds`,
  * and the owning run's status.
  */
+/**
+ * Supplies, on an existing comp-off decision harness, the preconditions exact-duration usage
+ * validation added - as every one of these fixtures would have met them before the rule
+ * existed.
+ *
+ * Each pre-existing case was written to exercise one guard (authorization, the weekly-off
+ * check, a frozen payroll period, the atomic transition) against a date it simply assumed was
+ * usable. The new rule means "usable" now also requires a finalized month and an absence of
+ * exactly the grant's duration, so without these defaults every such case fails on a
+ * precondition it was never about. Defaulting them here keeps each test testing what it was
+ * written to test; the exact-match rule itself is covered by its own suite, which sets these
+ * deliberately rather than inheriting them.
+ *
+ * Three things are filled in:
+ *
+ *  - **A finalized month.** Unconditional, because no pre-existing case is about finalization.
+ *  - **A full-day absence on whichever date is queried**, which matches the full-day grant
+ *    every one of these fixtures describes.
+ *  - **`days: 1` on the grant**, where the fixture predates the field. These rows were written
+ *    when nothing read `days`; they all describe a full-day grant, and saying so explicitly is
+ *    what lets the match succeed.
+ *
+ * It also routes the one query a blanket `findFirst` mock would otherwise answer wrongly.
+ * `decideCompOff` now issues two distinct `compOffGrant.findFirst` calls - the grant by id, and
+ * "is another USED grant already covering this date" - and a mock that answers every findFirst
+ * with the grant under test would report that grant as covered by itself. The coverage query is
+ * answered from `coveringGrant` (nothing, unless a test sets it) so each fixture's own mock
+ * keeps answering only the lookup it was written for.
+ */
+function withCompOffUsagePreconditions(
+  prisma: Record<string, any>,
+  options: { coveringGrant?: Record<string, unknown> | null } = {},
+): Record<string, any> {
+  prisma.attendanceFinalization ??= {
+    findFirst: jest.fn().mockResolvedValue({ id: 'finalization-1' }),
+  };
+  prisma.attendanceRecord = {
+    ...(prisma.attendanceRecord ?? {}),
+    findMany:
+      prisma.attendanceRecord?.findMany ??
+      jest.fn(({ where }: any) =>
+        Promise.resolve([{ employeeId: where.employeeId, date: where.date, status: 'ABSENT' }]),
+      ),
+  };
+  prisma.leaveRequest ??= { findMany: jest.fn().mockResolvedValue([]) };
+
+  const grantFindFirst = prisma.compOffGrant?.findFirst;
+  if (grantFindFirst) {
+    prisma.compOffGrant.findFirst = jest.fn(async (args: any) => {
+      const where = args?.where ?? {};
+      if (where.status === 'USED' && 'usedOnDate' in where) return options.coveringGrant ?? null;
+      const grant = await grantFindFirst(args);
+      if (grant && typeof grant === 'object' && (grant as any).days === undefined) {
+        return { ...(grant as Record<string, unknown>), days: 1 };
+      }
+      return grant;
+    });
+  }
+  return prisma;
+}
+
 function frozenPayoutLookup(
   payouts: Array<{ tenantId?: string; employeeId: string; grantIds: string[]; payrollRun: Record<string, any> }>,
 ) {
@@ -2680,6 +2741,75 @@ describe('AttendanceService', () => {
       expect(compOffGrants).toHaveLength(0);
     });
 
+    /**
+     * Earned duration is the day's own status, never a minutes threshold of comp-off's own.
+     * `eligibleShift` keeps `halfDayAfterMinutes: 240` and `minWorkingMinutes: 480` precisely
+     * so these cases prove those two fields no longer decide anything: the minute counts below
+     * straddle 240 on purpose, and only `status` moves the result.
+     */
+    describe('earned duration follows the attendance status', () => {
+      const grantFor = async (status: string, workingMinutes: number) => {
+        const { service, compOffGrants } = buildFinalizeHarness({
+          payrollPolicies: compOffEnabledPolicy,
+          existing: [
+            { id: 'record-1', employeeId: 'emp-1', date: saturday, status, workingMinutes, shift: eligibleShift },
+          ],
+        });
+        await service.finalizeMonth('tenant-1', 'hr-1', { month: '2026-07' });
+        return compOffGrants;
+      };
+
+      it('credits half a day for a HALF_DAY worked on a weekly off', async () => {
+        const grants = await grantFor('HALF_DAY', 300);
+
+        expect(grants).toHaveLength(1);
+        expect(grants[0]).toMatchObject({ employeeId: 'emp-1', earnedDate: saturday, days: 0.5 });
+      });
+
+      it('credits a full day for a PRESENT weekly off', async () => {
+        const grants = await grantFor('PRESENT', 480);
+
+        expect(grants).toHaveLength(1);
+        expect(grants[0]).toMatchObject({ days: 1 });
+      });
+
+      it('credits a full day for LATE, which only ever marks an otherwise full day', async () => {
+        const grants = await grantFor('LATE', 480);
+
+        expect(grants).toHaveLength(1);
+        expect(grants[0]).toMatchObject({ days: 1 });
+      });
+
+      // The old gate passed anything at or above 240 minutes and then wrote `days: 1`, so this
+      // exact day - stored HALF_DAY, worked 300 minutes - used to earn a *whole* day, and under
+      // `compOffUnusedTreatment: PAY` a whole day's cash for half a day worked.
+      it('does not round a half day up to a full day just because it cleared 240 minutes', async () => {
+        const grants = await grantFor('HALF_DAY', 300);
+
+        expect(grants[0].days).toBe(0.5);
+      });
+
+      // The mirror image: under the old gate a HALF_DAY below 240 minutes earned nothing at all,
+      // even though attendance had already credited the employee with half a day.
+      it('still credits half a day for a HALF_DAY below the retired 240-minute threshold', async () => {
+        const grants = await grantFor('HALF_DAY', 200);
+
+        expect(grants).toHaveLength(1);
+        expect(grants[0].days).toBe(0.5);
+      });
+
+      it('grants nothing for ABSENT however many minutes the record carries', async () => {
+        expect(await grantFor('ABSENT', 300)).toHaveLength(0);
+      });
+
+      it.each(['WEEKEND', 'HOLIDAY', 'ON_LEAVE', 'MISSING_PUNCH'])(
+        'grants nothing for %s, which describes a day that was not worked',
+        async (status) => {
+          expect(await grantFor(status, 480)).toHaveLength(0);
+        },
+      );
+    });
+
     it('does not create a duplicate grant when the same month is re-finalized', async () => {
       const record = {
         id: 'record-1',
@@ -4607,6 +4737,7 @@ describe('manual comp-off grants', () => {
       payrollVariableInput: { findFirst: frozenPayoutLookup([]) },
       ...overrides,
     };
+    withCompOffUsagePreconditions(prisma);
     return { prisma, service: newAttendanceService(prisma) };
   }
 
@@ -4766,6 +4897,125 @@ describe('manual comp-off grants', () => {
     await expect(
       service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
     ).rejects.toThrow('holiday');
+  });
+
+  /**
+   * Tenant-configurable expiry, on the attendance side.
+   *
+   * Two separate things are configurable and they are tested separately: how long a new grant
+   * is stamped valid for (`compOffExpiryDays`, read only at creation), and whether that date
+   * is a real deadline (`compOffExpiryTreatment`). Under the `NOT_ENFORCED` default the date
+   * stays advisory inside the earned period, which is what every grant created before this
+   * feature relies on.
+   */
+  describe('tenant-configurable expiry', () => {
+    const policyRow = (overrides: Record<string, unknown> = {}) => ({
+      findFirst: jest.fn().mockResolvedValue({
+        id: 'p1',
+        tenantId: 'tenant-1',
+        locationId: null,
+        compOffUsagePeriod: 'ANNUAL',
+        compOffCarryForwardEnabled: false,
+        compOffExpiryDays: null,
+        compOffExpiryTreatment: 'NOT_ENFORCED',
+        ...overrides,
+      }),
+    });
+
+    // Earned Monday 3 Aug 2026 under an ANNUAL period, so without enforcement the grant is
+    // usable to 31 Dec; a 10-day window ends it on 13 Aug (a Thursday).
+    const grantEarnedAugust = (overrides: Record<string, unknown> = {}) => ({
+      findFirst: jest.fn().mockResolvedValue({
+        id: 'grant-1',
+        status: 'AVAILABLE',
+        employeeId: 'emp-1',
+        earnedDate: new Date(Date.UTC(2026, 7, 3)),
+        expiresAt: new Date(Date.UTC(2026, 7, 13)),
+        employee: { managerId: 'mgr-1', locationId: null },
+        ...overrides,
+      }),
+      findFirstOrThrow: jest.fn().mockResolvedValue({ id: 'grant-1', status: 'USED' }),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    });
+
+    it('stamps a new grant with the tenant-configured window instead of the 90-day default', async () => {
+      const { prisma, service } = compOffHarness({ payrollPolicy: policyRow({ compOffExpiryDays: 30 }) });
+
+      await service.createCompOff('tenant-1', { employeeId: 'emp-1', earnedDate: '2026-08-15' });
+
+      const { data } = prisma.compOffGrant.create.mock.calls[0][0];
+      expect(data.expiresAt.toISOString().slice(0, 10)).toBe('2026-09-14');
+    });
+
+    it('still lets an explicit expiry override the configured window', async () => {
+      // The manual path exists for the correction a policy cannot express, so it keeps winning.
+      const { prisma, service } = compOffHarness({ payrollPolicy: policyRow({ compOffExpiryDays: 30 }) });
+
+      await service.createCompOff('tenant-1', {
+        employeeId: 'emp-1',
+        earnedDate: '2026-08-15',
+        expiresAt: '2026-12-31',
+      });
+
+      const { data } = prisma.compOffGrant.create.mock.calls[0][0];
+      expect(data.expiresAt.toISOString().slice(0, 10)).toBe('2026-12-31');
+    });
+
+    it.each(['FORFEIT', 'PAY_OUT'])(
+      'under %s, rejects usage after the expiry even inside the earned period',
+      async (treatment) => {
+        const { prisma, service } = compOffHarness({
+          payrollPolicy: policyRow({ compOffExpiryTreatment: treatment }),
+          compOffGrant: grantEarnedAugust(),
+        });
+
+        // Monday 17 Aug 2026: same calendar year as the grant, so only expiry can refuse it.
+        await expect(
+          service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' }),
+        ).rejects.toThrow('has expired and can no longer be used');
+        expect(prisma.compOffGrant.updateMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('treats the expiry date itself as usable', async () => {
+      // One documented convention: inclusive, matching the carry-forward comparison that has
+      // always read `usedOnDate > expiresAt`.
+      const { prisma, service } = compOffHarness({
+        payrollPolicy: policyRow({ compOffExpiryTreatment: 'FORFEIT' }),
+        compOffGrant: grantEarnedAugust(),
+      });
+
+      // Thursday 13 Aug 2026 is the expiry date.
+      await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-13' });
+
+      expect(prisma.compOffGrant.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: 'USED' }) }),
+      );
+    });
+
+    it('leaves a NOT_ENFORCED tenant able to use the same grant after that date', async () => {
+      // The backward-compatibility guarantee: the accidental 90-day dates on every historical
+      // grant must not start deleting balances when this feature ships.
+      const { prisma, service } = compOffHarness({
+        payrollPolicy: policyRow(),
+        compOffGrant: grantEarnedAugust(),
+      });
+
+      await service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2026-08-17' });
+
+      expect(prisma.compOffGrant.updateMany).toHaveBeenCalled();
+    });
+
+    it('still refuses an expired grant that carry-forward would otherwise carry', async () => {
+      const { service } = compOffHarness({
+        payrollPolicy: policyRow({ compOffExpiryTreatment: 'PAY_OUT', compOffCarryForwardEnabled: true }),
+        compOffGrant: grantEarnedAugust(),
+      });
+
+      await expect(
+        service.decideCompOff(hrAdminUser, 'grant-1', { status: 'USED' as never, usedOnDate: '2027-01-11' }),
+      ).rejects.toThrow('has expired and can no longer be used');
+    });
   });
 
   it('rejects usage in a later calendar month under a MONTHLY policy', async () => {
@@ -4940,6 +5190,225 @@ describe('listCompOffs visibility', () => {
   });
 });
 
+/**
+ * Per-grant expiry enforcement on the ledger.
+ *
+ * `compOffExpiryTreatment` is a per-location setting, and `expiresAt` alone cannot say whether
+ * it binds: under NOT_ENFORCED a lapsed date is advisory and the grant stays usable, while
+ * under FORFEIT or PAY_OUT the same date makes it unusable. The ledger row carries no location,
+ * so only the server can resolve this - and resolving it from the tenant default would
+ * misreport every grant at a location that overrides it, in whichever direction the override
+ * went. These tests pin that the resolution is per grant's own location, and that it costs one
+ * policy lookup per distinct location rather than one per grant.
+ */
+describe('listCompOffs expiry enforcement per location', () => {
+  const ledgerUser = {
+    userId: 'user-hr', tenantId: 'tenant-1', email: 'hr@x.com', name: 'HR',
+    isSuperAdmin: false, employeeId: 'emp-hr', roles: ['HR Admin'],
+  } as AuthUser;
+
+  /**
+   * `policies` maps a location key ('' for no location) to that scope's configured treatment.
+   * The double answers `payrollPolicy.findFirst` the way the real table would, so
+   * `PayrollPolicyService.resolve`'s own precedence - scoped row, then tenant default, then the
+   * in-code fallback - is the thing under test rather than something restated here.
+   */
+  function harness(
+    grants: Array<{
+      id: string;
+      locationId: string | null;
+      status?: string;
+      expiresAt?: Date | null;
+      days?: number;
+    }>,
+    policies: Record<string, 'NOT_ENFORCED' | 'FORFEIT' | 'PAY_OUT'> = {},
+  ) {
+    const prisma = {
+      compOffGrant: {
+        findMany: jest.fn().mockResolvedValue(
+          grants.map((grant) => ({
+            id: grant.id,
+            earnedDate: new Date(Date.UTC(2026, 7, 15)),
+            expiresAt: grant.expiresAt ?? new Date(Date.UTC(2026, 8, 1)),
+            usedOnDate: null,
+            days: grant.days ?? 1,
+            status: grant.status ?? 'AVAILABLE',
+            paidInPayrollRunId: null,
+            employee: {
+              firstName: 'A',
+              lastName: 'B',
+              employeeCode: 'E1',
+              locationId: grant.locationId,
+            },
+          })),
+        ),
+      },
+      payrollPolicy: {
+        findFirst: jest.fn(({ where }: any) => {
+          const key = where.locationId ?? '';
+          const treatment = policies[key];
+          if (!treatment) return Promise.resolve(null);
+          return Promise.resolve({
+            tenantId: 'tenant-1',
+            locationId: where.locationId ?? null,
+            compOffEnabled: true,
+            compOffUsagePeriod: 'MONTHLY',
+            compOffCarryForwardEnabled: false,
+            compOffUnusedTreatment: 'PAY',
+            compOffExpiryTreatment: treatment,
+            compOffExpiryDays: null,
+          });
+        }),
+      },
+    };
+    return { prisma, service: newAttendanceService(prisma) };
+  }
+
+  const enforcedById = (rows: any[]) =>
+    Object.fromEntries(rows.map((row) => [row.id, row.expiryEnforced]));
+
+  it('reports a location that enforces expiry as enforced', async () => {
+    const { service } = harness([{ id: 'g1', locationId: 'loc-1' }], { 'loc-1': 'FORFEIT' });
+
+    const rows = await service.listCompOffs(ledgerUser);
+
+    expect(enforcedById(rows)).toEqual({ g1: true });
+  });
+
+  it('does not inherit the tenant default when the location overrides it', async () => {
+    // The whole discrepancy: the tenant default says the date is advisory, but this grant's
+    // location makes it a deadline. Reading the default would have shown it as still available.
+    const { service } = harness([{ id: 'g1', locationId: 'loc-1' }], {
+      '': 'NOT_ENFORCED',
+      'loc-1': 'PAY_OUT',
+    });
+
+    const rows = await service.listCompOffs(ledgerUser);
+
+    expect(enforcedById(rows)).toEqual({ g1: true });
+  });
+
+  it('does not enforce for a location that overrides an enforcing tenant default', async () => {
+    // The same error in the other direction: the default enforces, this location does not, so
+    // the grant is still usable and must not be shown as expired.
+    const { service } = harness([{ id: 'g1', locationId: 'loc-1' }], {
+      '': 'FORFEIT',
+      'loc-1': 'NOT_ENFORCED',
+    });
+
+    const rows = await service.listCompOffs(ledgerUser);
+
+    expect(enforcedById(rows)).toEqual({ g1: false });
+  });
+
+  it('resolves each grant against its own location in one ledger', async () => {
+    const { service } = harness(
+      [
+        { id: 'enforced', locationId: 'loc-1' },
+        { id: 'relaxed', locationId: 'loc-2' },
+        { id: 'inherits', locationId: 'loc-3' },
+        { id: 'noLocation', locationId: null },
+      ],
+      { '': 'FORFEIT', 'loc-1': 'PAY_OUT', 'loc-2': 'NOT_ENFORCED' },
+    );
+
+    const rows = await service.listCompOffs(ledgerUser);
+
+    expect(enforcedById(rows)).toEqual({
+      enforced: true,
+      relaxed: false,
+      // No row of its own, so it inherits the enforcing tenant default.
+      inherits: true,
+      noLocation: true,
+    });
+  });
+
+  it('falls back to not enforcing when the tenant has configured no policy at all', async () => {
+    // Matches the in-code FALLBACK_POLICY, whose treatment is NOT_ENFORCED - the behaviour
+    // every grant was created under before expiry was configurable.
+    const { service } = harness([{ id: 'g1', locationId: 'loc-1' }], {});
+
+    const rows = await service.listCompOffs(ledgerUser);
+
+    expect(enforcedById(rows)).toEqual({ g1: false });
+  });
+
+  it('resolves once per distinct location, not once per grant', async () => {
+    const { prisma, service } = harness(
+      [
+        { id: 'g1', locationId: 'loc-1' },
+        { id: 'g2', locationId: 'loc-1' },
+        { id: 'g3', locationId: 'loc-1' },
+        { id: 'g4', locationId: null },
+      ],
+      { '': 'NOT_ENFORCED', 'loc-1': 'FORFEIT' },
+    );
+
+    await service.listCompOffs(ledgerUser);
+
+    // loc-1 resolves on its scoped row (one call); the null-location grant reads the tenant
+    // default (one more). Three grants at loc-1 must not cost three lookups.
+    expect(prisma.payrollPolicy.findFirst).toHaveBeenCalledTimes(2);
+  });
+
+  it('scopes policy resolution to the caller tenant', async () => {
+    const { prisma, service } = harness([{ id: 'g1', locationId: 'loc-1' }], {
+      'loc-1': 'FORFEIT',
+    });
+
+    await service.listCompOffs(ledgerUser);
+
+    for (const call of prisma.payrollPolicy.findFirst.mock.calls) {
+      expect(call[0].where).toMatchObject({ tenantId: 'tenant-1' });
+    }
+  });
+
+  it('does not publish the employee location it resolved from', async () => {
+    // Selected to resolve the policy, deliberately not returned: the derived flag is all the
+    // ledger needs, and where an employee sits is not the ledger's business.
+    const { service } = harness([{ id: 'g1', locationId: 'loc-1' }], { 'loc-1': 'FORFEIT' });
+
+    const [row] = await service.listCompOffs(ledgerUser);
+
+    expect(row.employee).toEqual({ firstName: 'A', lastName: 'B', employeeCode: 'E1' });
+    expect(row.employee).not.toHaveProperty('locationId');
+  });
+
+  it('still returns every stored field the ledger already relied on', async () => {
+    const { service } = harness([{ id: 'g1', locationId: null, days: 0.5 }], {});
+
+    const [row] = await service.listCompOffs(ledgerUser);
+
+    expect(row).toMatchObject({
+      id: 'g1',
+      days: 0.5,
+      status: 'AVAILABLE',
+      paidInPayrollRunId: null,
+    });
+    expect(row.expiresAt).toBeInstanceOf(Date);
+  });
+
+  it('reports enforcement for a decided grant too, without changing its status', async () => {
+    // Nothing is rewritten: a USED grant keeps its status and simply carries the flag.
+    const { service } = harness([{ id: 'g1', locationId: 'loc-1', status: 'USED' }], {
+      'loc-1': 'FORFEIT',
+    });
+
+    const [row] = await service.listCompOffs(ledgerUser);
+
+    expect(row.status).toBe('USED');
+    expect(row.expiryEnforced).toBe(true);
+  });
+
+  it('asks for no policy at all when the ledger is empty', async () => {
+    const { prisma, service } = harness([], { '': 'FORFEIT' });
+
+    await expect(service.listCompOffs(ledgerUser)).resolves.toEqual([]);
+
+    expect(prisma.payrollPolicy.findFirst).not.toHaveBeenCalled();
+  });
+});
+
 describe('decideCompOff authorization', () => {
   function compOffHarness(overrides: Record<string, any> = {}) {
     const prisma = {
@@ -4956,6 +5425,7 @@ describe('decideCompOff authorization', () => {
       payrollVariableInput: { findFirst: frozenPayoutLookup([]) },
       ...overrides,
     };
+    withCompOffUsagePreconditions(prisma);
     return { prisma, service: newAttendanceService(prisma) };
   }
 
@@ -5216,6 +5686,7 @@ describe('payroll period lock', () => {
         payrollRun: { findFirst: frozenRunLookup(options.payrollRuns ?? []) },
         payrollVariableInput: { findFirst: frozenPayoutLookup(options.payouts ?? []) },
       };
+      withCompOffUsagePreconditions(prisma);
       return { prisma, service: newAttendanceService(prisma) };
     }
 

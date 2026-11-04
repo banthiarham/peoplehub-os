@@ -32,6 +32,7 @@
 
 import type { AttendanceStatus } from '@prisma/client';
 import type { RangeLedgerDay } from '../attendance/attendance.service';
+import { roundDays } from '../attendance/absence-duration';
 
 /** Employee identity the reports repeat on every row. */
 export type ReportEmployee = {
@@ -235,6 +236,13 @@ export const SUMMARY_COLUMNS: ColumnSpec[] = [
   { key: 'attendancePercentage', label: 'Attendance %', width: 13, numeric: true },
   { key: 'finalizedDays', label: 'Finalized Days', width: 15, numeric: true },
   { key: 'unfinalizedDays', label: 'Unfinalized Days', width: 17, numeric: true },
+  // Comp-Off earned and used are attendance facts, like the status counts above: they read a
+  // grant's own `earnedDate` and `usedOnDate` and total the days. What is still deliberately
+  // absent is everything that needs a payroll decision - how much LOP a usage actually offset,
+  // what an unused grant was paid, what the remaining balance is worth. Those depend on the
+  // denominator and the unused-treatment policy, which is exactly the line this report draws.
+  { key: 'compOffEarnedDays', label: 'Comp-Off Earned (days)', width: 22, numeric: true },
+  { key: 'compOffUsedDays', label: 'Comp-Off Used (days)', width: 20, numeric: true },
 ];
 
 /**
@@ -363,6 +371,10 @@ function summaryRow(employee: ReportEmployee, days: RangeLedgerDay[]): ReportRow
         : null,
     finalizedDays: recorded.filter((day) => day.isFinalized).length,
     unfinalizedDays: recorded.filter((day) => !day.isFinalized).length,
+    // Summed, not counted: a half-day grant is worth 0.5, so counting rows would overstate it.
+    // Rounded because fractional days accumulate - three halves is 1.5, not 1.4999999999999998.
+    compOffEarnedDays: roundDays(days.reduce((sum, day) => sum + day.compOffEarnedDays, 0)),
+    compOffUsedDays: roundDays(days.reduce((sum, day) => sum + day.compOffUsedDays, 0)),
   };
 }
 

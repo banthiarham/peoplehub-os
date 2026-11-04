@@ -12,6 +12,7 @@ const inputs = (overrides: Partial<PayrollPolicyInputs> = {}): PayrollPolicyInpu
   compOffUnusedTreatment: 'UNPAID',
   compOffUsagePeriod: 'MONTHLY',
   compOffCarryForwardEnabled: false,
+  compOffExpiryTreatment: 'NOT_ENFORCED',
   ...overrides,
 });
 

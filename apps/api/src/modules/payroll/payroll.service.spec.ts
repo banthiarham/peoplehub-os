@@ -45,8 +45,19 @@ function buildProcessRunHarness(options: {
   weeklyOffDays?: number[];
   /** One entry per employee in the run, merged over the default fixture. */
   extraEmployees?: Array<Record<string, unknown>>;
-  /** USED Comp-Off grants; matched against the real `where` (tenant/employee/status/date range). */
-  usedCompOffGrants?: Array<{ employeeId: string; usedOnDate: Date; status?: string; tenantId?: string }>;
+  /**
+   * USED Comp-Off grants; matched against the real `where` (tenant/employee/status/date range).
+   * `days` defaults to a full day, so a case that does not care about duration reads as it
+   * always did; set it to 0.5 to exercise a half-day grant's capped offset.
+   */
+  usedCompOffGrants?: Array<{
+    id?: string;
+    employeeId: string;
+    usedOnDate: Date;
+    days?: number;
+    status?: string;
+    tenantId?: string;
+  }>;
   /** AVAILABLE Comp-Off grants; matched against the real `where` (tenant/employee/status only). */
   availableCompOffGrants?: Array<{
     id?: string;
@@ -353,7 +364,14 @@ function buildProcessRunHarness(options: {
             .filter((grant) => (where.employeeId?.in ?? []).includes(grant.employeeId))
             .filter((grant) => (grant.status ?? 'USED') === where.status)
             .filter((grant) => grant.usedOnDate >= where.usedOnDate.gte && grant.usedOnDate <= where.usedOnDate.lte)
-            .map((grant) => ({ employeeId: grant.employeeId, usedOnDate: grant.usedOnDate })),
+            .map((grant, index) => ({
+              // `id` is read so an attendance-correction warning can name the grant. Defaulted
+              // rather than required, so no pre-existing case has to state one.
+              id: grant.id ?? `used-grant-${index + 1}`,
+              employeeId: grant.employeeId,
+              usedOnDate: grant.usedOnDate,
+              days: grant.days ?? 1,
+            })),
         );
       }),
     },
@@ -2152,6 +2170,415 @@ describe('PayrollService', () => {
       expect(entryFor('emp-1').payableDays).toBe(31);
     });
 
+    /**
+     * A grant offsets the smaller of what its date contributed and what the grant is worth.
+     * Before this, the offset zeroed the date outright and ignored `days`, so half a day of
+     * comp-off cancelled a whole day of LOP - paying the employee for half a day nobody
+     * earned. Half-day grants reach here from the ledger's own "Half day (0.5)" option as
+     * well as from automatic HALF_DAY earning.
+     */
+    describe('a grant offsets no more LOP than it is worth', () => {
+      it('caps a 0.5-day grant at half of a full-day absence, leaving 0.5 payable as LOP', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+          usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 }],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(entryFor('emp-1').lopDays).toBe(0.5);
+        expect(entryFor('emp-1').payableDays).toBe(30.5);
+      });
+
+      it('clears a half day entirely with a 0.5-day grant, since that is all the date contributed', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [{ employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate }],
+          usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 }],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(entryFor('emp-1').lopDays).toBe(0);
+        expect(entryFor('emp-1').payableDays).toBe(31);
+      });
+
+      // Two halves make a whole, but they draw the same day down together rather than each
+      // clearing it - the cap is the date's contribution, not one grant's worth.
+      it('lets two 0.5-day grants on one date combine to clear a full absence', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+          usedCompOffGrants: [
+            { employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+            { employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(entryFor('emp-1').lopDays).toBe(0);
+      });
+
+      it('does not spend a 0.5-day grant twice across two absences', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate },
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: otherDate },
+          ],
+          usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 }],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        // 0.5 left on the used date + the untouched full day elsewhere.
+        expect(entryFor('emp-1').lopDays).toBe(1.5);
+      });
+
+      it('mixes a half-day and a full-day grant across two absences correctly', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate },
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: otherDate },
+          ],
+          usedCompOffGrants: [
+            { employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+            { employeeId: 'emp-1', usedOnDate: otherDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        // 2 days of absence, 1.5 of it offset (0.5 + 1), so 0.5 stays payable as LOP.
+        expect(entryFor('emp-1').lopDays).toBe(0.5);
+        expect(entryFor('emp-1').warnings).toContain('1.5 day(s) of LOP offset by used comp-off');
+      });
+
+      // Payroll only ever reads `CompOffGrant`, so a second pass recomputes from the same rows.
+      it('reaches the same result when the run is reprocessed', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [{ employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate }],
+          usedCompOffGrants: [{ employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 }],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(entryFor('emp-1').lopDays).toBe(0.5);
+      });
+    });
+
+    /**
+     * Attendance corrected after a Comp-Off was spent against it.
+     *
+     * Usage is accepted only against an absence worth exactly the grant's duration, but
+     * attendance can be corrected afterwards. The approved behaviour is an auditable warning
+     * rather than a reversal: restoring the grant would rewrite an administrator's decision,
+     * and refusing the correction would be worse, because the correction is usually the truth
+     * catching up. The money is already safe either way - `applyCompOffOffsets` caps every
+     * grant at what its date now contributes - so what these cases pin is that the discrepancy
+     * is *said*, and that saying it changes no figure.
+     */
+    describe('attendance correction after a grant was used', () => {
+      const warningsFor = (entry: any) => (entry.warnings ?? []) as string[];
+      const corrections = (entry: any) =>
+        warningsFor(entry).filter((warning) => warning.startsWith('Attendance correction:'));
+
+      it('says nothing when the absence still matches the grant exactly', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))).toEqual([]);
+        expect(entryFor('emp-1').lopDays).toBe(0);
+      });
+
+      it('says nothing when a half-day grant still matches a half-day absence', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))).toEqual([]);
+      });
+
+      it('warns when the correction removed the absence entirely', async () => {
+        // The employee was marked absent, a full-day comp-off was spent on it, then the day was
+        // corrected to present. The grant stays used and now offsets nothing.
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        const [warning] = corrections(entryFor('emp-1'));
+        expect(warning).toMatch(/comp-off grant-a was used on/);
+        expect(warning).toMatch(/no longer has a qualifying absence/);
+        expect(warning).toMatch(/offsets nothing/);
+      });
+
+      it('warns when the correction shrank a full absence to a half day', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        const [warning] = corrections(entryFor('emp-1'));
+        expect(warning).toMatch(/comp-off grant-a was used on/);
+        expect(warning).toMatch(/against 1 day\(s\) of absence/);
+        expect(warning).toMatch(/now carries 0\.5 day\(s\)/);
+        expect(warning).toMatch(/Only 0\.5 day\(s\) is offset/);
+      });
+
+      it('warns when the correction grew a half absence to a full day', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        const [warning] = corrections(entryFor('emp-1'));
+        expect(warning).toMatch(/against 0\.5 day\(s\) of absence/);
+        expect(warning).toMatch(/now carries 1 day\(s\)/);
+      });
+
+      it('names the date and employee entry the discrepancy belongs to', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))[0]).toContain(
+          absenceDate.toISOString().slice(0, 10),
+        );
+      });
+
+      it('treats two half-day grants sharing a full absence as consistent', async () => {
+        // This shape predates exact matching and was legitimate then: 0.5 + 0.5 = 1, so the
+        // date is consistent and warning about it would be noise, not a finding.
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: absenceDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+            { id: 'grant-b', employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))).toEqual([]);
+      });
+
+      it('names both grants when a shared date no longer adds up', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+            { id: 'grant-b', employeeId: 'emp-1', usedOnDate: absenceDate, days: 0.5 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))[0]).toMatch(/comp-off grant-a, grant-b/);
+      });
+
+      it('reports one warning per affected date', async () => {
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+            { id: 'grant-b', employeeId: 'emp-1', usedOnDate: otherDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))).toHaveLength(2);
+      });
+
+      it('does not change the LOP the offset would have produced anyway', async () => {
+        // The warning is descriptive. A full-day grant on a date now worth 0.5 still offsets
+        // 0.5 and no more, exactly as it did before the warning existed.
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [
+            { employeeId: 'emp-1', status: 'HALF_DAY', isFinalized: true, date: absenceDate },
+            { employeeId: 'emp-1', status: 'ABSENT', isFinalized: true, date: otherDate },
+          ],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        // 0.5 cleared on the corrected date, the other full absence untouched.
+        expect(entryFor('emp-1').lopDays).toBe(1);
+        expect(corrections(entryFor('emp-1'))).toHaveLength(1);
+      });
+
+      it('reports the same discrepancy again when the run is reprocessed', async () => {
+        // Recomputed from the same rows every time, so a warning cannot be made to disappear
+        // by re-running - which is what makes it auditable rather than a one-off notice.
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+        const first = corrections(entryFor('emp-1'));
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(corrections(entryFor('emp-1'))).toEqual(first);
+      });
+
+      it('leaves a used grant out of the unused payout either way', async () => {
+        // A grant named in a correction warning is still USED, so it cannot also be paid: no
+        // payout component reaches the entry, and the warning adds no second offset.
+        const { service, entryFor } = buildProcessRunHarness({
+          finalizations: finalizedJuly,
+          attendanceRecords: [],
+          usedCompOffGrants: [
+            { id: 'grant-a', employeeId: 'emp-1', usedOnDate: absenceDate, days: 1 },
+          ],
+        });
+
+        await service.processRun('tenant-1', 'run-1');
+
+        expect(
+          entryFor('emp-1').components.some((c: any) => c.code === 'INPUT_COMP_OFF_PAYOUT'),
+        ).toBe(false);
+        expect(entryFor('emp-1').lopDays).toBe(0);
+      });
+
+      /**
+       * A correction warning is only auditable if it actually reaches the approval gate.
+       *
+       * The warning is written to the entry's `warnings`, which `approveRun` counts - so these
+       * two cases close the loop between "payroll noticed" and "somebody had to answer for it".
+       * They use a standalone double rather than `buildProcessRunHarness`, because what is
+       * under test is the gate reading a stored warning, not the computation that produced it.
+       */
+      function approvalHarness(options: { warnings: string[]; overridden: boolean }) {
+        const prisma = {
+          payrollRun: {
+            findFirst: jest.fn().mockResolvedValue({
+              id: 'run-1',
+              tenantId: 'tenant-1',
+              status: 'REVIEW',
+              warningsOverriddenAt: options.overridden ? new Date() : null,
+            }),
+            update: jest.fn().mockResolvedValue({ id: 'run-1', status: 'APPROVED' }),
+          },
+          payrollRunEmployee: {
+            findMany: jest.fn().mockResolvedValue([{ errors: [], warnings: options.warnings }]),
+          },
+          payrollVariableInput: { findMany: jest.fn().mockResolvedValue([]) },
+          // Resolves, because `audit` chains `.catch` onto it.
+          auditLog: { create: jest.fn().mockResolvedValue({}) },
+        };
+        const service = new PayrollService(
+          prisma as any,
+          {} as any,
+          {} as any,
+          stubDenominators() as any,
+          {} as any,
+        );
+        return { prisma, service };
+      }
+
+      const CORRECTION_WARNING =
+        'Attendance correction: comp-off grant-a was used on 2026-07-20, which no longer has ' +
+        'a qualifying absence. The grant stays used and offsets nothing; review whether it ' +
+        'should be reinstated.';
+
+      it('blocks approval while a correction warning is unanswered', async () => {
+        const { prisma, service } = approvalHarness({
+          warnings: [CORRECTION_WARNING],
+          overridden: false,
+        });
+
+        await expect(service.approveRun('tenant-1', 'run-1', 'user-1')).rejects.toThrow(
+          /1 warning\(s\)\. Override warnings with a reason before approval/,
+        );
+        expect(prisma.payrollRun.update).not.toHaveBeenCalled();
+      });
+
+      it('lets the run advance once the warning has been overridden with a reason', async () => {
+        // Overriding is an answer on the record, not an erasure: the warning stays on the entry
+        // and the override itself is what an auditor reads alongside it.
+        const { prisma, service } = approvalHarness({
+          warnings: [CORRECTION_WARNING],
+          overridden: true,
+        });
+
+        await service.approveRun('tenant-1', 'run-1', 'user-1');
+
+        expect(prisma.payrollRun.update).toHaveBeenCalledWith({
+          where: { id: 'run-1' },
+          data: { status: 'APPROVED' },
+        });
+        // The entry is only read. Approving does not clear, rewrite or acknowledge away the
+        // warning text itself - there is no entry write in this path at all - so the
+        // discrepancy stays on the record next to the override that answered it.
+        expect(prisma.payrollRunEmployee.findMany).toHaveBeenCalled();
+        expect(prisma.payrollRunEmployee).not.toHaveProperty('update');
+        expect(prisma.payrollRunEmployee).not.toHaveProperty('updateMany');
+      });
+    });
+
     it('has no effect when the used date has no LOP contribution', async () => {
       const { service, entryFor } = buildProcessRunHarness({
         finalizations: finalizedJuly,
@@ -2416,6 +2843,10 @@ describe('PayrollService', () => {
           compOffUnusedTreatment: 'PAY',
           compOffUsagePeriod: 'MONTHLY',
           compOffCarryForwardEnabled: false,
+          // The stored default. Present so these fixtures keep describing the legacy tenant
+          // every one of them was written for; an enforced treatment is opted into per test.
+          compOffExpiryTreatment: 'NOT_ENFORCED',
+          compOffExpiryDays: null,
           ...overrides,
         },
       ];
@@ -2444,6 +2875,31 @@ describe('PayrollService', () => {
       expect(creates[0]).toMatchObject({ employeeId: 'emp-1', type: 'COMP_OFF_PAYOUT', source: 'COMP_OFF', amount: 838.71, taxable: true, status: 'APPROVED' });
       expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
       expect(entryFor('emp-1').components).toContainEqual(expect.objectContaining({ code: 'INPUT_COMP_OFF_PAYOUT', monthly: 838.71 }));
+    });
+
+    // Automatic earning now produces 0.5-day grants for a HALF_DAY, so the payout has to pay
+    // half the daily rate for one - not round it up to a day, and not drop it as ineligible.
+    it('1b. pays half the daily rate for a half-day unused Comp-Off', async () => {
+      const { service, prisma, entryFor } = buildProcessRunHarness({
+        finalizations: finalizedJuly,
+        payrollPolicies: policy(),
+        employeeOverrides: basicSalary(26000),
+        availableCompOffGrants: [
+          { employeeId: 'emp-1', earnedDate: new Date(Date.UTC(2026, 6, 5)), expiresAt: farFutureExpiry, days: 0.5 },
+        ],
+      });
+
+      await service.processRun('tenant-1', 'run-1');
+
+      const creates = payoutCreates(prisma);
+      expect(creates).toHaveLength(1);
+      expect(creates[0]).toMatchObject({ type: 'COMP_OFF_PAYOUT', amount: 419.35 });
+      // "paid", not "payout of a usage": the label has to distinguish cash settled for an
+      // unused grant from the LOP offset a *used* grant produces, since both reach a payslip.
+      expect(creates[0].label).toBe('Unused Comp-Off paid (0.5 days)');
+      expect((creates[0].metadata as { days: number }).days).toBe(0.5);
+      expect(entryFor('emp-1').grossPay).toBeCloseTo(26419.35, 2);
+      expect(entryFor('emp-1').components).toContainEqual(expect.objectContaining({ code: 'INPUT_COMP_OFF_PAYOUT', monthly: 419.35 }));
     });
 
     it('2. pays the correct total for multiple unused days', async () => {
@@ -3086,6 +3542,123 @@ describe('PayrollService', () => {
           expect(creates).toHaveLength(1);
           expect(creates[0]).toMatchObject({ metadata: { grantIds: ['grant-free'], days: 1 } });
           expect(entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
+        });
+      });
+
+      /**
+       * Tenant-configurable expiry at the payout boundary.
+       *
+       * Under the default `NOT_ENFORCED` every test above still applies: `expiresAt` is
+       * advisory and the usage window closes at the period end. The two enforced treatments
+       * make it a real deadline, and differ only in what an expired unused grant is worth -
+       * `FORFEIT` nothing, `PAY_OUT` a payout settled in the month the grant actually died.
+       */
+      describe('tenant-configured expiry treatment', () => {
+        // Earned 5 Feb 2024 under an ANNUAL period, so the legacy window runs to 31 Dec 2024
+        // while a 30-day expiry ends it on 6 Mar 2024 - two clearly different closure months.
+        const EARNED = new Date(Date.UTC(2024, 1, 5));
+        const EXPIRES_MARCH = new Date(Date.UTC(2024, 2, 6));
+        const grant = { id: 'grant-expiring', employeeId: 'emp-1', earnedDate: EARNED, expiresAt: EXPIRES_MARCH, days: 1 };
+        const annual = (treatment: string, extra: Record<string, unknown> = {}) =>
+          policy({ compOffUsagePeriod: 'ANNUAL', compOffExpiryTreatment: treatment, ...extra });
+
+        const runFor = (month: number, treatment: string, extra: Record<string, unknown> = {}) =>
+          buildProcessRunHarness({
+            run: { month, year: 2024 },
+            finalizations: finalized(month, 2024),
+            payrollPolicies: annual(treatment, extra),
+            employeeOverrides: basicSalary(26000),
+            availableCompOffGrants: [grant],
+          });
+
+        it('16. PAY_OUT settles the grant in the month it expired, not at the period end', async () => {
+          const march = runFor(3, 'PAY_OUT');
+          await march.service.processRun('tenant-1', 'run-1');
+
+          const creates = payoutCreates(march.prisma);
+          expect(creates).toHaveLength(1);
+          expect(creates[0]).toMatchObject({
+            month: 3,
+            year: 2024,
+            metadata: { grantIds: ['grant-expiring'], days: 1 },
+          });
+          // 26 000 / 31 March days = 838.71 for the one unused day, on top of the plain month.
+          expect(march.entryFor('emp-1').grossPay).toBeCloseTo(26838.71, 2);
+        });
+
+        it('17. PAY_OUT pays it exactly once - December no longer claims it', async () => {
+          // The closure month moved, so the run that used to pay it must now pay nothing.
+          // Otherwise shortening the window would create a second payout rather than move it.
+          const december = runFor(12, 'PAY_OUT');
+          await december.service.processRun('tenant-1', 'run-1');
+
+          expect(payoutCreates(december.prisma)).toHaveLength(0);
+        });
+
+        it.each([3, 12])('18. FORFEIT pays nothing, in month %i or any other', async (month) => {
+          const { service, prisma, entryFor } = runFor(month, 'FORFEIT');
+          await service.processRun('tenant-1', 'run-1');
+
+          expect(payoutCreates(prisma)).toHaveLength(0);
+          expect(entryFor('emp-1').grossPay).toBeCloseTo(26000, 2);
+        });
+
+        it('19. NOT_ENFORCED is unchanged: the same grant still closes in December', async () => {
+          // The backward-compatibility guarantee, stated as a test rather than a comment.
+          const march = runFor(3, 'NOT_ENFORCED');
+          await march.service.processRun('tenant-1', 'run-1');
+          expect(payoutCreates(march.prisma)).toHaveLength(0);
+
+          const december = runFor(12, 'NOT_ENFORCED');
+          await december.service.processRun('tenant-1', 'run-1');
+          expect(payoutCreates(december.prisma)).toHaveLength(1);
+        });
+
+        it('20. PAY_OUT with carry-forward closes at the expiry, even past the period end', async () => {
+          // Carry-forward already let `expiresAt` run past the period end; enforcement keeps
+          // that and adds the other direction, so the expiry governs either way.
+          const base = {
+            payrollPolicies: annual('PAY_OUT', { compOffCarryForwardEnabled: true }),
+            employeeOverrides: basicSalary(26000),
+            availableCompOffGrants: [{ ...grant, expiresAt: new Date(Date.UTC(2025, 3, 20)) }],
+          };
+          const december = buildProcessRunHarness({ run: { month: 12, year: 2024 }, finalizations: finalized(12, 2024), ...base });
+          await december.service.processRun('tenant-1', 'run-1');
+          expect(payoutCreates(december.prisma)).toHaveLength(0);
+
+          const april = buildProcessRunHarness({ run: { month: 4, year: 2025 }, finalizations: finalized(4, 2025), ...base });
+          await april.service.processRun('tenant-1', 'run-1');
+          expect(payoutCreates(april.prisma)).toHaveLength(1);
+        });
+
+        it('21. an enforced grant with no expiresAt still closes at the period end', async () => {
+          const { service, prisma } = buildProcessRunHarness({
+            run: { month: 12, year: 2024 },
+            finalizations: finalized(12, 2024),
+            payrollPolicies: annual('PAY_OUT'),
+            employeeOverrides: basicSalary(26000),
+            availableCompOffGrants: [{ ...grant, expiresAt: null }],
+          });
+          await service.processRun('tenant-1', 'run-1');
+
+          expect(payoutCreates(prisma)).toHaveLength(1);
+        });
+
+        it('22. FORFEIT does not disturb a grant a locked run already owns', async () => {
+          // Forfeiting is about future payment, never about reversing money already paid.
+          const { service, prisma } = buildProcessRunHarness({
+            run: { month: 3, year: 2024 },
+            finalizations: finalized(3, 2024),
+            payrollPolicies: annual('FORFEIT'),
+            employeeOverrides: basicSalary(26000),
+            availableCompOffGrants: [{ ...grant, paidInPayrollRunId: 'run-locked' }],
+          });
+          await service.processRun('tenant-1', 'run-1');
+
+          // No payout, and no attempt to touch the grant: the harness's compOffGrant double
+          // exposes no write method at all, so payout generation reaching for one would fail
+          // here rather than quietly un-claiming a grant a locked run had already paid.
+          expect(payoutCreates(prisma)).toHaveLength(0);
         });
       });
 
@@ -4634,6 +5207,8 @@ describe('payroll reprocess and policy staleness', () => {
     compOffUnusedTreatment: 'PAY',
     compOffUsagePeriod: 'MONTHLY',
     compOffCarryForwardEnabled: false,
+    compOffExpiryTreatment: 'NOT_ENFORCED',
+    compOffExpiryDays: null,
     ...overrides,
   });
 
@@ -4815,7 +5390,12 @@ describe('payroll reprocess and policy staleness', () => {
 
       const { policySnapshot, policyHash } = lastRunUpdate(h);
       expect(policySnapshot).toEqual({
-        version: 1,
+        // Version 2 since comp-off expiry became configurable: `compOffExpiryTreatment`
+        // decides whether an expired grant is paid and when its window closes, so a run
+        // processed under one treatment would pay differently under another and has to read
+        // as stale. `compOffExpiryDays` is deliberately not here - it only shapes a grant at
+        // creation, never a run that has already been computed.
+        version: 2,
         locations: {
           '': {
             salaryBasis: 'CALENDAR_DAYS',
@@ -4824,6 +5404,7 @@ describe('payroll reprocess and policy staleness', () => {
             compOffUnusedTreatment: 'PAY',
             compOffUsagePeriod: 'MONTHLY',
             compOffCarryForwardEnabled: false,
+            compOffExpiryTreatment: 'NOT_ENFORCED',
           },
         },
       });

@@ -23,6 +23,7 @@ interface LocationOption {
 type SalaryBasis = 'CALENDAR_DAYS' | 'FIXED_DAYS' | 'WORKING_DAYS';
 type CompOffUnusedTreatment = 'PAY' | 'UNPAID';
 type CompOffUsagePeriod = 'MONTHLY' | 'ANNUAL';
+type CompOffExpiryTreatment = 'NOT_ENFORCED' | 'FORFEIT' | 'PAY_OUT';
 
 interface PayrollPolicyRow {
   id: string;
@@ -34,6 +35,8 @@ interface PayrollPolicyRow {
   compOffUnusedTreatment: CompOffUnusedTreatment;
   compOffUsagePeriod: CompOffUsagePeriod;
   compOffCarryForwardEnabled: boolean;
+  compOffExpiryDays: number | null;
+  compOffExpiryTreatment: CompOffExpiryTreatment;
   isDefault: boolean;
   updatedAt: string;
 }
@@ -46,6 +49,8 @@ type PolicyFormState = {
   compOffUnusedTreatment: CompOffUnusedTreatment;
   compOffUsagePeriod: CompOffUsagePeriod;
   compOffCarryForwardEnabled: boolean;
+  compOffExpiryDays: number | null;
+  compOffExpiryTreatment: CompOffExpiryTreatment;
 };
 
 /** Mirrors PayrollPolicyService's in-code fallback - what an unconfigured scope resolves to. */
@@ -57,6 +62,8 @@ const FALLBACK_POLICY: PolicyFormState = {
   compOffUnusedTreatment: 'UNPAID',
   compOffUsagePeriod: 'MONTHLY',
   compOffCarryForwardEnabled: false,
+  compOffExpiryDays: null,
+  compOffExpiryTreatment: 'NOT_ENFORCED',
 };
 
 function toFormState(policy: PayrollPolicyRow | null): PolicyFormState {
@@ -69,6 +76,8 @@ function toFormState(policy: PayrollPolicyRow | null): PolicyFormState {
     compOffUnusedTreatment: policy.compOffUnusedTreatment,
     compOffUsagePeriod: policy.compOffUsagePeriod,
     compOffCarryForwardEnabled: policy.compOffCarryForwardEnabled,
+    compOffExpiryDays: policy.compOffExpiryDays,
+    compOffExpiryTreatment: policy.compOffExpiryTreatment,
   };
 }
 
@@ -108,6 +117,13 @@ export function PayrollPoliciesTab() {
     form.salaryBasis !== 'FIXED_DAYS' ||
     (Number.isInteger(fixedDaysNumber) && fixedDaysNumber >= 1 && fixedDaysNumber <= 31);
 
+  // Warned only when the *saved* policy is not already enforcing, so an admin editing an
+  // enforced policy is not re-warned about a decision they made long ago.
+  const expiryEnforcementWarning =
+    form.compOffEnabled &&
+    form.compOffExpiryTreatment !== 'NOT_ENFORCED' &&
+    (scopedPolicy?.compOffExpiryTreatment ?? 'NOT_ENFORCED') === 'NOT_ENFORCED';
+
   const save = useMutation({
     mutationFn: () => {
       const payload = {
@@ -122,6 +138,9 @@ export function PayrollPoliciesTab() {
         compOffUnusedTreatment: form.compOffUnusedTreatment,
         compOffUsagePeriod: form.compOffUsagePeriod,
         compOffCarryForwardEnabled: form.compOffCarryForwardEnabled,
+        // Omitted rather than sent as null, so a blank field keeps the API's own default.
+        ...(form.compOffExpiryDays !== null && { compOffExpiryDays: form.compOffExpiryDays }),
+        compOffExpiryTreatment: form.compOffExpiryTreatment,
       };
       return scopedPolicy
         ? api.patch(`/payroll/policies/${scopedPolicy.id}`, payload)
@@ -298,6 +317,66 @@ export function PayrollPoliciesTab() {
                   />
                   Allow Comp-Off to carry forward past its usage period
                 </label>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+                    Validity window (days)
+                    <Input
+                      type="number"
+                      min={1}
+                      max={1095}
+                      placeholder="90"
+                      value={form.compOffExpiryDays ?? ''}
+                      onChange={(e) =>
+                        setForm((f) => ({
+                          ...f,
+                          compOffExpiryDays: e.target.value === '' ? null : Number(e.target.value),
+                        }))
+                      }
+                    />
+                    <span className="block font-normal text-ink-faint">
+                      How long a newly credited Comp-Off stays valid. Blank keeps the 90-day
+                      default. Applies only to Comp-Offs credited from now on.
+                    </span>
+                  </label>
+
+                  <label className="block space-y-1.5 text-xs font-medium text-ink-muted">
+                    When a Comp-Off expires unused
+                    <Select
+                      className="w-full"
+                      value={form.compOffExpiryTreatment}
+                      onChange={(e) =>
+                        setForm((f) => ({
+                          ...f,
+                          compOffExpiryTreatment: e.target.value as CompOffExpiryTreatment,
+                        }))
+                      }
+                    >
+                      <option value="NOT_ENFORCED">Not enforced (current behaviour)</option>
+                      <option value="FORFEIT">Forfeit - cannot be used or paid</option>
+                      <option value="PAY_OUT">Pay out - cannot be used, still paid</option>
+                    </Select>
+                    <span className="block font-normal text-ink-faint">
+                      Not enforced means the expiry date is informational: a Comp-Off stays
+                      usable until the end of its usage period whatever the date says.
+                    </span>
+                  </label>
+                </div>
+
+                {expiryEnforcementWarning && (
+                  <p
+                    role="alert"
+                    className="rounded-md border border-amber-400/40 bg-amber-400/10 p-2 text-xs text-ink"
+                  >
+                    Enforcing expiry also applies to Comp-Offs that already exist. Every grant
+                    credited before now carries a 90-day expiry date, so any whose date has
+                    already passed becomes unusable as soon as you save
+                    {form.compOffExpiryTreatment === 'FORFEIT'
+                      ? ' - and under Forfeit it will not be paid out either.'
+                      : ' - under Pay out it will still be settled through payroll.'}{' '}
+                    Review the Comp-Off ledger before saving.
+                  </p>
+                )}
               </fieldset>
 
               <Button type="submit" disabled={!fixedDaysValid || save.isPending} className="w-full">

@@ -5,9 +5,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AgeCategory, CompOffStatus, CompOffUsagePeriod, Prisma } from '@prisma/client';
+import { AgeCategory, CompOffExpiryTreatment, CompOffStatus, CompOffUsagePeriod, Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/database/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { buildAbsenceContributions } from '../attendance/absence-duration';
 import { assertCanDecideApproval } from '../../common/authorization/approval-authorization';
 import { toCsv } from '../../common/utils/csv';
 import { TdsCalculationResult, TdsEngineService } from '../tax/tds-engine.service';
@@ -947,7 +948,9 @@ export class PayrollService {
             status: 'USED',
             usedOnDate: { gte: monthStart, lte: monthEnd },
           },
-          select: { employeeId: true, usedOnDate: true },
+          // `days` is read because a grant offsets at most its own worth: a 0.5-day comp-off
+          // cannot clear a full absence. `id` only so a warning can name the grant.
+          select: { id: true, employeeId: true, usedOnDate: true, days: true },
         }),
       ]);
     const inputsByEmployee = this.groupByEmployee(variableInputs);
@@ -994,15 +997,26 @@ export class PayrollService {
       const attendanceLop = lopContributions.attendanceTotalByEmployee.get(emp.id) ?? 0;
       if (attendanceLop > 0) warnings.push(`${attendanceLop} attendance LOP day(s) from finalized absences/half-days`);
       // Comp-Off offset is applied per date before the employee's days are totalled: a used
-      // grant removes only the LOP its own usedOnDate actually contributed - 1 for an
-      // absence, 0.5 for a half day, nothing if that date had none - and never the leftover
-      // from one date onto another. See applyCompOffOffsets.
-      const usedOnDates = (usedCompOffDatesByEmployee.get(emp.id) ?? [])
-        .map((grant) => grant.usedOnDate)
-        .filter((date): date is Date => date !== null);
+      // grant removes the smaller of what its own usedOnDate contributed and what the grant
+      // itself is worth - so a half-day comp-off cannot clear a full absence - and never
+      // carries the leftover from one date onto another. See applyCompOffOffsets.
+      const usedGrants = (usedCompOffDatesByEmployee.get(emp.id) ?? [])
+        .filter((grant): grant is typeof grant & { usedOnDate: Date } => grant.usedOnDate !== null)
+        .map((grant) => ({ id: grant.id, usedOnDate: grant.usedOnDate, days: grant.days }));
+      // Reported before the offset is applied, because the offset itself is deliberately
+      // tolerant: `applyCompOffOffsets` caps a grant at what its date now contributes and
+      // carries nothing over, so a correction never produces a wrong figure - it produces a
+      // quietly wrong *outcome*, where a grant was spent on an absence that no longer matches
+      // it. The money stays right; what needs saying is that the usage no longer fits.
+      for (const warning of this.compOffCorrectionWarnings(
+        usedGrants,
+        lopContributions.byDate.get(emp.id) ?? new Map<string, number>(),
+      )) {
+        warnings.push(warning);
+      }
       const { lopDays: rawLopDays, offsetDays: compOffOffsetDays } = this.applyCompOffOffsets(
         lopContributions.byDate.get(emp.id) ?? new Map<string, number>(),
-        usedOnDates,
+        usedGrants,
       );
       if (compOffOffsetDays > 0) {
         warnings.push(`${compOffOffsetDays} day(s) of LOP offset by used comp-off`);
@@ -1927,64 +1941,118 @@ export class PayrollService {
       }),
     ]);
 
-    const result = new Map<string, Map<string, number>>();
-    const add = (employeeId: string, dayKey: string, amount: number) => {
-      if (amount <= 0) return;
-      const byDate = result.get(employeeId) ?? new Map<string, number>();
-      byDate.set(dayKey, (byDate.get(dayKey) ?? 0) + amount);
-      result.set(employeeId, byDate);
-    };
-
-    // Tracked separately from `result` only so callers can report "N attendance LOP day(s)"
-    // as they did before this method existed - it plays no part in the offset itself.
-    const attendanceTotalByEmployee = new Map<string, number>();
-    for (const record of attendanceRecords) {
-      const amount = record.status === 'HALF_DAY' ? 0.5 : 1;
-      add(record.employeeId, this.dayKey(record.date), amount);
-      attendanceTotalByEmployee.set(
-        record.employeeId,
-        (attendanceTotalByEmployee.get(record.employeeId) ?? 0) + amount,
-      );
-    }
-
-    for (const leave of lwpRequests) {
-      const clippedFrom = leave.fromDate < monthStart ? monthStart : leave.fromDate;
-      const clippedTo = leave.toDate > monthEnd ? monthEnd : leave.toDate;
-      if (clippedTo < clippedFrom) continue;
-      const totalSpanDays = this.inclusiveDayCount(leave.fromDate, leave.toDate);
-      if (totalSpanDays <= 0) continue;
-      const dailyRate = leave.days / totalSpanDays;
-      for (let d = new Date(clippedFrom); d <= clippedTo; d.setUTCDate(d.getUTCDate() + 1)) {
-        add(leave.employeeId, this.dayKey(d), dailyRate);
-      }
-    }
-
-    return { byDate: result, attendanceTotalByEmployee };
+    // The arithmetic itself lives in `absence-duration.ts`, shared with Comp-Off usage
+    // validation so a usage the API accepts is scored identically here. Extracted verbatim:
+    // this method still queries exactly what it always did and still returns exactly what it
+    // always returned.
+    return buildAbsenceContributions({
+      attendanceRecords,
+      unpaidLeave: lwpRequests,
+      windowStart: monthStart,
+      windowEnd: monthEnd,
+    });
   }
 
   /**
-   * Removes, from one employee's per-date LOP map, the contribution of every date named by
-   * a USED Comp-Off's `usedOnDate`. Each date is offset by exactly what it contributed - 1
-   * for a full absence, 0.5 for a half day, nothing for a date with no LOP - never the
-   * grant's own `days`, and never applied to any other date.
+   * Removes, from one employee's per-date LOP map, the LOP covered by every USED Comp-Off
+   * whose `usedOnDate` falls on a date that contributed LOP.
    *
-   * A date already brought to zero (by an earlier grant, or one that had no LOP to begin
-   * with) is left alone, so two grants that happen to share a `usedOnDate` cannot
-   * double-offset the same day, and the total can never go negative.
+   * Each grant is worth `min(what that date contributed, the grant's own days)`:
+   *
+   *  - a 1-day grant on a full absence clears the whole day;
+   *  - a 1-day grant on a half day clears the 0.5 that day contributed and no more, because
+   *    the leftover is never carried onto another date;
+   *  - a **0.5-day grant on a full absence clears only 0.5**, leaving 0.5 payable as LOP.
+   *
+   * That last case is why `days` is read at all. The rule used to be "zero whatever the date
+   * contributed", ignoring the grant's own worth, so half a day of comp-off cancelled a whole
+   * day of LOP and paid the employee for half a day nobody earned. Half-day grants have been
+   * creatable by hand since the ledger offered them (`CreateCompOffDto.days` accepts 0.5),
+   * and automatic earning now produces them for a HALF_DAY, so the shortfall is reachable
+   * from both paths.
+   *
+   * A grant is consumed at most once: each row is visited a single time, and what it takes is
+   * deducted from that date's running balance. So two grants sharing one `usedOnDate` draw
+   * the date down together rather than each clearing it, a date already at zero yields
+   * nothing to a later grant, and the total can never go negative or exceed the LOP that was
+   * actually there. Nothing here writes to `CompOffGrant` - payroll only reads it - so
+   * reprocessing recomputes from the same rows and reaches the same answer.
    */
+  /**
+   * Warnings for USED Comp-Off whose supporting absence no longer matches what it was spent on.
+   *
+   * Usage is accepted only against an absence worth exactly the grant's own duration
+   * (`AttendanceService.validateCompOffUsage`). Attendance can still be corrected afterwards,
+   * and a correction that removes that absence or changes its size leaves a grant consumed for
+   * something that is no longer there. Nothing here reverses it: the approved behaviour is an
+   * auditable warning, because silently restoring the grant would rewrite a decision an
+   * administrator made, and refusing the correction would be worse - the correction is usually
+   * the truth catching up.
+   *
+   * Compared per *date* against the total the grants on that date are worth, not per grant.
+   * Two half-day grants legitimately share one full-day absence in data created before exact
+   * matching existed; summing them means that history reads as consistent (0.5 + 0.5 = 1)
+   * instead of warning twice about a shape that was once allowed.
+   *
+   * Reported through the payroll run's own per-employee `warnings`, which persist on
+   * `PayrollRunEmployee`, survive reprocessing (they are recomputed from the same rows every
+   * time, so a discrepancy cannot be made to disappear by re-running) and already block
+   * approval until an operator overrides them with a reason. No separate audit store is
+   * introduced; this is the mechanism the run already uses for everything an operator must see.
+   *
+   * Purely descriptive: it writes nothing, changes no amount, and cannot cause a second offset
+   * or a duplicate payout. A grant named here is still `USED`, so it stays out of the unused
+   * payout query exactly as before.
+   */
+  private compOffCorrectionWarnings(
+    usedGrants: Array<{ id: string; usedOnDate: Date; days: number }>,
+    byDate: Map<string, number>,
+  ): string[] {
+    const grantsByDate = new Map<string, { ids: string[]; days: number }>();
+    for (const grant of usedGrants) {
+      const key = this.dayKey(grant.usedOnDate);
+      const entry = grantsByDate.get(key) ?? { ids: [], days: 0 };
+      entry.ids.push(grant.id);
+      entry.days = round2(entry.days + grant.days);
+      grantsByDate.set(key, entry);
+    }
+
+    const warnings: string[] = [];
+    for (const [dayKey, entry] of [...grantsByDate].sort(([a], [b]) => a.localeCompare(b))) {
+      const contribution = round2(byDate.get(dayKey) ?? 0);
+      if (contribution === entry.days) continue;
+      const grants = `comp-off ${entry.ids.join(', ')}`;
+      warnings.push(
+        contribution === 0
+          ? `Attendance correction: ${grants} was used on ${dayKey}, which no longer has a ` +
+            `qualifying absence. The grant stays used and offsets nothing; review whether it ` +
+            `should be reinstated.`
+          : `Attendance correction: ${grants} was used on ${dayKey} against ${entry.days} ` +
+            `day(s) of absence, but that date now carries ${contribution} day(s). Only ` +
+            `${Math.min(contribution, entry.days)} day(s) is offset; review the usage.`,
+      );
+    }
+    return warnings;
+  }
+
   private applyCompOffOffsets(
     byDate: Map<string, number>,
-    usedOnDates: Date[],
+    usedGrants: Array<{ usedOnDate: Date; days: number }>,
   ): { lopDays: number; offsetDays: number } {
     const working = new Map(byDate);
     let offsetDays = 0;
-    for (const usedOnDate of usedOnDates) {
-      const key = this.dayKey(usedOnDate);
+    for (const grant of usedGrants) {
+      const key = this.dayKey(grant.usedOnDate);
       const contribution = working.get(key) ?? 0;
-      if (contribution > 0) {
-        working.set(key, 0);
-        offsetDays += contribution;
-      }
+      // `days` is NOT NULL in the schema, but it is arithmetic reaching a payslip: a negative
+      // or non-finite value must not subtract nothing-while-counting, and must never let NaN
+      // escape into `lopDays`. Anything unusable makes the grant inert, which leaves the LOP
+      // standing rather than silently forgiving a day nobody earned.
+      const worth = Number.isFinite(grant.days) ? Math.max(0, grant.days) : 0;
+      const claimable = Math.min(contribution, worth);
+      if (claimable <= 0) continue;
+      working.set(key, round2(contribution - claimable));
+      offsetDays += claimable;
     }
     let lopDays = 0;
     for (const contribution of working.values()) lopDays += contribution;
@@ -2166,6 +2234,11 @@ export class PayrollService {
         continue;
       }
       const policy = await resolvePolicy(grant.employeeId);
+      // FORFEIT is the one treatment that pays nothing: the grant stopped being usable and
+      // the tenant chose for that to be the end of it. Skipped here rather than filtered out
+      // of the query, because the treatment is resolved per employee location and two
+      // employees in the same run can legitimately resolve different policies.
+      if (policy.compOffExpiryTreatment === CompOffExpiryTreatment.FORFEIT) continue;
       const closureDate = this.compOffClosureDate(policy, grant);
       if (closureDate < monthStart || closureDate > monthEnd) continue;
       const entry = eligibleByEmployee.get(grant.employeeId) ?? { days: 0, grantIds: [] };
@@ -2207,7 +2280,12 @@ export class PayrollService {
         month: run.month,
         year: run.year,
         type: 'COMP_OFF_PAYOUT',
-        label: `Unused comp-off payout (${eligible.days} day${eligible.days === 1 ? '' : 's'})`,
+        // "day" for exactly one, "days" otherwise - so a half day reads "0.5 days" and a
+        // single full day "1 day". The duration is in the label because this is the only place
+        // a payslip says how much comp-off was settled, and a bare amount cannot be checked
+        // against the ledger. It is a payout, never a usage: the wording says "paid" so it is
+        // not read as the LOP offset a *used* grant produces.
+        label: `Unused Comp-Off paid (${eligible.days} day${eligible.days === 1 ? '' : 's'})`,
         amount,
         taxable: true,
         status: 'APPROVED',
@@ -2247,10 +2325,27 @@ export class PayrollService {
    * earlier, and never past an `expiresAt` it doesn't have.
    */
   private compOffClosureDate(
-    policy: { compOffUsagePeriod: CompOffUsagePeriod; compOffCarryForwardEnabled: boolean },
+    policy: {
+      compOffUsagePeriod: CompOffUsagePeriod;
+      compOffCarryForwardEnabled: boolean;
+      compOffExpiryTreatment: CompOffExpiryTreatment;
+    },
     grant: { earnedDate: Date; expiresAt: Date | null },
   ): Date {
     const periodEnd = this.compOffPeriodEnd(policy.compOffUsagePeriod, grant.earnedDate);
+
+    // Enforced expiry: `expiresAt` is a real deadline, so the usage window closes there even
+    // when that falls *before* the period end - which NOT_ENFORCED never allows. Settling the
+    // grant in the month it actually stopped being usable is what keeps the payout from
+    // drifting to a later month in which the employee could no longer have spent it, and
+    // keeps it to exactly one run. Without an `expiresAt` there is no deadline to enforce and
+    // the period end still governs.
+    if (policy.compOffExpiryTreatment !== CompOffExpiryTreatment.NOT_ENFORCED) {
+      if (!grant.expiresAt) return periodEnd;
+      if (policy.compOffCarryForwardEnabled) return grant.expiresAt;
+      return grant.expiresAt < periodEnd ? grant.expiresAt : periodEnd;
+    }
+
     if (!policy.compOffCarryForwardEnabled) return periodEnd;
     if (!grant.expiresAt || grant.expiresAt <= periodEnd) return periodEnd;
     return grant.expiresAt;

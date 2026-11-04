@@ -40,6 +40,15 @@ interface RunEntry {
   grossPay: number;
   totalDeductions: number;
   netPay: number;
+  /**
+   * Days of loss of pay left after any Comp-Off offset, and the days actually paid.
+   *
+   * Both have always been stored on `PayrollRunEmployee` and returned here, and neither was
+   * ever displayed - so the one figure that explains why a gross differs from the configured
+   * salary was invisible. They are shown as given: nothing is recomputed in the client.
+   */
+  lopDays?: number;
+  payableDays?: number;
   components: PayslipComponent[];
   errors?: string[];
   warnings?: string[];
@@ -121,6 +130,7 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
               netPay={entry.netPay}
               components={entry.components ?? []}
             />
+            <DayCountSummary lopDays={entry.lopDays} payableDays={entry.payableDays} />
             {!!entry.errors?.length && (
               <IssueList title="Critical issues" variant="destructive" items={entry.errors} />
             )}
@@ -295,6 +305,44 @@ export function PayrollRunDetailDialog({ runId, onClose }: PayrollRunDetailDialo
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * Loss-of-pay and payable days for one entry.
+ *
+ * These are the two figures that reconcile a payslip to the configured salary, and neither was
+ * shown anywhere before. Kept deliberately separate from the earnings table above: a Comp-Off
+ * *payout* is an earning line and appears there, while a Comp-Off used as leave shows up here
+ * only as LOP that is no longer being charged. Conflating the two is the specific confusion
+ * this panel exists to prevent, so it states days and never money.
+ *
+ * Rendered only when the run actually supplied the values, rather than defaulting to 0 - a
+ * zero and a missing figure mean different things, and inventing one would misreport an entry
+ * the backend could not compute.
+ */
+function DayCountSummary({ lopDays, payableDays }: { lopDays?: number; payableDays?: number }) {
+  if (lopDays === undefined && payableDays === undefined) return null;
+  return (
+    <div className="rounded-lg border border-line p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <Badge variant="outline">Days</Badge>
+      </div>
+      <dl className="grid grid-cols-2 gap-2 text-sm">
+        {payableDays !== undefined && (
+          <div>
+            <dt className="text-xs text-ink-muted">Payable days</dt>
+            <dd className="text-ink">{payableDays}</dd>
+          </div>
+        )}
+        {lopDays !== undefined && (
+          <div>
+            <dt className="text-xs text-ink-muted">Loss of pay (days, after Comp-Off offset)</dt>
+            <dd className="text-ink">{lopDays}</dd>
+          </div>
+        )}
+      </dl>
+    </div>
   );
 }
 

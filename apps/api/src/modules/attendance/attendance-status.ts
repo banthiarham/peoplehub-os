@@ -105,3 +105,31 @@ function statusFor(workingMinutes: number, scheduledMinutes: number): WorkedDayS
   if (attended >= HALF_DAY_MIN_ATTENDANCE_PERCENTAGE * scheduledMinutes) return 'HALF_DAY';
   return 'ABSENT';
 }
+
+/**
+ * What a day's own status makes an automatic comp-off worth, in days.
+ *
+ * A comp-off compensates a rest day that was worked, so it is credited for exactly as much
+ * of that day as attendance says was worked: a half day earns half a day. The mapping reads
+ * the status already stored on the record rather than re-scoring the minutes, so a grant can
+ * never disagree with the attendance it was earned from — and so the thresholds live in one
+ * place, `statusFor` above, instead of being restated per caller.
+ *
+ * `LATE` is deliberately worth a full day: it is only ever applied to a day that already
+ * classified as PRESENT (see `withLateArrival`), so the shortfall it describes is in arrival
+ * time, not in hours worked.
+ *
+ * `null` means no automatic grant at all. That covers every status describing a day that was
+ * not worked — ABSENT, WEEKEND, HOLIDAY, ON_LEAVE, MISSING_PUNCH — and is the reason the
+ * caller tests for `null` rather than for a zero duration.
+ */
+const COMP_OFF_DAYS_BY_STATUS: Readonly<Record<string, number>> = {
+  PRESENT: 1,
+  LATE: 1,
+  HALF_DAY: 0.5,
+};
+
+/** Days an automatic comp-off is worth for `status`, or `null` if it earns none. */
+export function compOffDaysForStatus(status: string): number | null {
+  return COMP_OFF_DAYS_BY_STATUS[status] ?? null;
+}

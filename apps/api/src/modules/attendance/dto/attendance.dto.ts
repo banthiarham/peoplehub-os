@@ -845,6 +845,20 @@ export class DecideShiftSwapDto {
   note?: string;
 }
 
+/**
+ * The only durations a comp-off grant may be credited at.
+ *
+ * Exported so the service can re-check it: a DTO guards the HTTP boundary, but the service is
+ * the path every caller shares, and a grant worth anything else is unusable by construction -
+ * usage requires an absence of exactly the grant's duration, and an absence is only ever worth
+ * 0.5 or 1 for one source. Automatic earning already produces only these two
+ * (`compOffDaysForStatus`); this is the manual path catching up.
+ *
+ * Historical grants outside this set are deliberately left alone. They remain payable as
+ * unused comp-off, which is the one outcome still open to them.
+ */
+export const COMP_OFF_GRANT_DAYS = [0.5, 1] as const;
+
 export class CreateCompOffDto {
   @ApiProperty({ description: 'Employee the comp-off is credited to' })
   @IsString()
@@ -855,11 +869,17 @@ export class CreateCompOffDto {
   @IsDateString()
   earnedDate!: string;
 
-  @ApiPropertyOptional({ description: 'Credited days; half-day comp-offs are 0.5', default: 1 })
+  @ApiPropertyOptional({
+    description:
+      'Credited days: 0.5 for a half-day comp-off, 1 for a full day. These are the only two ' +
+      'durations a comp-off can be spent at, because usage requires an absence of exactly the ' +
+      'grant’s duration - a grant worth anything else could never be used, only paid out.',
+    enum: COMP_OFF_GRANT_DAYS,
+    default: 1,
+  })
   @IsOptional()
-  @IsNumber()
-  @Min(0.5)
-  @Max(2)
+  @Type(() => Number)
+  @IsIn(COMP_OFF_GRANT_DAYS)
   days?: number;
 
   @ApiPropertyOptional({ description: 'Expiry date; defaults to 90 days after the earned date' })
